@@ -50,7 +50,7 @@ class VirtualSheet(Sheet):
 
         """
         super().__init__(identifier, datasets, specs, coords)
-        self.update_specs({"vert": {"is_virtual": 0}, "edge": {"order": 0}})
+        self.update_specs({"vert": {"is_virtual": int(0)}, "edge": {"order": int(0)}})
         self.sanitize(trim_borders=True, order_edges=True)
         self.maximal_bond_length = maximal_bond_length
         self.minimal_bond_length = minimal_bond_length
@@ -83,8 +83,8 @@ class VirtualSheet(Sheet):
         self.edge_df.loc[edges.index, "order"] = 0
         current_edge = edges.iloc[0]
         current_edge_order = 1
-        while current_edge.order < 1:
-            self.edge_df.loc[current_edge.name, "order"] = current_edge_order
+        while self.edge_df.at[current_edge.name, "order"] < 1:
+            self.edge_df.at[current_edge.name, "order"] = current_edge_order
             edge_trgt = current_edge.trgt
             current_edge = edges.query("srce == %d" %edge_trgt).iloc[0]
             current_edge_order += 1
@@ -115,7 +115,7 @@ class VirtualSheet(Sheet):
                 self.edge_df.at[new_opposite_edge, "opposite"] = new_edge
                 self.edge_df.at[new_opposite_edge, "length"] /= 2
                 increase_order = self.edge_df.query("face == %d and order > %d" % (opposite_face, opposite_order))
-                self.edge_df.at[new_opposite_edge, "order"] = opposite_order + 1
+                self.edge_df.at[opposite, "order"] = opposite_order + 1
                 self.edge_df.loc[increase_order.index, "order"] += 1
             long = self.edge_df[sheet.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
             np.random.shuffle(long)
@@ -438,12 +438,18 @@ class InnerEarModel:
     def mean_delta(indices):
         return sheet.face_df.loc[indices[indices >= 0], 'delta_level'].mean()
 
-    @staticmethod
-    def get_neighbors_data(func_list):
+    def get_neighbors(self, face):
+        face_edges = self.sheet.edge_df.query("face == %d" % face)
+        opposite_edges = face_edges.opposite.to_numpy()
+        neighbors = self.sheet.edge_df.loc[opposite_edges[opposite_edges >= 0], "face"].to_numpy()
+        return np.unique(neighbors)
+
+
+    def get_neighbors_data(self, func_list):
         def apply_on_real_neighbors(func):
             def f(neighbours):
                 indices = neighbours.to_numpy()
-                return func(inner.sheet.edge_df.loc[indices[indices >= 0], "face"].unique())
+                return func(self.sheet.edge_df.loc[indices[indices >= 0], "face"].unique())
             return f
         if hasattr(func_list, "__len__"):
             return sheet.edge_df.groupby("face")["opposite"].agg([apply_on_real_neighbors(func) for func in func_list])
@@ -472,6 +478,14 @@ class InnerEarModel:
                     # Do delamination
                     manager.append(apoptosis, face_id=cell_id, **sheet.settings['apoptosis'])
                     sheet.face_df.at[cell_id, "prefered_area"] = sheet.face_df.at[cell_id, "prefered_vol"]
+                    involved_faces = self.get_neighbors(cell_id)
+                    for face in involved_faces:
+                        sheet.order_edges(face)
+                    sheet.reset_index(order=False)
+                    sheet.edge_df.sort_values(["face", "order"], inplace=True)
+                    sheet.get_opposite()
+                    # update geometry
+                    geom.update_all(sheet)
             return
         return delamination
 
@@ -636,10 +650,12 @@ if __name__ == "__main__":
     sheet.set_minimal_bond_length(0.02)
     sheet.add_virtual_vertices()
     inner = InnerEarModel(sheet)
+    name = "full_model"
     fig1, ax1 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=True)
-    plt.savefig("full_model_initial.png")
+    plt.savefig("%s_initial.png" % name)
     history = inner.simulate(t_end=10, dt=0.01)
+    history.to_archive("%s.hf5" % name)
     fig2, ax2 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=True)
-    plt.savefig("full_model_finale.png")
-    create_gif(history, "full_model.gif", num_frames=len(history), draw_func=inner.draw_sheet)
+    plt.savefig("%s_finale.png" % name)
+    create_gif(history, "%s.gif" % name, num_frames=len(history), draw_func=inner.draw_sheet)
 
