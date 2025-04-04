@@ -3,9 +3,13 @@
 # 1. Adding virtual vertices to allow for round apical morphology
 # 2. Adding differential features by cell types
 # 3. Adding external forces
-
+import os.path
+import pickle
+import random
+import sys
+#sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue')
 import tyssue
-from tyssue import Sheet, config, SheetGeometry, History, EventManager
+from tyssue import Sheet, config, History
 from tyssue import PlanarGeometry as geom
 from tyssue.draw import sheet_view
 from tyssue.draw.plt_draw import plot_forces
@@ -20,6 +24,7 @@ from tyssue.draw.plt_draw import create_gif
 from tyssue.dynamics import model_factory
 from tyssue.dynamics.effectors import AbstractEffector, units, to_nd, LineTension, FaceAreaElasticity, FaceContractility
 from tyssue.dynamics.planar_gradients import area_grad as area_grad_2d
+from tyssue import HistoryHdf5
 
 import numpy as np
 import pandas as pd
@@ -51,15 +56,15 @@ class VirtualSheet(Sheet):
         """
         super().__init__(identifier, datasets, specs, coords)
         self.update_specs({"vert": {"is_virtual": int(0)}, "edge": {"order": int(0)}})
-        self.sanitize(trim_borders=True, order_edges=True)
         self.maximal_bond_length = maximal_bond_length
         self.minimal_bond_length = minimal_bond_length
-        geom.update_all(self)
-        self.reset_index(order=True)
-        self.get_opposite()
-        self.initiate_edge_order()
+        self.geom = geom
 
     def initiate_edge_order(self):
+        self.sanitize(trim_borders=True, order_edges=True)
+        self.reset_index(order=True)
+        self.geom.update_all(self)
+        self.get_opposite()
         face_list = self.edge_df.face.to_numpy()
         edges_order = np.zeros((len(face_list,)))
         counter = 0
@@ -78,6 +83,10 @@ class VirtualSheet(Sheet):
     def set_minimal_bond_length(self, length):
         self.minimal_bond_length = length
 
+    def order_all_edges(self):
+        for face in self.face_df.index.values:
+            self.order_edges(face)
+
     def order_edges(self, face_number):
         edges = self.edge_df.query("face == %d" % face_number)
         self.edge_df.loc[edges.index, "order"] = 0
@@ -89,8 +98,30 @@ class VirtualSheet(Sheet):
             current_edge = edges.query("srce == %d" %edge_trgt).iloc[0]
             current_edge_order += 1
 
+    def check_edge_order(self, face_number):
+        edges = self.edge_df.query("face == %d" % face_number).loc[:,["order", "srce", "trgt"]]
+        edges.sort_values(["order"], inplace=True)
+        first_srce = -1
+        current_trgt = -1
+        for index, row in edges.iterrows():
+            if first_srce < 0:
+                first_srce = row.srce
+            if current_trgt > 0 and current_trgt != row.srce:
+                return False
+            current_trgt = row.trgt
+        return row.trgt == first_srce
+
+    def check_all_edge_order(self):
+        for face in self.face_df.index.values:
+            if not self.check_edge_order(face):
+                print("wrong order in face %d" %face)
+                return False
+        return True
+
+
+
     def add_virtual_vertices(self):
-        long = self.edge_df[sheet.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
+        long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
         np.random.shuffle(long)
         while long.size > 0:
             edge_ind = long[0]
@@ -117,43 +148,65 @@ class VirtualSheet(Sheet):
                 increase_order = self.edge_df.query("face == %d and order > %d" % (opposite_face, opposite_order))
                 self.edge_df.at[opposite, "order"] = opposite_order + 1
                 self.edge_df.loc[increase_order.index, "order"] += 1
-            long = self.edge_df[sheet.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
+            long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
             np.random.shuffle(long)
         self.edge_df.index.name = 'edge'
-        geom.update_all(self)
-        self.reset_index(order=False)
+        self.geom.update_all(self)
+        # self.reset_index(order=False)
         self.edge_df.sort_values(["face", "order"], inplace=True)
         self.get_opposite()
+        if not self.check_all_edge_order():
+            print("bug in adding virtual vertices")
+
+    def remove_virtual_vertex(self, edge_id):
+        srce_idx = self.edge_df.loc[edge_id].srce
+        trgt_idx = self.edge_df.loc[edge_id].trgt
+        srce = self.vert_df.loc[srce_idx]
+        trgt = self.vert_df.loc[trgt_idx]
+        if srce.is_virtual == 1 and trgt.is_virtual != 1:  # if only one is virtual, collapse to the real vertex
+            self.vert_df.loc[srce_idx, self.coords] = self.vert_df.loc[trgt_idx, self.coords]
+        elif trgt.is_virtual == 1 and srce.is_virtual != 1:
+            self.vert_df.loc[trgt_idx, self.coords] = self.vert_df.loc[srce_idx, self.coords]
+        # involved_faces.append(self.edge_df.at[short[0], "face"])
+        # opposite_edge = self.edge_df.at[short[0], "opposite"]
+        # if opposite_edge > 0:
+        #     involved_faces.append(self.edge_df.at[opposite_edge, "face"])
+        collapse_edge(self, edge_id, allow_two_sided=False, reindex=True)
+        return 0
 
     def remove_virtual_vertices(self):
-        short = self.edge_df[sheet.edge_df["length"] < self.minimal_bond_length].index.to_numpy()
+        # involved_faces = []
+        short = self.edge_df[self.edge_df["length"] < self.minimal_bond_length].index.to_numpy()
         if short.size > 0:
             short = short[self.is_virtual_edge(short)]
         np.random.shuffle(short)
         while short.size > 0:
-            srce_idx = self.edge_df.loc[short[0]].srce
-            trgt_idx = self.edge_df.loc[short[0]].trgt
-            srce = self.vert_df.loc[srce_idx]
-            trgt = self.vert_df.loc[trgt_idx]
-            if srce.is_virtual == 1 and trgt.is_virtual != 1: # if only one is virtual, collapse to the real vertex
-                sheet.vert_df.loc[srce_idx, sheet.coords] = sheet.vert_df.loc[trgt_idx, sheet.coords]
-            elif trgt.is_virtual == 1 and srce.is_virtual != 1:
-                sheet.vert_df.loc[trgt_idx, sheet.coords] = sheet.vert_df.loc[srce_idx, sheet.coords]
-            collapse_edge(sheet, short[0], allow_two_sided=False, reindex=True)
-            short = self.edge_df[sheet.edge_df["length"] < self.minimal_bond_length].index.to_numpy()
+            self.remove_virtual_vertex(short[0])
+            short = self.edge_df[self.edge_df["length"] < self.minimal_bond_length].index.to_numpy()
             if short.size > 0:
                 short = short[self.is_virtual_edge(short)]
             np.random.shuffle(short)
-        geom.update_all(self)
+        # for face in np.unique(involved_faces):
+        #     self.order_edges(face)
+        # sheet.edge_df.sort_values(["face", "order"], inplace=True)
+        # sheet.get_opposite()
+        # self.geom.update_all(self)
+        if not self.check_all_edge_order():
+            print("bug in removing virtual vertices")
         return 0
 
     def is_virtual_edge(self, edge_indices):
         """
         Checks if an edge contains a virtual vertex
         """
-        srce_is_virtual = self.vert_df.loc[self.edge_df.loc[edge_indices].srce].is_virtual.to_numpy() == 1
-        trgt_is_virtual = self.vert_df.loc[self.edge_df.loc[edge_indices].trgt].is_virtual.to_numpy() == 1
-        return np.logical_or(srce_is_virtual, trgt_is_virtual)
+        if hasattr(edge_indices, "__len__"):
+            srce_is_virtual = self.vert_df.loc[self.edge_df.loc[edge_indices].srce].is_virtual.to_numpy() == 1
+            trgt_is_virtual = self.vert_df.loc[self.edge_df.loc[edge_indices].trgt].is_virtual.to_numpy() == 1
+            return np.logical_or(srce_is_virtual, trgt_is_virtual)
+        else:
+            srce_is_virtual = self.vert_df.loc[self.edge_df.loc[edge_indices].srce].is_virtual == 1
+            trgt_is_virtual = self.vert_df.loc[self.edge_df.loc[edge_indices].trgt].is_virtual == 1
+            return srce_is_virtual or trgt_is_virtual
 
     def get_update_virtual_vertices_function(self):
         def update_virtual_vertices(sheet, manager):
@@ -163,6 +216,11 @@ class VirtualSheet(Sheet):
             return
         return update_virtual_vertices
 
+    def get_neighbors(self, face, elem="face"):
+        face_edges = self.edge_df.query("face == %d" % face)
+        opposite_edges = face_edges.opposite.to_numpy()
+        neighbors = self.edge_df.loc[opposite_edges[opposite_edges >= 0], "face"].to_numpy()
+        return np.unique(neighbors)
 
 # Helping methods for FaceRepulsion effector #
 def _get_centroid_diff_matrix(face_df):
@@ -276,6 +334,30 @@ class EmptyAffector(AbstractEffector):
         return (pd.DataFrame.from_dict({"gx":[0]*eptm.edge_df.shape[0],"gy":[0]*eptm.edge_df.shape[0]}),
                pd.DataFrame.from_dict({"gx": [0] * eptm.edge_df.shape[0], "gy": [0] * eptm.edge_df.shape[0]}))
 
+class RandomAffector(AbstractEffector):
+    dimensionless = False
+    dimensions = units.energy
+    magnitude = "random"
+    label = "Random"
+    element = "edge"
+    spatial_ref = "distance", units.length
+
+    @staticmethod
+    def get_nrj_norm(specs):
+        return specs["edge"]["length"]
+
+    @staticmethod
+    def energy(eptm):
+        return np.random.rand()
+
+    @staticmethod
+    def gradient(eptm):
+        gx = np.random.rand(eptm.edge_df.shape[0])
+        gy = np.random.rand(eptm.edge_df.shape[0])
+        return (pd.DataFrame.from_dict({"gx":gx,"gy":gy}),
+               pd.DataFrame.from_dict({"gx":-gx, "gy":-gy}))
+
+
 class FaceRepulsion(AbstractEffector):
     dimensionless = False
     dimensions = units.energy
@@ -339,7 +421,7 @@ class InnerEarModel:
 
     def __init__(self, sheet, tension=None, repulsion=None, repulsion_distance=None, repulsion_exp=7,
                  preferred_area=None, contractility=None, elasticity=None,
-                 differentiation_threshold=0.5):
+                 differentiation_threshold=0.5, random_sensitivity=False, saved_notch_delta_levels_file=None):
         # Setting class constants
         self.CELL_TYPES = ['SC', 'HC']
         self.DIMENSIONS = ['2D']
@@ -355,22 +437,22 @@ class InnerEarModel:
             preferred_area = {'HC': 1,
                               'SC': 1}
         if contractility is None:
-            contractility = {'HC': 0.4,
+            contractility = {'HC': 0.15, #0.4
                              'SC': 0.1}
         if repulsion is None:
-            repulsion = {'HC': 0.001,
+            repulsion = {'HC': 0.001, #0.001
                          'SC': 0}
         if repulsion_distance is None:
             repulsion_distance = {'HC': 2.0,
                                   'SC': 0}
         if elasticity is None:
-            elasticity = {'HC': 5,
+            elasticity = {'HC': 1, #5
                           'SC': 1}
         if ('SC', 'HC') in tension:
             tension[('HC', 'SC')] = tension[('SC', 'HC')]
         elif ('HC', 'SC') in tension:
             tension[('SC', 'HC')] = tension[('HC', 'SC')]
-        self.sheet = sheet
+        self.sheet = self.arrange_sheet_from_history(sheet)
         sheet.repulsion_exp = repulsion_exp
         self.face_params = {"contractility": contractility, "repulsion": repulsion,
                             "repulsion_distance": repulsion_distance, "prefered_area": preferred_area,
@@ -381,20 +463,42 @@ class InnerEarModel:
         self.dimensionality = '2D'
         specs = self.get_specs_2d()
         self.sheet.update_specs(specs)
-        self.initialize_random_notch_delta()
+        self.initialize_notch_delta(random_sensitivity, saved_levels_file_path=saved_notch_delta_levels_file)
         active_edges = (self.sheet.edge_df.opposite.values >= 0).astype(int)
         self.sheet.edge_df.loc[:, 'is_active'] = active_edges
         self.sheet.vert_df.loc[list(set(self.sheet.edge_df.srce.values[np.logical_not(active_edges)])), 'is_active'] = 0
         self.sheet.vert_df.loc[list(set(self.sheet.edge_df.trgt.values[np.logical_not(active_edges)])), 'is_active'] = 0
+        self.sheet.face_df.loc[:,"id"] = self.sheet.face_df.index
         self.sheet.active_verts = np.where(self.sheet.vert_df.is_active.values)[0]
         self.update_cell_type_parameters(self.sheet.face_df.delta_level)
+        self.sheet.initiate_edge_order()
+        self.sheet.order_all_edges()
+        return
 
+    @staticmethod
+    def arrange_sheet_from_history(sheet):
+        if 'vert' in sheet.vert_df.columns:
+            sheet.vert_df.drop('time', inplace=True, axis=1)
+            if np.isnan(sheet.vert_df['vert']).any():
+                sheet.vert_df.set_index('index', inplace=True)
+            else:
+                sheet.vert_df.set_index('vert', inplace=True)
+        if 'edge' in sheet.edge_df.columns:
+            sheet.edge_df.set_index('edge', inplace=True)
+            sheet.edge_df.drop('time', inplace=True, axis=1)
+        if 'face' in sheet.face_df.columns:
+            sheet.face_df.set_index('face', inplace=True)
+            sheet.face_df.drop('time', inplace=True, axis=1)
+        return sheet
 
     def update_cell_type_parameters(self, delta_level):
+        differentiating_cells = self.sheet.face_df.query('type >= 0').index
         for param in self.face_params.keys():
-            self.sheet.face_df.loc[:,param] = delta_level*self.face_params[param]["HC"] +\
-                                                   (1-delta_level)*self.face_params[param]["SC"]
-        self.sheet.face_df.loc[:, 'type'] = (delta_level > self.differentiation_threshold).astype(int)
+            new_values = delta_level * self.face_params[param]["HC"] + (1 - delta_level) * self.face_params[param]["SC"]
+            self.sheet.face_df.loc[differentiating_cells,param] = new_values[differentiating_cells]
+
+        new_types = (delta_level > self.differentiation_threshold).astype(int)
+        self.sheet.face_df.loc[differentiating_cells, 'type'] = new_types[differentiating_cells]
         first_faces = self.sheet.edge_df.face.values
         opposite_to_first = self.sheet.edge_df.opposite.values
         second_faces = - np.ones(opposite_to_first.shape)
@@ -411,17 +515,18 @@ class InnerEarModel:
             self.sheet.edge_df.loc[:, param] = new_vals
 
     def get_specs_2d(self):
-        specs = {'vert': {'is_active':1},
+        specs = {'vert': {'is_active':1,
+                          'radial_tension': 0},
                  'edge': {'is_active': 1,
                           'sub_area': 6,
-                          'notch_level': 1.,
-                          'delta_level': 1.,
                           },
                  'face': {'notch_level': 1.,
                           'delta_level': 1.,
                           'repressor_level': 1.,
                           'is_alive': 1,
-                          'type': 0
+                          'type': 0,
+                          'radial_tension': 0,
+                          'notch_sensitivity': 1
                           }
                  }
         for param in self.edge_params.keys():
@@ -430,19 +535,14 @@ class InnerEarModel:
             specs['face'][param] = self.face_params[param]["SC"]
         return specs
 
-    @staticmethod
-    def mean_notch(indices):
-        return sheet.face_df.loc[indices[indices >= 0], 'notch_level'].mean()
+    def mean_notch(self, indices):
+        return self.sheet.face_df.loc[indices[indices >= 0], 'notch_level'].mean()
 
-    @staticmethod
-    def mean_delta(indices):
-        return sheet.face_df.loc[indices[indices >= 0], 'delta_level'].mean()
+    def mean_delta(self, indices):
+        return self.sheet.face_df.loc[indices[indices >= 0], 'delta_level'].mean()
 
     def get_neighbors(self, face):
-        face_edges = self.sheet.edge_df.query("face == %d" % face)
-        opposite_edges = face_edges.opposite.to_numpy()
-        neighbors = self.sheet.edge_df.loc[opposite_edges[opposite_edges >= 0], "face"].to_numpy()
-        return np.unique(neighbors)
+        return sheet.get_neighbors(face)
 
 
     def get_neighbors_data(self, func_list):
@@ -452,16 +552,39 @@ class InnerEarModel:
                 return func(self.sheet.edge_df.loc[indices[indices >= 0], "face"].unique())
             return f
         if hasattr(func_list, "__len__"):
-            return sheet.edge_df.groupby("face")["opposite"].agg([apply_on_real_neighbors(func) for func in func_list])
+            return self.sheet.edge_df.groupby("face")["opposite"].agg([apply_on_real_neighbors(func) for func in func_list])
         else:
-            return sheet.edge_df.groupby("face")["opposite"].agg(apply_on_real_neighbors(func_list))
+            return self.sheet.edge_df.groupby("face")["opposite"].agg(apply_on_real_neighbors(func_list))
 
     @staticmethod
-    def get_model():
-        # model = model_factory([EmptyAffector])
-        # model = model_factory([LineTension, FaceContractility, FaceAreaElasticity, FaceRepulsion])
-        model = model_factory([LineTension, FaceContractility, FaceAreaElasticity])
+    def get_model(only_differentiation=False, add_random_forces=False):
+        if only_differentiation:
+            model = model_factory([EmptyAffector])
+        elif add_random_forces:
+            model = model_factory([LineTension, FaceContractility, FaceAreaElasticity, FaceRepulsion, RandomAffector])
+        else:
+            model = model_factory([LineTension, FaceContractility, FaceAreaElasticity])
         return model
+
+    def get_ablation_function(self, cell_id, shrink_rate=1.5):
+        self.sheet.settings['apoptosis'] = {
+            'shrink_rate': shrink_rate,
+            'critical_area': 0.01,
+            'radial_tension': 0.2,
+            'contractile_increase': 0.3,
+            'contract_span': 2,
+            'geom': self.sheet.geom,
+            'neighbors': self.get_neighbors(cell_id)
+        }
+        def ablation(sheet, manager):
+            # Do delamination
+            sheet.face_df.loc[cell_id, "type"] = -1
+            sheet.face_df.loc[cell_id, "area_elasticity"] = 5
+            manager.append(apoptosis, face_id=cell_id, **sheet.settings['apoptosis'])
+
+            return
+        return ablation
+
 
     def get_delamination_function(self, crit_area=0.5, shrink_rate=1.2):
         self.sheet.settings['apoptosis'] = {
@@ -469,23 +592,27 @@ class InnerEarModel:
             'critical_area': crit_area/2,
             'radial_tension': 0.2,
             'contractile_increase': 0.3,
-            'contract_span': 2
+            'contract_span': 2,
+            'geom': self.sheet.geom
         }
 
         def delamination(sheet, manager):
             for cell_id, row in sheet.face_df.iterrows():
                 if row.area < crit_area:
                     # Do delamination
+                    sheet.face_df.loc[cell_id, "type"] = -1
                     manager.append(apoptosis, face_id=cell_id, **sheet.settings['apoptosis'])
                     sheet.face_df.at[cell_id, "prefered_area"] = sheet.face_df.at[cell_id, "prefered_vol"]
                     involved_faces = self.get_neighbors(cell_id)
                     for face in involved_faces:
                         sheet.order_edges(face)
-                    sheet.reset_index(order=False)
+                    # sheet.reset_index(order=False)
                     sheet.edge_df.sort_values(["face", "order"], inplace=True)
                     sheet.get_opposite()
                     # update geometry
-                    geom.update_all(sheet)
+                    sheet.geom.update_all(sheet)
+                    if not sheet.check_all_edge_order():
+                        print("bug in delamination")
             return
         return delamination
 
@@ -497,15 +624,18 @@ class InnerEarModel:
             for cell_id, row in sheet.face_df.iterrows():
                 if row.area > crit_area and row.type == 0:
                     # Do division
-                    daughter = cell_division(sheet, cell_id, geom)
+                    daughter = cell_division(sheet, cell_id, sheet.geom)[0]
                     # Update the topology
-                    sheet.order_edges(cell_id)
-                    sheet.order_edges(daughter)
-                    sheet.reset_index(order=False)
+                    sheet.get_opposite()
+                    involved_faces = np.intersect1d(self.get_neighbors(cell_id), self.get_neighbors(daughter))
+                    involved_faces = np.hstack([involved_faces, np.array([cell_id, daughter])]).astype(int)
+                    for face in involved_faces:
+                        sheet.order_edges(face)
+                    # sheet.reset_index(order=False)
                     sheet.edge_df.sort_values(["face", "order"], inplace=True)
                     sheet.get_opposite()
                     # update geometry
-                    geom.update_all(sheet)
+                    sheet.geom.update_all(sheet)
             manager.append(division)
         return division
 
@@ -531,73 +661,127 @@ class InnerEarModel:
                     sheet.edge_df.sort_values(["face", "order"], inplace=True)
                     sheet.get_opposite()
                     # update geometry
-                    geom.update_all(sheet)
+                    sheet.geom.update_all(sheet)
+                    if not sheet.check_all_edge_order():
+                        print("bug in intercalation")
                     break
             manager.append(intercalation)
         return intercalation
 
-
-    def get_differentiation_function(self, k, h, a, b, mu, rho):
+    def get_differentiation_function(self, l, m, mu, rho, betaN, betaD, inhibition=False):
         def differentiation(sheet, manager, dt=1.):
             # Notch and delta levels of each cell
-            levels = sheet.face_df.loc[:,['notch_level', 'delta_level']]
+            levels = sheet.face_df.loc[:,['notch_level', 'delta_level', 'notch_sensitivity']]
             notch_level = levels.notch_level.to_numpy()
             delta_level = levels.delta_level.to_numpy()
+            sensitivity = levels.notch_sensitivity.to_numpy()
             # Mean notch and delta of neighboring cells
             neigh_delta = self.get_neighbors_data(self.mean_delta).to_numpy()
 
-            def f(x):
-                return (x**k)/(a + x**k)
+            def f(x, a):
+                return (x**l)/(a + x**l)
 
             def g(x):
-                return 1/(1 + b*(x**h))
-            new_notch = notch_level + dt*mu*(f(neigh_delta) - notch_level)
-            new_delta = delta_level + dt*rho*(g(notch_level) - delta_level)
+                return 1/(1 + x**m)
+            if inhibition:
+                new_notch = notch_level - dt * mu * notch_level
+                new_delta = delta_level + dt * rho * (1 - delta_level)
+            else:
+                new_notch = notch_level + dt * mu * (betaN * f(neigh_delta, sensitivity) - notch_level)
+                new_delta = delta_level + dt * rho * (betaD * g(notch_level) - delta_level)
             sheet.face_df.loc[:, 'notch_level'] = new_notch
             sheet.face_df.loc[:, 'delta_level'] = new_delta
             self.update_cell_type_parameters(new_delta)
             manager.append(differentiation, dt=dt)
         return differentiation
 
-    # def get_length_dependent_differentiation_function(self, betaN, betaD, betaR, kt, m, l):
-    #     def differentiation(sheet, manager, dt=1.):
-    #         # Notch and delta levels of each edge
-    #         edge_levels = sheet.edge_df.loc[:,['notch_level', 'delta_level']]
-    #         edge_length =  sheet.edge_df.length.values()
-    #         repressor_level = sheet.face_df.repressor_level.values()
-    #         notch_level = edge_levels.notch_level.to_numpy()
-    #         delta_level = edge_levels.delta_level.to_numpy()
-    #         weighted_mean_of_notch =
-    #         def f(x):
-    #             return (x**m)/(1 + x**m)
-    #
-    #         def g(x):
-    #             return 1/(1 + (x**l))
-    #         notch_change = betaN/
-    #
-    #
-    #
-    #         sheet.edge_df.loc[:, 'notch_level'] =
-    #         sheet.face_df.loc[:, 'delta_level'] = new_delta
-    #         self.update_cell_type_parameters(new_delta)
-    #         manager.append(differentiation, dt=dt)
-    #     return differentiation
+    def get_length_dependent_differentiation_function(self, l, m, mu, rho, xhi, betaN, betaD, betaR, kt, gammaR, inhibition=False):
+        if inhibition:
+            return self.get_differentiation_function(l, m, mu, rho, inhibition=inhibition)
+        def differentiation(sheet, manager, dt=1.):
+            # Notch and delta levels of each edge
+            edge_data = sheet.edge_df[['face', 'opposite', 'length']]
+            face_data = sheet.face_df[['repressor_level', 'notch_level', 'delta_level', 'perimeter', 'notch_sensitivity']]
+            face_list, number_of_edges = np.unique(edge_data.face.values, return_counts=True)
+            face_data.loc[face_list, 'n_edges'] = number_of_edges
+            face_data['mean_notch_level'] = face_data.eval('notch_level / n_edges')
+            face_data['mean_delta_level'] = face_data.eval('delta_level / n_edges')
+            edge_data.loc[:, ['notch_level', 'delta_level', 'face_perimeter', 'face_repressor_level']] =\
+                face_data.loc[edge_data.face.values, ['mean_notch_level','mean_delta_level', 'perimeter', 'repressor_level']]
+            edge_data.loc[:, ['opposite_notch_level','opposite_delta_level']] = \
+                edge_data.loc[edge_data.opposite.values, ['notch_level', 'delta_level']]
+            edge_data.loc[:, "interaction_level"] = edge_data.eval('notch_level * opposite_delta_level * edge_length')
+            face_data = face_data.join(edge_data.group_by("face")["interaction_level"].sum(), on="face", how="left")
+
+            edge_notch_levels = edge_data.notch_level.to_numpy()
+            edge_delta_levels = edge_data.delta_level.to_numpy()
+            matching_faces_perimeter = edge_data.face_perimeter.to_numpy()
+            matching_face_repressor = edge_data.repressor_level.to_numpy()
+            opposite_notch_levels = edge_data.opposite_notch_level.to_numpy()
+            opposite_delta_levels = edge_data.opposite_delta_level.to_numpy()
+            face_repressor_levels = face_data.repressor_level.to_numpy()
+            face_interactions_level = face_data.interaction_level.to_numpy()
+            face_sensitivity = face_data.notch_sensitivity.to_numpy()
+
+            def f(x, a):
+                return (x**m)/(a + x**m)
+
+            def g(x):
+                return 1/(1 + (x**l))
+            notch_change = betaN/matching_faces_perimeter - edge_notch_levels - edge_notch_levels*opposite_delta_levels/kt
+            delta_change = g(matching_face_repressor)*betaD/matching_faces_perimeter - edge_delta_levels - edge_delta_levels*opposite_notch_levels/kt
+            repressor_change = f(face_interactions_level, face_sensitivity)*betaR - gammaR*face_repressor_levels
+
+            edge_data.loc[:, "notch_level"] = edge_data.loc[:, "notch_level"] + notch_change * mu * dt
+            edge_data.loc[:, "delta_level"] = edge_data.loc[:, "notch_level"] + delta_change * rho * dt
+            new_notch_delta_levels = edge_data.group_by("face")["notch_level", "delta_level"].sum()
+            new_notch_delta_levels.set_index("face", inplace=True)
+
+            sheet.face_df.update(new_notch_delta_levels.notch_level)
+            sheet.face_df.loc[:, "repressor_level"] = sheet.face_df.repressor_level.values + repressor_change * xhi * dt
+
+            self.update_cell_type_parameters(sheet.face_df.delta_level.values)
+            manager.append(differentiation, dt=dt)
+        return differentiation
+
+    def get_aging_sensitivity_function(self, rate):
+        def aging_sensitivity(sheet, manager, dt=1.):
+            sheet.face_df.loc[:, "notch_sensitivity"] = sheet.face_df.notch_sensitivity.values + rate**dt
+        return aging_sensitivity
+
+    def save_notch_delta(self, file_path):
+        levels = self.sheet.face_df.loc[:, ['notch_level', 'delta_level']]
+        levels.to_pickle(file_path)
+
+    def initialize_notch_delta(self, random_sensitivity=False, saved_levels_file_path=None):
+        if saved_levels_file_path is not None and os.path.isfile(saved_levels_file_path):
+            levels = pd.read_pickle(saved_levels_file_path)
+            self.sheet.face_df.loc[:, 'notch_level'] = levels.notch_level.values
+            self.sheet.face_df.loc[:, 'delta_level'] = levels.delta_level.values
+        else:
+            self.sheet.face_df.loc[:, 'notch_level'] = np.random.rand(self.sheet.face_df.shape[0])
+            self.sheet.face_df.loc[:, 'delta_level'] = np.random.rand(self.sheet.face_df.shape[0])
+            # self.sheet.face_df.loc[:, 'notch_level'] = 1
+            # self.sheet.face_df.loc[:, 'delta_level'] = 0
+        if random_sensitivity:
+            self.sheet.face_df.loc[:, 'notch_sensitivity'] = np.random.rand(self.sheet.face_df.shape[0])
 
 
-    def initialize_random_notch_delta(self):
-        self.sheet.face_df.loc[:, 'notch_level'] = np.random.rand(self.sheet.face_df.shape[0])
-        self.sheet.face_df.loc[:, 'delta_level'] = np.random.rand(self.sheet.face_df.shape[0])
-
-    def simulate(self, t_end, dt):
+    def simulate(self, t_end, dt, notch_inhibition=False, only_differentiation=False, random_forces=False, aging_sensitivity=False):
         manager = EventManager("face")
-        manager.append(self.get_differentiation_function(k=2, h=2, a=0.01, b=100, mu=10, rho=10), dt=dt)
-        manager.append(self.get_division_function(crit_area=1.01))
-        manager.append(self.get_intercalation_function(crit_edge_length=0.05))
-        manager.append(self.get_delamination_function(crit_area=0.5, shrink_rate=1.2))
-        manager.append(sheet.get_update_virtual_vertices_function())
-        history = History(self.sheet)
-        model = self.get_model()
-        solver = EulerSolver(self.sheet, geom, model, manager=manager, history=history,auto_reconnect=True)
+        manager.append(self.get_ablation_function(2))
+        manager.append(self.get_differentiation_function(l=2, m=2, mu=10, rho=10, betaN=100, betaD=1,
+                                                        inhibition=notch_inhibition), dt=dt)
+        if aging_sensitivity:
+            manager.append(self.get_aging_sensitivity_function(rate=10))
+        if not only_differentiation:
+            manager.append(self.get_division_function(crit_area=1.01))
+            manager.append(self.get_intercalation_function(crit_edge_length=0.04))
+            manager.append(self.get_delamination_function(crit_area=0.1, shrink_rate=1.2))
+            manager.append(self.sheet.get_update_virtual_vertices_function())
+        history = History(self.sheet, save_all=True)
+        model = self.get_model(only_differentiation, random_forces)
+        solver = EulerSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=True)
         self.sheet.vert_df['viscosity'] = 3.0
         # for diff in range(100):
         #     manager.execute(self.sheet)
@@ -609,6 +793,9 @@ class InnerEarModel:
 
     @staticmethod
     def draw_sheet(sheet, number_vertices=False, number_edges=False, number_faces=False, is_ordered=True):
+        if not sheet.check_all_edge_order():
+            print("bug in drawing")
+            sheet.order_all_edges()
         draw_specs = tyssue.config.draw.sheet_spec()
         cmap = plt.cm.get_cmap('Greens').reversed()
         cmap_scale = sheet.face_df.delta_level.to_numpy()
@@ -619,6 +806,7 @@ class InnerEarModel:
         if is_ordered:
             sheet.is_ordered = True
             sheet.edge_df.sort_values(["face", "order"], inplace=True)
+
         fig, ax = sheet_view(sheet, ['x', 'y'], **draw_specs)
         fig.set_size_inches((8, 8))
 
@@ -638,24 +826,70 @@ class InnerEarModel:
 
         return fig, ax
 
+
+def get_neighbors_from_history(history, face, time):
+        edge_time_df = history.edge_h.get(['face', 'oposite', 'time'])
+        edge_df = edge_time_df.query("time == %f" % time)
+        face_edges = edge_time_df.query("face == %d" % face)
+        opposite_edges = face_edges.opposite.to_numpy()
+        neighbors = edge_df.loc[opposite_edges[opposite_edges >= 0], "face"].to_numpy()
+        return np.unique(neighbors)
+
+def find_differentiation_events(history):
+    face_time_df = history.face_h.get(['face', 'type', 'time'])
+    previously_SC = set()
+    differentiation_df = pd.DataFrame(columns=["time", "face", "HC_neighbors"])
+    for time in np.sort(np.unique(face_time_df.time.to_numpy())):
+        currently_HC = set(face_time_df.query("type == 1 and time == %f" % time).face)
+        differentiating_faces = previously_SC.intersection(currently_HC)
+        for face in differentiating_faces:
+            neighbors = set(get_neighbors_from_history(history, face, time))
+            HC_neighbors_number = len(neighbors.intersection(currently_HC))
+            differentiation_df.append({"time": time, "face": face, "HC_neighbors_number": HC_neighbors_number},
+                                      ignore_index=True)
+        previously_SC = set(face_time_df.query("type == 0 and time == %f" % time).face)
+    return differentiation_df
+
 if __name__ == "__main__":
-    sheet = VirtualSheet.planar_sheet_2d(
-        'basic2D', # a name or identifier for this sheet
-        nx=14, #14 approximate number of cells on the x axis
-        ny=15, #15 approximate number of cells along the y axis
-        distx=1, # distance between 2 cells along x
-        disty=1 # distance between 2 cells along y
-    )
-    sheet.set_maximal_bond_length(0.2)
-    sheet.set_minimal_bond_length(0.02)
-    sheet.add_virtual_vertices()
-    inner = InnerEarModel(sheet)
-    name = "full_model"
-    fig1, ax1 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=True)
+    initial_sheet_name = ""
+    name = "ablation_trial"
+    random_sensitivity = False
+    aging_sensitivity = False
+    only_differentiation = False
+    random_forces = False
+
+    if os.path.isfile("%s.hf5" % initial_sheet_name):
+        history = HistoryHdf5.from_archive("%s.hf5" % initial_sheet_name, eptm_class=VirtualSheet)
+        last_time_point = np.max(history.time_stamps)
+        sheet = history.retrieve(last_time_point)
+    else:
+        sheet = VirtualSheet.planar_sheet_2d(
+            'basic2D',  # a name or identifier for this sheet
+            nx=5,  # approximate number of cells on the x axis
+            ny=6,  # approximae number of cells along the y axis
+            distx=1,  # distance between 2 cells along x
+            disty=1  # distance between 2 cells along y
+        )
+        sheet.initiate_edge_order()
+        sheet.add_virtual_vertices()
+    sheet.set_maximal_bond_length(0.2)  # was 0.2
+    sheet.set_minimal_bond_length(0.05)  # was 0.05
+    inner = InnerEarModel(sheet, random_sensitivity=random_sensitivity,
+                          saved_notch_delta_levels_file="%s_notch_delta_levels.pkl" % initial_sheet_name)
+    fig1, ax1 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=False)
     plt.savefig("%s_initial.png" % name)
-    history = inner.simulate(t_end=10, dt=0.01)
+    history = inner.simulate(t_end=10, dt=0.01, notch_inhibition=False, only_differentiation=only_differentiation,
+                             random_forces=random_forces, aging_sensitivity=aging_sensitivity)
+    # history2 = inner.simulate(t_end=5, dt=0.01, notch_inhibition=True)
+    if os.path.isfile("%s.hf5" % name):
+        os.remove("%s.hf5" % name)
+    # if os.path.isfile("%s_after.hf5" % name):
+    #     os.remove("%s_after.hf5" % name)
     history.to_archive("%s.hf5" % name)
-    fig2, ax2 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=True)
+    inner.save_notch_delta("%s_notch_delta_levels.pkl" % name)
+    # history2.to_archive("%s_after.hf5" % name)
+    fig2, ax2 = inner.draw_sheet(inner.sheet, number_faces=True, number_edges=False, number_vertices=False)
     plt.savefig("%s_finale.png" % name)
     create_gif(history, "%s.gif" % name, num_frames=len(history), draw_func=inner.draw_sheet)
+    # create_gif(history2, "%s_after.gif" % name, num_frames=len(history), draw_func=inner.draw_sheet)
 
