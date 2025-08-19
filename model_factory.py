@@ -7,7 +7,7 @@ import os.path
 import pickle
 import random
 import sys
-#sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue')
+sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue\\tyssue')
 import tyssue
 from tyssue import Sheet, config, History
 from tyssue import PlanarGeometry as geom
@@ -28,6 +28,8 @@ from tyssue import HistoryHdf5
 
 import numpy as np
 import pandas as pd
+# import matplotlib
+# matplotlib.use('agg')
 from matplotlib import pyplot as plt
 
 
@@ -59,6 +61,9 @@ class VirtualSheet(Sheet):
         self.maximal_bond_length = maximal_bond_length
         self.minimal_bond_length = minimal_bond_length
         self.geom = geom
+
+    def set_periodic_boundary_condition(self):
+        self.specs = config.geometry.planar_periodic_sheet()
 
     def initiate_edge_order(self):
         self.sanitize(trim_borders=True, order_edges=True)
@@ -221,6 +226,26 @@ class VirtualSheet(Sheet):
         opposite_edges = face_edges.opposite.to_numpy()
         neighbors = self.edge_df.loc[opposite_edges[opposite_edges >= 0], "face"].to_numpy()
         return np.unique(neighbors)
+
+    def get_contact_matrix(self):
+        m = np.zeros((self.face_df.shape[0], self.face_df.shape[0]))
+        for i, face in self.face_df.iterrows():
+            face_edges = self.edge_df.query("face == %d" % i)
+            contacts = dict()
+            for j, edge in face_edges.iterrows():
+                length = edge.length
+                opposite = edge.opposite
+                if opposite < 0:
+                    continue
+                neighbor = self.edge_df.loc[opposite, "face"]
+                if neighbor in contacts.keys():
+                    contacts[neighbor] = contacts[neighbor] + length
+                else:
+                    contacts[neighbor] = length
+            for neighbor in contacts.keys():
+                m[i, neighbor] = contacts[neighbor]
+        return m
+
 
 # Helping methods for FaceRepulsion effector #
 def _get_centroid_diff_matrix(face_df):
@@ -514,6 +539,12 @@ class InnerEarModel:
             new_vals[np.logical_and(first_types == 0, second_types == 0)] = self.edge_params[param][("SC", "SC")]
             self.sheet.edge_df.loc[:, param] = new_vals
 
+    def set_random_parameters(self):
+        self.sheet.face_df.loc[:, "prefered_area"] = np.random.rand(self.sheet.face_df.shape[0],)
+        self.sheet.face_df.loc[:, "prefered_vol"] = self.sheet.face_df.loc[:, "prefered_area"]
+        self.sheet.face_df.loc[:, "contractility"] = np.random.rand(self.sheet.face_df.shape[0],)/5
+        self.sheet.edge_df.loc[:, "line_tension"] = np.random.rand(self.sheet.edge_df.shape[0],)/10
+
     def get_specs_2d(self):
         specs = {'vert': {'is_active':1,
                           'radial_tension': 0},
@@ -547,8 +578,8 @@ class InnerEarModel:
 
     def get_neighbors_data(self, func_list):
         def apply_on_real_neighbors(func):
-            def f(neighbours):
-                indices = neighbours.to_numpy()
+            def f(neighbors):
+                indices = neighbors.to_numpy()
                 return func(self.sheet.edge_df.loc[indices[indices >= 0], "face"].unique())
             return f
         if hasattr(func_list, "__len__"):
@@ -561,7 +592,7 @@ class InnerEarModel:
         if only_differentiation:
             model = model_factory([EmptyAffector])
         elif add_random_forces:
-            model = model_factory([LineTension, FaceContractility, FaceAreaElasticity, FaceRepulsion, RandomAffector])
+            model = model_factory([LineTension, FaceContractility, FaceAreaElasticity, FaceRepulsion])
         else:
             model = model_factory([LineTension, FaceContractility, FaceAreaElasticity])
         return model
@@ -668,8 +699,8 @@ class InnerEarModel:
             manager.append(intercalation)
         return intercalation
 
-    def get_differentiation_function(self, l, m, mu, rho, betaN, betaD, inhibition=False):
-        def differentiation(sheet, manager, dt=1.):
+    def get_differentiation_function(self, l, m, mu, rho, betaN, betaD, inhibition=False, dt=1.):
+        def differentiation(sheet, manager):
             # Notch and delta levels of each cell
             levels = sheet.face_df.loc[:,['notch_level', 'delta_level', 'notch_sensitivity']]
             notch_level = levels.notch_level.to_numpy()
@@ -692,7 +723,7 @@ class InnerEarModel:
             sheet.face_df.loc[:, 'notch_level'] = new_notch
             sheet.face_df.loc[:, 'delta_level'] = new_delta
             self.update_cell_type_parameters(new_delta)
-            manager.append(differentiation, dt=dt)
+            manager.append(differentiation)
         return differentiation
 
     def get_length_dependent_differentiation_function(self, l, m, mu, rho, xhi, betaN, betaD, betaR, kt, gammaR, inhibition=False):
@@ -704,21 +735,28 @@ class InnerEarModel:
             face_data = sheet.face_df[['repressor_level', 'notch_level', 'delta_level', 'perimeter', 'notch_sensitivity']]
             face_list, number_of_edges = np.unique(edge_data.face.values, return_counts=True)
             face_data.loc[face_list, 'n_edges'] = number_of_edges
-            face_data['mean_notch_level'] = face_data.eval('notch_level / n_edges')
-            face_data['mean_delta_level'] = face_data.eval('delta_level / n_edges')
-            edge_data.loc[:, ['notch_level', 'delta_level', 'face_perimeter', 'face_repressor_level']] =\
-                face_data.loc[edge_data.face.values, ['mean_notch_level','mean_delta_level', 'perimeter', 'repressor_level']]
-            edge_data.loc[:, ['opposite_notch_level','opposite_delta_level']] = \
-                edge_data.loc[edge_data.opposite.values, ['notch_level', 'delta_level']]
-            edge_data.loc[:, "interaction_level"] = edge_data.eval('notch_level * opposite_delta_level * edge_length')
-            face_data = face_data.join(edge_data.group_by("face")["interaction_level"].sum(), on="face", how="left")
+            face_data['notch_level_per_length'] = face_data.eval('notch_level / perimeter')
+            face_data['delta_level_per_length'] = face_data.eval('delta_level / perimeter')
+            for to_key, from_key in zip(['notch_level_per_length', 'delta_level_per_length', 'face_perimeter', 'face_repressor_level'],
+                                        ['notch_level_per_length','delta_level_per_length', 'perimeter', 'repressor_level']):
+                edge_data.loc[:, to_key] = face_data.loc[edge_data.face.values, from_key].to_numpy()
+            edge_data["notch_level"] = edge_data.eval('notch_level_per_length * length')
+            edge_data["delta_level"] = edge_data.eval('delta_level_per_length * length')
+            has_opposite = edge_data.opposite.values >= 0
+            edge_data.loc[edge_data.index[has_opposite], ['opposite_notch_level','opposite_delta_level']] = \
+                edge_data.loc[edge_data.opposite.values[has_opposite], ['notch_level', 'delta_level']].to_numpy()
+            edge_data["interaction_level"] = edge_data.eval('notch_level * opposite_delta_level * length')
+            edge_data["interaction_level"].fillna(0)
+            face_data = face_data.join(edge_data.groupby("face")["interaction_level"].sum(), on="face", how="left")
 
             edge_notch_levels = edge_data.notch_level.to_numpy()
             edge_delta_levels = edge_data.delta_level.to_numpy()
             matching_faces_perimeter = edge_data.face_perimeter.to_numpy()
-            matching_face_repressor = edge_data.repressor_level.to_numpy()
+            matching_face_repressor = edge_data.face_repressor_level.to_numpy()
             opposite_notch_levels = edge_data.opposite_notch_level.to_numpy()
+            opposite_notch_levels[np.isnan(opposite_notch_levels)] = 0
             opposite_delta_levels = edge_data.opposite_delta_level.to_numpy()
+            opposite_delta_levels[np.isnan(opposite_delta_levels)] = 0
             face_repressor_levels = face_data.repressor_level.to_numpy()
             face_interactions_level = face_data.interaction_level.to_numpy()
             face_sensitivity = face_data.notch_sensitivity.to_numpy()
@@ -732,26 +770,38 @@ class InnerEarModel:
             delta_change = g(matching_face_repressor)*betaD/matching_faces_perimeter - edge_delta_levels - edge_delta_levels*opposite_notch_levels/kt
             repressor_change = f(face_interactions_level, face_sensitivity)*betaR - gammaR*face_repressor_levels
 
-            edge_data.loc[:, "notch_level"] = edge_data.loc[:, "notch_level"] + notch_change * mu * dt
-            edge_data.loc[:, "delta_level"] = edge_data.loc[:, "notch_level"] + delta_change * rho * dt
-            new_notch_delta_levels = edge_data.group_by("face")["notch_level", "delta_level"].sum()
+            edge_data.loc[:, "notch_level"] = edge_data.notch_level.values + notch_change * mu * dt
+            edge_data.loc[:, "delta_level"] = edge_data.delta_level.values + delta_change * rho * dt
+            new_notch_delta_levels = edge_data.groupby("face")["face", "notch_level", "delta_level"].sum()
             new_notch_delta_levels.set_index("face", inplace=True)
-
-            sheet.face_df.update(new_notch_delta_levels.notch_level)
+            sheet.face_df.update(new_notch_delta_levels)
             sheet.face_df.loc[:, "repressor_level"] = sheet.face_df.repressor_level.values + repressor_change * xhi * dt
-
             self.update_cell_type_parameters(sheet.face_df.delta_level.values)
             manager.append(differentiation, dt=dt)
         return differentiation
 
-    def get_aging_sensitivity_function(self, rate):
-        def aging_sensitivity(sheet, manager, dt=1.):
+    def get_aging_sensitivity_function(self, rate, dt):
+        def aging_sensitivity(sheet, manager):
             sheet.face_df.loc[:, "notch_sensitivity"] = sheet.face_df.notch_sensitivity.values + rate**dt
         return aging_sensitivity
+
+
+    def get_random_initializer(self, wait_time=5, dt=1.):
+        self.time_to_random = wait_time
+        def random_initializer(sheet, manager):
+            if self.time_to_random <= 0:
+                self.set_random_parameters()
+                self.time_to_random = wait_time
+            else:
+                self.time_to_random -= dt
+            manager.append(random_initializer)
+        return random_initializer
 
     def save_notch_delta(self, file_path):
         levels = self.sheet.face_df.loc[:, ['notch_level', 'delta_level']]
         levels.to_pickle(file_path)
+
+
 
     def initialize_notch_delta(self, random_sensitivity=False, saved_levels_file_path=None):
         if saved_levels_file_path is not None and os.path.isfile(saved_levels_file_path):
@@ -767,20 +817,29 @@ class InnerEarModel:
             self.sheet.face_df.loc[:, 'notch_sensitivity'] = np.random.rand(self.sheet.face_df.shape[0])
 
 
-    def simulate(self, t_end, dt, notch_inhibition=False, only_differentiation=False, random_forces=False, aging_sensitivity=False):
+    def simulate(self, t_end, dt, notch_inhibition=False, only_differentiation=False, random_forces=False,
+                 aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False):
         manager = EventManager("face")
-        manager.append(self.get_ablation_function(2))
-        manager.append(self.get_differentiation_function(l=2, m=2, mu=10, rho=10, betaN=100, betaD=1,
-                                                        inhibition=notch_inhibition), dt=dt)
+        # manager.append(self.get_ablation_function(2))
+        if not no_differentiation:
+            if contact_dependent_differentiation:
+                manager.append(self.get_length_dependent_differentiation_function(l=3, m=3, mu=10, rho=10, xhi=10, betaN=100,
+                                                                                  betaD=1, betaR=1, kt=1, gammaR=1,
+                                                                                  inhibition=notch_inhibition), dt=dt)
+            else:
+                manager.append(self.get_differentiation_function(l=3, m=3, mu=10, rho=10, betaN=100, betaD=1,
+                                                                 inhibition=notch_inhibition), dt=dt)
         if aging_sensitivity:
-            manager.append(self.get_aging_sensitivity_function(rate=10))
+            manager.append(self.get_aging_sensitivity_function(rate=10, dt=dt))
         if not only_differentiation:
-            manager.append(self.get_division_function(crit_area=1.01))
+            manager.append(self.get_division_function(crit_area=1.3))
             manager.append(self.get_intercalation_function(crit_edge_length=0.04))
             manager.append(self.get_delamination_function(crit_area=0.1, shrink_rate=1.2))
             manager.append(self.sheet.get_update_virtual_vertices_function())
+        if random_forces:
+            manager.append(self.get_random_initializer(wait_time=1, dt=dt))
         history = History(self.sheet, save_all=True)
-        model = self.get_model(only_differentiation, random_forces)
+        model = self.get_model(only_differentiation)
         solver = EulerSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=True)
         self.sheet.vert_df['viscosity'] = 3.0
         # for diff in range(100):
@@ -792,14 +851,23 @@ class InnerEarModel:
         return history
 
     @staticmethod
-    def draw_sheet(sheet, number_vertices=False, number_edges=False, number_faces=False, is_ordered=True):
+    def draw_sheet(sheet, number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
+                   for_labels=False):
         if not sheet.check_all_edge_order():
             print("bug in drawing")
             sheet.order_all_edges()
         draw_specs = tyssue.config.draw.sheet_spec()
-        cmap = plt.cm.get_cmap('Greens').reversed()
-        cmap_scale = sheet.face_df.delta_level.to_numpy()
-        color_cmap = cmap(0.7*(cmap_scale - 1) + 1)
+        if for_labels:
+            cmap_scale = sheet.face_df.id.to_numpy()
+            color_cmap = np.zeros((cmap_scale.size, 4))
+            color_cmap[:,0] = (cmap_scale%127) / 127
+            color_cmap[:,1] = ((cmap_scale//127)%127) / 127
+            color_cmap[:,2] = 0.5
+            color_cmap[:,3] = 1
+        else:
+            cmap = plt.cm.get_cmap('Greens').reversed()
+            cmap_scale = sheet.face_df.delta_level.to_numpy()
+            color_cmap = cmap(0.7*(cmap_scale - 1) + 1)
         draw_specs['face']['color'] = color_cmap
         draw_specs['face']['alpha'] = 0.5
         draw_specs['face']['visible'] = True
@@ -825,6 +893,57 @@ class InnerEarModel:
                         edge, weight="bold", color="green")
 
         return fig, ax
+    @staticmethod
+    def save_sheet_labels_to_numpy(sheet, path):
+        # Creating labeld image
+        Nc = sheet.Nc
+        fig, ax = InnerEarModel.draw_sheet(sheet, for_labels=True)
+        fig.tight_layout(pad=0)
+        ax.set_axis_off()
+        canvas = fig.canvas
+        canvas.draw()
+        data = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
+        data = data.reshape(canvas.get_width_height()[::-1] + (3,))
+        data0 = data[:,:,0].copy()
+        data0[data[:,:,2] != 191] = 0
+        data1 = data[:,:,1].copy()
+        data1[data[:,:,2] != 191] = 0
+        labels = np.zeros(data0.shape)
+        values1 = np.unique(data1)
+        values0 = np.unique(data0)
+        i = 1
+        for v1 in values1:
+            for v0 in values0:
+                if i <= Nc:
+                    if v0 != 0 or v1 != 0:
+                        cell_pixels = np.logical_and(data0 == v0, data1 == v1)
+                        if cell_pixels.any():
+                            labels[np.logical_and(data0 == v0, data1 == v1)] = i
+                            i += 1
+        np.save(path, labels.astype("uint16"))
+        return 0
+
+    @staticmethod
+    def save_contact_matrix_to_numpy(sheet, path):
+        contact_matrix = sheet.get_contact_matrix()
+        np.save(path, contact_matrix)
+        return 0
+
+    @staticmethod
+    def save_face_data_to_df(sheet, path):
+        face_data = sheet.face_df
+        neighbors = []
+        for id, face in face_data.iterrows():
+            neighbors.append(set(sheet.get_neighbors(id)))
+        cells_info_dict = {"label": face_data.id.to_numpy() + 1, "cx":face_data.x.to_numpy(),
+                           "cy": face_data.y.to_numpy(), "type": face_data.type.to_numpy(),
+                           "perimeter": face_data.perimeter.to_numpy(), "valid": face_data.is_alive.to_numpy(),
+                           "notch_level": face_data.notch_level.to_numpy(),
+                           "delta_level": face_data.delta_level.to_numpy(),
+                           "neighbors": neighbors}
+        cells_info = pd.DataFrame(cells_info_dict)
+        cells_info.to_pickle(path)
+        return 0
 
 
 def get_neighbors_from_history(history, face, time):
@@ -852,11 +971,14 @@ def find_differentiation_events(history):
 
 if __name__ == "__main__":
     initial_sheet_name = ""
-    name = "ablation_trial"
+    name = "contact_dependent_diff_only"
     random_sensitivity = False
     aging_sensitivity = False
-    only_differentiation = False
+    only_differentiation = True
+    no_differentiation = False
+    contact_dependent_differentiation = True
     random_forces = False
+
 
     if os.path.isfile("%s.hf5" % initial_sheet_name):
         history = HistoryHdf5.from_archive("%s.hf5" % initial_sheet_name, eptm_class=VirtualSheet)
@@ -866,20 +988,22 @@ if __name__ == "__main__":
         sheet = VirtualSheet.planar_sheet_2d(
             'basic2D',  # a name or identifier for this sheet
             nx=5,  # approximate number of cells on the x axis
-            ny=6,  # approximae number of cells along the y axis
+            ny=5,  # approximae number of cells along the y axis
             distx=1,  # distance between 2 cells along x
             disty=1  # distance between 2 cells along y
         )
+        sheet.set_maximal_bond_length(0.5)  # was 0.2
+        sheet.set_minimal_bond_length(0.05) # was 0.05
         sheet.initiate_edge_order()
         sheet.add_virtual_vertices()
-    sheet.set_maximal_bond_length(0.2)  # was 0.2
-    sheet.set_minimal_bond_length(0.05)  # was 0.05
     inner = InnerEarModel(sheet, random_sensitivity=random_sensitivity,
                           saved_notch_delta_levels_file="%s_notch_delta_levels.pkl" % initial_sheet_name)
     fig1, ax1 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=False)
     plt.savefig("%s_initial.png" % name)
-    history = inner.simulate(t_end=10, dt=0.01, notch_inhibition=False, only_differentiation=only_differentiation,
-                             random_forces=random_forces, aging_sensitivity=aging_sensitivity)
+    history = inner.simulate(t_end=100, dt=0.1, notch_inhibition=False, only_differentiation=only_differentiation,
+                             random_forces=random_forces, aging_sensitivity=aging_sensitivity,
+                             no_differentiation=no_differentiation,
+                             contact_dependent_differentiation=contact_dependent_differentiation)
     # history2 = inner.simulate(t_end=5, dt=0.01, notch_inhibition=True)
     if os.path.isfile("%s.hf5" % name):
         os.remove("%s.hf5" % name)
@@ -890,6 +1014,9 @@ if __name__ == "__main__":
     # history2.to_archive("%s_after.hf5" % name)
     fig2, ax2 = inner.draw_sheet(inner.sheet, number_faces=True, number_edges=False, number_vertices=False)
     plt.savefig("%s_finale.png" % name)
+    inner.save_sheet_labels_to_numpy(inner.sheet, path="%s_labels.npy" % name)
+    inner.save_contact_matrix_to_numpy(inner.sheet, path="%s_contact_matrix.npy" % name)
+    inner.save_face_data_to_df(inner.sheet, path="%s_cells_info.npy" % name)
     create_gif(history, "%s.gif" % name, num_frames=len(history), draw_func=inner.draw_sheet)
     # create_gif(history2, "%s_after.gif" % name, num_frames=len(history), draw_func=inner.draw_sheet)
 
