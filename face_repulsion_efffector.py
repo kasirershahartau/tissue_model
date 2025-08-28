@@ -1,5 +1,3 @@
-import sys
-sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue\\tyssue')
 from tyssue.dynamics.effectors import AbstractEffector, units, to_nd
 from tyssue.dynamics.planar_gradients import area_grad as area_grad_2d
 import numpy as np

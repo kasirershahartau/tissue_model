@@ -1,9 +1,4 @@
-import os.path
-import pickle
-import random
-import sys
-sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue\\tyssue')
-from tyssue import Sheet, config, History
+from tyssue import Sheet, config
 from tyssue import PlanarGeometry as geom
 from tyssue.topology.base_topology import add_vert, collapse_edge
 import numpy as np

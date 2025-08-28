@@ -1,6 +1,4 @@
-import sys
-sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue\\tyssue')
-from tyssue.dynamics.effectors import AbstractEffector, units, to_nd, LineTension, FaceAreaElasticity, FaceContractility
+from tyssue.dynamics.effectors import AbstractEffector, units
 import numpy as np
 import pandas as pd
 
