@@ -169,6 +169,33 @@ class InnerEarModel:
         else:
             return self.sheet.edge_df.groupby("face")["opposite"].agg(apply_on_real_neighbors(func_list))
 
+    def get_edge_tension(self, relevant_effectors):
+        edge_data = self.sheet.edge_df[["ux", "uy"]]
+        tension_model = model_factory(relevant_effectors)
+        grads = tension_model.compute_gradient(self.sheet, components=True)
+        norm_factor = self.sheet.specs["settings"].get("nrj_norm_factor", 1)
+        srce_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Ne]
+        if srce_grads:
+            edge_data["srce_gx"] = srce_grads["gx"]
+            edge_data["srce_gy"] = srce_grads["gy"]
+        trgt_grads = [
+            g[1] for g in grads if (g[1] is not None) and (g[1].shape[0] == self.sheet.Ne)
+        ]
+        if trgt_grads:
+            edge_data["trgt_gx"] = trgt_grads["gx"]
+            edge_data["trgt_gy"] = trgt_grads["gy"]
+        vert_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Nv]
+        if vert_grads:
+            raise NotImplementedError
+        edge_data["tension"] = edge_data.eval("((trgt_gx - srce_gx) * ux + (trgt_gy - srce_gy) * uy)/ %s" % str(norm_factor))
+        return edge_data.tension
+
+    def get_face_tension(self, relevant_effectors):
+        edge_tension = self.get_edge_tension(relevant_effectors)
+        tension_df = pd.DataFrame({"face": self.sheet.edge_df.face.to_numpy(),"tension": edge_tension.to_numpy()})
+        face_tension = tension_df.groupby("face").sum()
+        return face_tension
+
     @staticmethod
     def get_model(only_differentiation=False, effectors=None):
         if only_differentiation:
@@ -212,14 +239,16 @@ class InnerEarModel:
                  aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False,
                  l=3, m=3, mu=10, rho=10, xhi=10, betaN=1, betaD=1, betaR=1, kt=1, gammaR=1, sensitivity_aging_rate=10,
                  division_area=1.3, intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
-                 viscosity=3, effectors=None):
+                 viscosity=3, effectors=None, mechanosensitivity=0, tension_effectors=None):
         manager = EventManager("face")
         # manager.append(self.get_ablation_function(2))
         if not no_differentiation:
             if contact_dependent_differentiation:
                 manager.append(self.lateral_inhibition_model.get_length_dependent_differentiation_function(l=l, m=m, mu=mu, rho=rho, xhi=xhi, betaN=betaN,
                                                                                   betaD=betaD, betaR=betaR, kt=kt, gammaR=gammaR,
-                                                                                  inhibition=notch_inhibition), dt=dt)
+                                                                                  inhibition=notch_inhibition,
+                                                                                  mechanosensitivity=mechanosensitivity,
+                                                                                  tension_effectors=tension_effectors), dt=dt)
             else:
                 manager.append(self.lateral_inhibition_model.get_differentiation_function(l=l, m=m, mu=mu, rho=rho, betaN=betaN, betaD=betaD,
                                                                  inhibition=notch_inhibition), dt=dt)
@@ -233,7 +262,7 @@ class InnerEarModel:
         if random_forces:
             manager.append(self.get_random_initializer(wait_time=1, dt=dt))
         history = History(self.sheet, save_all=True)
-        model = self.get_model(only_differentiation)
+        model = self.get_model(only_differentiation, effectors=effectors)
         solver = EulerSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=True)
         self.sheet.vert_df['viscosity'] = viscosity
         # for diff in range(100):

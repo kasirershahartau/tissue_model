@@ -7,6 +7,7 @@ from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 
+
 def initialize_sheet(nx, ny, distx=1, disty=1, max_bond_length=0.5, min_bond_length=0.05):
     sheet = VirtualSheet.planar_sheet_2d(
         'basic2D',  # a name or identifier for this sheet
@@ -21,10 +22,12 @@ def initialize_sheet(nx, ny, distx=1, disty=1, max_bond_length=0.5, min_bond_len
     sheet.add_virtual_vertices()
     return sheet
 
+
 def load_sheet_from_file(initial_sheet_name):
     history = HistoryHdf5.from_archive("%s.hf5" % initial_sheet_name, eptm_class=VirtualSheet)
     last_time_point = np.max(history.time_stamps)
     return history.retrieve(last_time_point)
+
 
 if __name__ == "__main__":
 
@@ -46,11 +49,13 @@ if __name__ == "__main__":
     contact_dependent_differentiation = True
     random_forces = False
     notch_inhibition = False
+    tension_dependent = False
 
     # Model Parameters
     # General parameters
     t_end = 10
     dt = 0.001
+    movie_frames = 100
 
     # 2D vertex related parameters
     effectors = [LineTension, FaceContractility, FaceAreaElasticity]
@@ -91,6 +96,11 @@ if __name__ == "__main__":
     kt = 5
     gammaR = 60
     sensitivity_aging_rate = 10
+    mechanosensitivity = 1
+    tension_effectors = [LineTension, FaceContractility]
+
+    if not tension_dependent:
+        mechanosensitivity = 0
 
     # Load or initialize sheet
     if os.path.isfile("%s.hf5" % initial_sheet_name):
@@ -115,7 +125,8 @@ if __name__ == "__main__":
                              gammaR=gammaR, sensitivity_aging_rate=sensitivity_aging_rate,
                              division_area=division_area, intercalation_length=intercalation_length,
                              delamination_area=delamination_area, delamination_rate=delamination_rate,
-                             viscosity=viscosity, effectors=effectors
+                             viscosity=viscosity, effectors=effectors, mechanosensitivity=mechanosensitivity,
+                             tension_effectors=tension_effectors
                              )
     if os.path.isfile("%s.hf5" % name):
         os.remove("%s.hf5" % name)
@@ -126,4 +137,4 @@ if __name__ == "__main__":
     inner.save_sheet_labels_to_numpy(inner.sheet, path="%s_labels.npy" % name)
     inner.save_contact_matrix_to_numpy(inner.sheet, path="%s_contact_matrix.npy" % name)
     inner.save_face_data_to_df(inner.sheet, path="%s_cells_info.npy" % name)
-    create_gif(history, "%s.gif" % name, num_frames=len(history), draw_func=inner.draw_sheet)
+    create_gif(history, "%s.gif" % name, num_frames=movie_frames, draw_func=inner.draw_sheet)

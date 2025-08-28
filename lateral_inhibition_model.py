@@ -31,7 +31,9 @@ class LateralInhibitionModel:
             manager.append(differentiation)
         return differentiation
 
-    def get_length_dependent_differentiation_function(self, l, m, mu, rho, xhi, betaN, betaD, betaR, kt, gammaR, inhibition=False):
+    def get_length_dependent_differentiation_function(self, l, m, mu, rho, xhi, betaN, betaD, betaR, kt, gammaR,
+                                                      inhibition=False, tension_effectors=None,
+                                                      mechanosensitivity=0):
         if inhibition:
             return self.get_differentiation_function(l, m, mu, rho, inhibition=inhibition)
         def differentiation(sheet, manager, dt=1.):
@@ -52,6 +54,8 @@ class LateralInhibitionModel:
                 edge_data.loc[edge_data.opposite.values[has_opposite], ['notch_level', 'delta_level']].to_numpy()
             edge_data["interaction_level"] = edge_data.eval('notch_level * opposite_delta_level * length').fillna(0)
             face_data = face_data.join(edge_data.groupby("face")["interaction_level"].sum(), on="face", how="left")
+            if mechanosensitivity > 0:
+                edge_data["tension"] = self.model.get_edge_tension(self, tension_effectors)
 
             edge_notch_levels = edge_data.notch_level.to_numpy()
             edge_delta_levels = edge_data.delta_level.to_numpy()
@@ -70,9 +74,17 @@ class LateralInhibitionModel:
 
             def g(x):
                 return 1/(1 + (x**l))
-            notch_change = betaN/matching_faces_perimeter - edge_notch_levels - edge_notch_levels*opposite_delta_levels/kt
-            delta_change = g(matching_face_repressor)*betaD/matching_faces_perimeter - edge_delta_levels - edge_delta_levels*opposite_notch_levels/kt
-            repressor_change = f(face_interactions_level, face_sensitivity)*betaR - gammaR*face_repressor_levels
+
+            delta_production = g(matching_face_repressor)*betaD/matching_faces_perimeter
+            if mechanosensitivity > 0:
+                edge_tension = edge_data.tension.to_numpy()
+                delta_production = delta_production * f(edge_tension, mechanosensitivity)
+            notch_production = betaN/matching_faces_perimeter
+            repressor_production = f(face_interactions_level, face_sensitivity)*betaR
+
+            notch_change = notch_production - edge_notch_levels - edge_notch_levels*opposite_delta_levels/kt
+            delta_change = delta_production - edge_delta_levels - edge_delta_levels*opposite_notch_levels/kt
+            repressor_change = repressor_production - gammaR*face_repressor_levels
 
             edge_data.loc[:, "notch_level"] = edge_data.notch_level.values + notch_change * mu * dt
             edge_data.loc[:, "delta_level"] = edge_data.delta_level.values + delta_change * rho * dt
