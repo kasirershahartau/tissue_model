@@ -170,20 +170,20 @@ class InnerEarModel:
             return self.sheet.edge_df.groupby("face")["opposite"].agg(apply_on_real_neighbors(func_list))
 
     def get_edge_tension(self, relevant_effectors):
-        edge_data = self.sheet.edge_df[["ux", "uy"]]
+        edge_data = self.sheet.edge_df[["ux", "uy"]].copy()
         tension_model = model_factory(relevant_effectors)
         grads = tension_model.compute_gradient(self.sheet, components=True)
         norm_factor = self.sheet.specs["settings"].get("nrj_norm_factor", 1)
         srce_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Ne]
         if srce_grads:
-            edge_data["srce_gx"] = srce_grads["gx"]
-            edge_data["srce_gy"] = srce_grads["gy"]
+            edge_data["srce_gx"] = np.array([grad.gx.values for grad in srce_grads]).sum(axis=0)
+            edge_data["srce_gy"] = np.array([grad.gy.values for grad in srce_grads]).sum(axis=0)
         trgt_grads = [
             g[1] for g in grads if (g[1] is not None) and (g[1].shape[0] == self.sheet.Ne)
         ]
         if trgt_grads:
-            edge_data["trgt_gx"] = trgt_grads["gx"]
-            edge_data["trgt_gy"] = trgt_grads["gy"]
+            edge_data["trgt_gx"] = np.array([grad.gx.values for grad in trgt_grads]).sum(axis=0)
+            edge_data["trgt_gy"] = np.array([grad.gy.values for grad in trgt_grads]).sum(axis=0)
         vert_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Nv]
         if vert_grads:
             raise NotImplementedError

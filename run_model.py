@@ -33,7 +33,7 @@ if __name__ == "__main__":
 
     # Sheet Parameters
     initial_sheet_name = ""
-    name = "contact_dependent_diff_only"
+    name = "tension_dependent"
     nx = 5
     ny = 5
     distx = 1
@@ -44,17 +44,17 @@ if __name__ == "__main__":
     # Model version select
     random_sensitivity = False
     aging_sensitivity = False
-    only_differentiation = True
+    only_differentiation = False
     no_differentiation = False
     contact_dependent_differentiation = True
     random_forces = False
     notch_inhibition = False
-    tension_dependent = False
+    tension_dependent = True
 
     # Model Parameters
     # General parameters
-    t_end = 10
-    dt = 0.001
+    t_end = 100
+    dt = 0.01
     movie_frames = 100
 
     # 2D vertex related parameters
@@ -81,26 +81,48 @@ if __name__ == "__main__":
     intercalation_length = 0.04
     delamination_area = 0.1
     delamination_rate = 1.2
-    viscosity = 3
+    viscosity = 1
 
     # Lateral Inhibition parameters
     differentiation_threshold = 0.5
-    l = 3
-    m = 3
-    mu = 10
-    rho = 10
-    xhi = 10
-    betaN = 3.9
-    betaD = 3.9
-    betaR = 194
-    kt = 5
-    gammaR = 60
-    sensitivity_aging_rate = 10
-    mechanosensitivity = 1
-    tension_effectors = [LineTension, FaceContractility]
+    l = 3  # decreasing Hill exponent
+    m = 3  # increasing Hill exponent
+    mu = 0.1  # change rate Notch
+    rho = 0.1  # change rate Delta
+    xhi = 0.1  # change rate repressor
+    betaN = 3.9  # maximum production rate Notch
+    betaD = 3.9  # maximum production rate Delta
+    betaR = 194  # maximum production rate repressor
+    kt = 5  # Notch Delta complex binding rate
+    gammaR = 60  # repressor degradation rate
+    sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
+    mechanosensitivity = 0.5  # Sensitivity to tension (for tension dependent version)
+    tension_effectors = [LineTension, FaceContractility]  # effectors to calculate tension (for tension dependent version)
 
     if not tension_dependent:
         mechanosensitivity = 0
+
+
+    results_dir = os.path.join("results", name)
+    if os.path.exists(results_dir):
+        overwrite = input("overwriting existing results, are you sure? (y/n)")
+        if overwrite not in ["y", "Y", "yes", "Yes"]:
+            exit(0)
+    else:
+        os.mkdir(results_dir)
+
+
+    #  Saving model  parameters
+    params_file = os.path.join(os.path.join("results", name, name + "_parameters.txt"))
+    variables = globals().copy().items()
+    with open(params_file, "w") as f:
+        for var_name, var_value in variables:
+            # Exclude built-in and special variables (e.g., those starting with '__')
+            if not var_name.startswith("__") and not callable(var_value) and not isinstance(var_value, type(os)):
+                f.write(f"{var_name}: {repr(var_value)}\n")
+
+    initial_sheet_name = os.path.join("results", initial_sheet_name, initial_sheet_name)
+    name = os.path.join("results", name, name)
 
     # Load or initialize sheet
     if os.path.isfile("%s.hf5" % initial_sheet_name):

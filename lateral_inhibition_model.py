@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.integrate import solve_ivp
 
 class LateralInhibitionModel:
     def __init__(self, model):
@@ -55,7 +56,7 @@ class LateralInhibitionModel:
             edge_data["interaction_level"] = edge_data.eval('notch_level * opposite_delta_level * length').fillna(0)
             face_data = face_data.join(edge_data.groupby("face")["interaction_level"].sum(), on="face", how="left")
             if mechanosensitivity > 0:
-                edge_data["tension"] = self.model.get_edge_tension(self, tension_effectors)
+                edge_data["tension"] = self.model.get_edge_tension(tension_effectors)
 
             edge_notch_levels = edge_data.notch_level.to_numpy()
             edge_delta_levels = edge_data.delta_level.to_numpy()
