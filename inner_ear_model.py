@@ -10,7 +10,7 @@ import tyssue
 from tyssue import config, History
 from tyssue.draw import sheet_view
 from tyssue.behaviors import EventManager
-from tyssue.solvers.viscous import EulerSolver
+from solvers import IVPSolver
 from tyssue.dynamics import model_factory
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 
@@ -88,6 +88,7 @@ class InnerEarModel:
             sheet.vert_df.drop('time', inplace=True, axis=1)
             if np.isnan(sheet.vert_df['vert']).any():
                 sheet.vert_df.set_index('index', inplace=True)
+                sheet.vert_df.drop(columns=['vert'], inplace=True)
             else:
                 sheet.vert_df.set_index('vert', inplace=True)
         if 'edge' in sheet.edge_df.columns:
@@ -219,17 +220,25 @@ class InnerEarModel:
         return random_initializer
 
     def save_notch_delta(self, file_path):
-        levels = self.sheet.face_df.loc[:, ['notch_level', 'delta_level']]
+        relevant_columns = ['notch_level', 'delta_level']
+        if 'repressor_level' in self.sheet.face_df.columns:
+            relevant_columns.append('repressor_level')
+        levels = self.sheet.face_df.loc[:, relevant_columns]
+
         levels.to_pickle(file_path)
 
-    def initialize_notch_delta(self, random_sensitivity=False, saved_levels_file_path=None):
+    def initialize_notch_delta(self, random_sensitivity=False, contact_dependent=False, saved_levels_file_path=None):
         if saved_levels_file_path is not None and os.path.isfile(saved_levels_file_path):
             levels = pd.read_pickle(saved_levels_file_path)
             self.sheet.face_df.loc[:, 'notch_level'] = levels.notch_level.values
             self.sheet.face_df.loc[:, 'delta_level'] = levels.delta_level.values
+            if contact_dependent and 'repressor_level' in levels.columns:
+                self.sheet.face_df.loc[:, 'repressor_level'] = levels.repressor.values
         else:
             self.sheet.face_df.loc[:, 'notch_level'] = np.random.rand(self.sheet.face_df.shape[0])
             self.sheet.face_df.loc[:, 'delta_level'] = np.random.rand(self.sheet.face_df.shape[0])
+            if contact_dependent:
+                self.sheet.face_df.loc[:, 'repressor_level'] = np.random.rand(self.sheet.face_df.shape[0])
             # self.sheet.face_df.loc[:, 'notch_level'] = 1
             # self.sheet.face_df.loc[:, 'delta_level'] = 0
         if random_sensitivity:
@@ -263,7 +272,7 @@ class InnerEarModel:
             manager.append(self.get_random_initializer(wait_time=1, dt=dt))
         history = History(self.sheet, save_all=True)
         model = self.get_model(only_differentiation, effectors=effectors)
-        solver = EulerSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=True)
+        solver = IVPSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=True)
         self.sheet.vert_df['viscosity'] = viscosity
         # for diff in range(100):
         #     manager.execute(self.sheet)

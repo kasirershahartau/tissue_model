@@ -32,14 +32,17 @@ def load_sheet_from_file(initial_sheet_name):
 if __name__ == "__main__":
 
     # Sheet Parameters
-    initial_sheet_name = ""
-    name = "tension_dependent"
+    initial_sheet_name = "random_array_0"
+    load_lateral_inhibition_data_from_file = False
+    name = "tension_dependent_on_random0"
+    max_bond_length = 0.5
+    min_bond_length = 0.05
+
+    # In case initial_sheet_name == "", creating a new sheet with the following parameters
     nx = 5
     ny = 5
     distx = 1
     disty = 1
-    max_bond_length = 0.5
-    min_bond_length = 0.05
 
     # Model version select
     random_sensitivity = False
@@ -53,7 +56,7 @@ if __name__ == "__main__":
 
     # Model Parameters
     # General parameters
-    t_end = 100
+    t_end = 0.1
     dt = 0.01
     movie_frames = 100
 
@@ -81,7 +84,7 @@ if __name__ == "__main__":
     intercalation_length = 0.04
     delamination_area = 0.1
     delamination_rate = 1.2
-    viscosity = 1
+    viscosity = 5
 
     # Lateral Inhibition parameters
     differentiation_threshold = 0.5
@@ -129,13 +132,19 @@ if __name__ == "__main__":
         sheet = load_sheet_from_file(initial_sheet_name)
     else:
         sheet = initialize_sheet(nx, ny, distx, disty, max_bond_length, min_bond_length)
+    if load_lateral_inhibition_data_from_file:
+        lateral_inhibition_data_file = "%s_notch_delta_levels.pkl" % initial_sheet_name
+    else:
+        lateral_inhibition_data_file = None
+    sheet.set_maximal_bond_length = max_bond_length
+    sheet.set_minimal_bond_length = min_bond_length
 
     # Initialize model
     inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
                           repulsion_exp=repulsion_exponent, preferred_area=preferred_area, contractility=contractility,
                           elasticity=elasticity, differentiation_threshold=differentiation_threshold,
                           random_sensitivity=random_sensitivity,
-                          saved_notch_delta_levels_file="%s_notch_delta_levels.pkl" % initial_sheet_name)
+                          saved_notch_delta_levels_file=lateral_inhibition_data_file)
 
     fig1, ax1 = inner.draw_sheet(inner.sheet, number_faces=False, number_edges=False, number_vertices=False)
     plt.savefig("%s_initial.png" % name)
