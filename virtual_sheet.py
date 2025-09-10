@@ -130,8 +130,8 @@ class VirtualSheet(Sheet):
         # self.reset_index(order=False)
         self.edge_df.sort_values(["face", "order"], inplace=True)
         self.get_opposite()
-        if not self.check_all_edge_order():
-            print("bug in adding virtual vertices")
+        # if not self.check_all_edge_order():
+        #     print("bug in adding virtual vertices")
 
     def remove_virtual_vertex(self, edge_id):
         srce_idx = self.edge_df.loc[edge_id].srce
@@ -166,8 +166,8 @@ class VirtualSheet(Sheet):
         # sheet.edge_df.sort_values(["face", "order"], inplace=True)
         # sheet.get_opposite()
         # self.geom.update_all(self)
-        if not self.check_all_edge_order():
-            print("bug in removing virtual vertices")
+        # if not self.check_all_edge_order():
+        #     print("bug in removing virtual vertices")
         return 0
 
     def is_virtual_edge(self, edge_indices):

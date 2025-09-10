@@ -33,9 +33,9 @@ if __name__ == "__main__":
 
     # Sheet Parameters
     initial_sheet_name = "random_array_0"
-    load_lateral_inhibition_data_from_file = False
+    load_lateral_inhibition_data_from_file = True
     name = "tension_dependent_on_random0"
-    max_bond_length = 0.5
+    max_bond_length = 0.2
     min_bond_length = 0.05
 
     # In case initial_sheet_name == "", creating a new sheet with the following parameters
@@ -50,18 +50,22 @@ if __name__ == "__main__":
     only_differentiation = False
     no_differentiation = False
     contact_dependent_differentiation = True
-    random_forces = False
     notch_inhibition = False
     tension_dependent = True
+    divisions = False
+    intercalations = True
+    delaminations = True
+    ablated_cells = []
+    random_forces = False
 
     # Model Parameters
     # General parameters
-    t_end = 0.1
+    t_end = 100
     dt = 0.01
     movie_frames = 100
 
     # 2D vertex related parameters
-    effectors = [LineTension, FaceContractility, FaceAreaElasticity]
+    effectors = [FaceContractility, FaceAreaElasticity]
     tension = {('HC', 'HC'): 0.05,
                ('HC', 'SC'): 0.05,
                ('SC', 'SC'): 0.05
@@ -99,8 +103,8 @@ if __name__ == "__main__":
     kt = 5  # Notch Delta complex binding rate
     gammaR = 60  # repressor degradation rate
     sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
-    mechanosensitivity = 0.5  # Sensitivity to tension (for tension dependent version)
-    tension_effectors = [LineTension, FaceContractility]  # effectors to calculate tension (for tension dependent version)
+    mechanosensitivity = 0.2  # Sensitivity to tension (for tension dependent version)
+    tension_effectors = [FaceContractility]  # effectors to calculate tension (for tension dependent version)
 
     if not tension_dependent:
         mechanosensitivity = 0
@@ -136,8 +140,8 @@ if __name__ == "__main__":
         lateral_inhibition_data_file = "%s_notch_delta_levels.pkl" % initial_sheet_name
     else:
         lateral_inhibition_data_file = None
-    sheet.set_maximal_bond_length = max_bond_length
-    sheet.set_minimal_bond_length = min_bond_length
+    sheet.set_maximal_bond_length(max_bond_length)
+    sheet.set_minimal_bond_length(min_bond_length)
 
     # Initialize model
     inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
@@ -151,7 +155,8 @@ if __name__ == "__main__":
     history = inner.simulate(t_end=t_end, dt=dt, notch_inhibition=notch_inhibition, only_differentiation=only_differentiation,
                              random_forces=random_forces, aging_sensitivity=aging_sensitivity,
                              no_differentiation=no_differentiation,
-                             contact_dependent_differentiation=contact_dependent_differentiation,
+                             contact_dependent_differentiation=contact_dependent_differentiation, divisions=divisions,
+                             intercalations=intercalations, delaminations=delaminations, ablated_cells=ablated_cells,
                              l=l, m=m, mu=mu, rho=rho, xhi=xhi, betaN=betaN, betaD=betaD, betaR=betaR, kt=kt,
                              gammaR=gammaR, sensitivity_aging_rate=sensitivity_aging_rate,
                              division_area=division_area, intercalation_length=intercalation_length,

@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 from tyssue.solvers.viscous import EulerSolver, log
-
+from tqdm import tqdm
 
 class IVPSolver(EulerSolver):
     def __init__( self,
@@ -37,12 +37,15 @@ class IVPSolver(EulerSolver):
         ode solving method to use (see scipy.integrate.solve_ivp documentation)
         """
         self.eptm.settings["dt"] = dt
-        for t in np.arange(self.prev_t, tf + dt, dt):
+        for t in tqdm(np.arange(self.prev_t, tf + dt, dt)):
             pos = self.current_pos
             new_pos = solve_ivp(self.ode_func, (0, dt), pos, t_eval=[dt]).y[:,0]
             if self.bounds is not None:
                 new_pos = self.clip_new_pos(pos, new_pos)
             self.set_pos(new_pos)
+            # if not self.eptm.check_all_edge_order():
+            #     print("bug in solver")
+            #     raise IndexError
             self.prev_t = t
             if self.manager is not None:
                 self.manager.execute(self.eptm)

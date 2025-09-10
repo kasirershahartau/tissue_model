@@ -85,17 +85,20 @@ class InnerEarModel:
     @staticmethod
     def arrange_sheet_from_history(sheet):
         if 'vert' in sheet.vert_df.columns:
-            sheet.vert_df.drop('time', inplace=True, axis=1)
             if np.isnan(sheet.vert_df['vert']).any():
                 sheet.vert_df.set_index('index', inplace=True)
                 sheet.vert_df.drop(columns=['vert'], inplace=True)
             else:
                 sheet.vert_df.set_index('vert', inplace=True)
+        if 'time' in sheet.vert_df.columns:
+            sheet.vert_df.drop('time', inplace=True, axis=1)
         if 'edge' in sheet.edge_df.columns:
             sheet.edge_df.set_index('edge', inplace=True)
+        if 'time' in sheet.edge_df.columns:
             sheet.edge_df.drop('time', inplace=True, axis=1)
         if 'face' in sheet.face_df.columns:
             sheet.face_df.set_index('face', inplace=True)
+        if 'time' in sheet.face_df.columns:
             sheet.face_df.drop('time', inplace=True, axis=1)
         return sheet
 
@@ -246,6 +249,7 @@ class InnerEarModel:
 
     def simulate(self, t_end, dt, notch_inhibition=False, only_differentiation=False, random_forces=False,
                  aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False,
+                 divisions=True, intercalations=True, delaminations=True, ablated_cells=[],
                  l=3, m=3, mu=10, rho=10, xhi=10, betaN=1, betaD=1, betaR=1, kt=1, gammaR=1, sensitivity_aging_rate=10,
                  division_area=1.3, intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
                  viscosity=3, effectors=None, mechanosensitivity=0, tension_effectors=None):
@@ -264,15 +268,25 @@ class InnerEarModel:
         if aging_sensitivity:
             manager.append(self.lateral_inhibition_model.get_aging_sensitivity_function(rate=sensitivity_aging_rate, dt=dt))
         if not only_differentiation:
-            manager.append(self.topological_events_handler.get_division_function(crit_area=division_area))
-            manager.append(self.topological_events_handler.get_intercalation_function(crit_edge_length=intercalation_length))
-            manager.append(self.topological_events_handler.get_delamination_function(crit_area=delamination_area, shrink_rate=delamination_rate))
+            if divisions:
+                manager.append(self.topological_events_handler.get_division_function(crit_area=division_area))
+            if intercalations:
+                manager.append(self.topological_events_handler.get_intercalation_function(crit_edge_length=intercalation_length))
+            if delaminations:
+                manager.append(self.topological_events_handler.get_delamination_function(crit_area=delamination_area,
+                                                                                         shrink_rate=delamination_rate))
+            if len(ablated_cells) > 0:
+                for cell in ablated_cells:
+                    manager.append(
+                        self.topological_events_handler.get_ablation_function(cell, shrink_rate=delamination_rate,
+                                                                              critical_area=delamination_area))
             manager.append(self.sheet.get_update_virtual_vertices_function())
+
         if random_forces:
             manager.append(self.get_random_initializer(wait_time=1, dt=dt))
         history = History(self.sheet, save_all=True)
         model = self.get_model(only_differentiation, effectors=effectors)
-        solver = IVPSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=True)
+        solver = IVPSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=False)
         self.sheet.vert_df['viscosity'] = viscosity
         # for diff in range(100):
         #     manager.execute(self.sheet)
