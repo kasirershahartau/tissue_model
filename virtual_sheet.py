@@ -112,17 +112,17 @@ class VirtualSheet(Sheet):
             opposite = int(self.edge_df.loc[edge_ind, "opposite"])
             if opposite >= 0:
                 self.edge_df.at[opposite, "length"] /= 2
-            if new_opposite_edge is None:
-                self.edge_df.at[new_edge, "opposite"] = -1
-            else:
-                opposite_order = self.edge_df.at[opposite, "order"]
-                opposite_face = self.edge_df.at[opposite, "face"]
-                self.edge_df.at[new_edge, "opposite"] = new_opposite_edge
-                self.edge_df.at[new_opposite_edge, "opposite"] = new_edge
-                self.edge_df.at[new_opposite_edge, "length"] /= 2
-                increase_order = self.edge_df.query("face == %d and order > %d" % (opposite_face, opposite_order))
-                self.edge_df.at[opposite, "order"] = opposite_order + 1
-                self.edge_df.loc[increase_order.index, "order"] += 1
+                if new_opposite_edge is None:
+                    self.edge_df.at[new_edge, "opposite"] = -1
+                else:
+                    opposite_order = self.edge_df.at[opposite, "order"]
+                    opposite_face = self.edge_df.at[opposite, "face"]
+                    self.edge_df.at[new_edge, "opposite"] = new_opposite_edge
+                    self.edge_df.at[new_opposite_edge, "opposite"] = new_edge
+                    self.edge_df.at[new_opposite_edge, "length"] /= 2
+                    increase_order = self.edge_df.query("face == %d and order > %d" % (opposite_face, opposite_order))
+                    self.edge_df.at[opposite, "order"] = opposite_order + 1
+                    self.edge_df.loc[increase_order.index, "order"] += 1
             long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
             np.random.shuffle(long)
         self.edge_df.index.name = 'edge'

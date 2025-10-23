@@ -54,6 +54,7 @@ class TopologicalEventsHandler:
             for cell_id, row in dividing_faces.iterrows():
                 # Do division
                 daughter = cell_division(sheet, cell_id, sheet.geom)[0]
+                sheet.face_df.at[daughter, "id"] = daughter
                 # Update the topology
                 sheet.get_opposite()
                 involved_faces = np.intersect1d(self.model.get_neighbors(cell_id), self.model.get_neighbors(daughter))
@@ -87,7 +88,7 @@ class TopologicalEventsHandler:
                 # Update the topology
                 for face in involved_faces:
                     sheet.order_edges(face)
-                sheet.reset_index(order=False)
+                # sheet.reset_index(order=False)
                 sheet.edge_df.sort_values(["face", "order"], inplace=True)
                 sheet.get_opposite()
                 # update geometry

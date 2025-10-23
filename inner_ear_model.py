@@ -5,7 +5,6 @@
 # 3. Adding external forces
 import os.path
 import sys
-sys.path.insert(1, 'C:\\Users\\Kasirer\\Phd\\mouse_ear_project\\tissue_model\\tyssue\\tyssue')
 import tyssue
 from tyssue import config, History
 from tyssue.draw import sheet_view
@@ -28,12 +27,15 @@ class InnerEarModel:
     """
     def __init__(self, sheet, tension=None, repulsion=None, repulsion_distance=None, repulsion_exp=7,
                  preferred_area=None, contractility=None, elasticity=None,
-                 differentiation_threshold=0.5, random_sensitivity=False, saved_notch_delta_levels_file=None):
+                 differentiation_threshold=0.5, random_sensitivity=False, saved_notch_delta_levels_file=None,
+                 l=3, m=3, betaN=1, betaD=1, inhibition=False,
+                 notch_repressor_degradation_ratio=1, repressor_sensitivity=1, atoh_sensitivity=1,
+                 delta_repressor_degradation_ratio=1, notch_delta_production_ratio=1,
+                 stress_effectors=None, mechanosensitivity=0, notch_sensitivity=1):
         # Setting class constants
         self.CELL_TYPES = ['SC', 'HC']
         self.DIMENSIONS = ['2D']
         self.topological_events_handler = TopologicalEventsHandler(self)
-        self.lateral_inhibition_model = LateralInhibitionModel(self)
         # Setting default behavior
         if tension is None:
             tension = {('HC', 'HC'): 0.05,
@@ -41,8 +43,8 @@ class InnerEarModel:
                        ('SC', 'SC'): 0.05
                        }
         if preferred_area is None:
-            preferred_area = {'HC': 1,
-                              'SC': 1}
+            preferred_area = {'HC': 1.,
+                              'SC': 1.}
         if contractility is None:
             contractility = {'HC': 0.4,
                              'SC': 0.1}
@@ -53,23 +55,38 @@ class InnerEarModel:
             repulsion_distance = {'HC': 2.0,
                                   'SC': 0}
         if elasticity is None:
-            elasticity = {'HC': 5,
-                          'SC': 1}
+            elasticity = {'HC': 5.,
+                          'SC': 1.}
         if ('SC', 'HC') in tension:
             tension[('HC', 'SC')] = tension[('SC', 'HC')]
         elif ('HC', 'SC') in tension:
             tension[('SC', 'HC')] = tension[('HC', 'SC')]
         self.sheet = self.arrange_sheet_from_history(sheet)
+        self.sheet.initiate_edge_order()
         sheet.repulsion_exp = repulsion_exp
+        length_normalization_factor = self.get_average_face_perimeter()
+        preferred_area['HC'] *= length_normalization_factor ** 2
+        preferred_area['SC'] *= length_normalization_factor ** 2
+        repulsion_distance['HC'] *= length_normalization_factor
+        repulsion_distance['SC'] *= length_normalization_factor
         self.face_params = {"contractility": contractility, "repulsion": repulsion,
-                            "repulsion_distance": repulsion_distance, "prefered_area": preferred_area,
+                            "repulsion_distance": repulsion_distance,
+                            "prefered_area": preferred_area,
                             "prefered_vol": preferred_area,
                             "area_elasticity": elasticity}
         self.differentiation_threshold = differentiation_threshold
         self.edge_params = {"line_tension": tension}
         self.dimensionality = '2D'
-        specs = self.get_specs_2d()
+        specs = self.get_specs_2d(notch_sensitivity)
         self.sheet.update_specs(specs)
+        self.lateral_inhibition_model = LateralInhibitionModel(
+            self, l=l, m=m, betaN=betaN, betaD=betaD, inhibition=inhibition,
+            notch_repressor_degradation_ratio=notch_repressor_degradation_ratio,
+            length_normalization_factor=length_normalization_factor,
+            repressor_sensitivity=repressor_sensitivity, atoh_sensitivity=atoh_sensitivity,
+            delta_repressor_degradation_ratio=delta_repressor_degradation_ratio,
+            notch_delta_production_ratio=notch_delta_production_ratio,
+            stress_effectors=stress_effectors, mechanosensitivity=mechanosensitivity)
         self.initialize_notch_delta(random_sensitivity, saved_levels_file_path=saved_notch_delta_levels_file)
         active_edges = (self.sheet.edge_df.opposite.values >= 0).astype(int)
         self.sheet.edge_df.loc[:, 'is_active'] = active_edges
@@ -77,9 +94,17 @@ class InnerEarModel:
         self.sheet.vert_df.loc[list(set(self.sheet.edge_df.trgt.values[np.logical_not(active_edges)])), 'is_active'] = 0
         self.sheet.face_df.loc[:,"id"] = self.sheet.face_df.index
         self.sheet.active_verts = np.where(self.sheet.vert_df.is_active.values)[0]
-        self.update_cell_type_parameters(self.sheet.face_df.delta_level)
-        self.sheet.initiate_edge_order()
+        if "atoh_level" not in self.sheet.face_df.columns:
+            if "reressor_level" in self.sheet.face_df.columns:
+                self.sheet.face_df["atoh_level"] = self.lateral_inhibition_model.get_atoh_level(
+                    self.sheet.face_df.reressor_level.values)
+            else:
+                self.sheet.face_df["atoh_level"] = self.lateral_inhibition_model.get_atoh_level(
+                    self.sheet.face_df.notch_level.values)
+        self.update_cell_type_parameters(self.sheet.face_df.atoh_level)
+
         self.sheet.order_all_edges()
+
         return
 
     @staticmethod
@@ -102,13 +127,13 @@ class InnerEarModel:
             sheet.face_df.drop('time', inplace=True, axis=1)
         return sheet
 
-    def update_cell_type_parameters(self, delta_level):
+    def update_cell_type_parameters(self, atoh_level):
         differentiating_cells = self.sheet.face_df.query('type >= 0').index
         for param in self.face_params.keys():
-            new_values = delta_level * self.face_params[param]["HC"] + (1 - delta_level) * self.face_params[param]["SC"]
+            new_values = atoh_level * self.face_params[param]["HC"] + (1 - atoh_level) * self.face_params[param]["SC"]
             self.sheet.face_df.loc[differentiating_cells,param] = new_values[differentiating_cells]
 
-        new_types = (delta_level > self.differentiation_threshold).astype(int)
+        new_types = (atoh_level > self.differentiation_threshold).astype(int)
         self.sheet.face_df.loc[differentiating_cells, 'type'] = new_types[differentiating_cells]
         first_faces = self.sheet.edge_df.face.values
         opposite_to_first = self.sheet.edge_df.opposite.values
@@ -131,7 +156,7 @@ class InnerEarModel:
         self.sheet.face_df.loc[:, "contractility"] = np.random.rand(self.sheet.face_df.shape[0],)/5
         self.sheet.edge_df.loc[:, "line_tension"] = np.random.rand(self.sheet.edge_df.shape[0],)/10
 
-    def get_specs_2d(self):
+    def get_specs_2d(self, notch_sensitivity):
         specs = {'vert': {'is_active':1,
                           'radial_tension': 0},
                  'edge': {'is_active': 1,
@@ -143,7 +168,7 @@ class InnerEarModel:
                           'is_alive': 1,
                           'type': 0,
                           'radial_tension': 0,
-                          'notch_sensitivity': 1
+                          'notch_sensitivity': notch_sensitivity
                           }
                  }
         for param in self.edge_params.keys():
@@ -173,10 +198,21 @@ class InnerEarModel:
         else:
             return self.sheet.edge_df.groupby("face")["opposite"].agg(apply_on_real_neighbors(func_list))
 
-    def get_edge_tension(self, relevant_effectors):
+    def get_neighbor_types(self, neighbors_id):
+        return self.sheet.face_df.type[neighbors_id].values
+
+    def get_num_of_HC_neighbors(self, neighbors_id):
+        types = self.get_neighbor_types(neighbors_id)
+        counts = np.bincount(types[types>=0])
+        if counts.size > 1:
+            return counts[1]
+        else:
+            return 0
+
+    def get_edge_stress(self, relevant_effectors):
         edge_data = self.sheet.edge_df[["ux", "uy"]].copy()
-        tension_model = model_factory(relevant_effectors)
-        grads = tension_model.compute_gradient(self.sheet, components=True)
+        stress_model = model_factory(relevant_effectors)
+        grads = stress_model.compute_gradient(self.sheet, components=True)
         norm_factor = self.sheet.specs["settings"].get("nrj_norm_factor", 1)
         srce_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Ne]
         if srce_grads:
@@ -191,14 +227,78 @@ class InnerEarModel:
         vert_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Nv]
         if vert_grads:
             raise NotImplementedError
-        edge_data["tension"] = edge_data.eval("((trgt_gx - srce_gx) * ux + (trgt_gy - srce_gy) * uy)/ %s" % str(norm_factor))
-        return edge_data.tension
+        edge_data["stress"] = edge_data.eval("((trgt_gx - srce_gx) * ux + (trgt_gy - srce_gy) * uy)/ %s" % str(norm_factor))
+        return edge_data.stress
 
-    def get_face_tension(self, relevant_effectors):
-        edge_tension = self.get_edge_tension(relevant_effectors)
-        tension_df = pd.DataFrame({"face": self.sheet.edge_df.face.to_numpy(),"tension": edge_tension.to_numpy()})
-        face_tension = tension_df.groupby("face").sum()
-        return face_tension
+    def get_face_stress(self, relevant_effectors):
+        edge_stress = self.get_edge_stress(relevant_effectors)
+        stress_df = self.sheet.edge_df[["face", "length"]].copy()
+        stress_df["stress"] = edge_stress.values
+        stress_df["weighted_stress"] = stress_df.eval("stress * length")
+        face_stress = stress_df[["face", "weighted_stress"]].groupby("face").sum()
+        return face_stress.weighted_stress.values
+
+    def get_average_edge_stress_by_type(self, relevant_effectors=None):
+        if relevant_effectors is None:
+            relevant_effectors = self.lateral_inhibition_model.stress_effectors
+        edge_stress = self.get_edge_stress(relevant_effectors).values
+        first_faces = self.sheet.edge_df.face.values
+        opposite_to_first = self.sheet.edge_df.opposite.values
+        second_faces = - np.ones(opposite_to_first.shape)
+        second_faces[opposite_to_first >= 0] = self.sheet.edge_df.loc[
+            opposite_to_first[opposite_to_first >= 0], "face"].values
+        first_types = self.sheet.face_df.loc[first_faces, "type"].values
+        second_types = - np.ones(second_faces.shape)
+        second_types[second_faces >= 0] = self.sheet.face_df.loc[second_faces[second_faces >= 0], "type"].values
+        HC_HC_stress = edge_stress[np.logical_and(first_types == 1, second_types == 1)]
+        SC_SC_stress = edge_stress[np.logical_and(first_types == 0, second_types == 0)]
+        HC_SC_stress = edge_stress[np.logical_and(first_types == 1, second_types == 0)]
+        SC_HC_stress = edge_stress[np.logical_and(first_types == 0, second_types == 1)]
+        res = {"HC:HC": np.average(HC_HC_stress), "SC:SC": np.average(SC_SC_stress),
+               "HC:SC": np.average(HC_SC_stress), "SC:HC": np.average(SC_HC_stress),
+               "all": np.std(edge_stress),
+               "HC:HC std": np.std(HC_HC_stress), "SC:SC std": np.std(SC_SC_stress),
+               "HC:SC std": np.std(HC_SC_stress), "SC:HC std": np.std(SC_HC_stress),
+               "all std": np.std(edge_stress),
+               }
+        return res
+
+    def get_average_face_stress_by_number_of_HC_neighbors(self, relevant_effectors=None):
+        if relevant_effectors is None:
+            relevant_effectors = self.lateral_inhibition_model.stress_effectors
+        face_stress = self.get_face_stress(relevant_effectors)
+        face_types = self.sheet.face_df.type.values
+        number_of_HC_neighbors = self.get_neighbors_data(self.get_num_of_HC_neighbors)
+        res = dict()
+        for n in range(np.max(number_of_HC_neighbors)+1):
+            relevant_stresses = face_stress[np.logical_and(number_of_HC_neighbors == n, face_types == 0)]
+            res["SC with %d HC neighbors N" % n] = relevant_stresses.size
+            if relevant_stresses.size > 0:
+                res["SC with %d HC neighbors avg" % n] = np.average(relevant_stresses)
+            if relevant_stresses.size > 1:
+                res["SC with %d HC neighbors std" % n] = np.std(relevant_stresses)
+            relevant_stresses = face_stress[np.logical_and(number_of_HC_neighbors == n, face_types == 1)]
+            res["HC with %d HC neighbors N" % n] = relevant_stresses.size
+            if relevant_stresses.size > 0:
+                res["HC with %d HC neighbors avg" % n] = np.average(relevant_stresses)
+            if relevant_stresses.size > 1:
+                res["HC with %d HC neighbors std" % n] = np.std(relevant_stresses)
+        return res
+
+    def get_average_edge_length(self, std=False):
+        if std:
+            return np.average(self.sheet.edge_df.length.values), np.std(self.sheet.edge_df.length.values)
+        else:
+            return np.average(self.sheet.edge_df.length.values)
+
+    def get_average_face_perimeter(self, std=False):
+        if std:
+            return np.average(self.sheet.face_df.perimeter.values), np.std(self.sheet.face_df.perimeter.values)
+        else:
+            return np.average(self.sheet.face_df.perimeter.values)
+
+    def get_contact_matrix(self):
+        return self.sheet.get_contact_matrix()
 
     @staticmethod
     def get_model(only_differentiation=False, effectors=None):
@@ -231,40 +331,41 @@ class InnerEarModel:
         levels.to_pickle(file_path)
 
     def initialize_notch_delta(self, random_sensitivity=False, contact_dependent=False, saved_levels_file_path=None):
+        maximal_delta_level = self.lateral_inhibition_model.get_maximal_delta_level()
+        maximal_notch_level = self.lateral_inhibition_model.get_maximal_notch_level()
+        maximal_repressor_level = self.lateral_inhibition_model.get_maximal_repressor_level()
         if saved_levels_file_path is not None and os.path.isfile(saved_levels_file_path):
             levels = pd.read_pickle(saved_levels_file_path)
             self.sheet.face_df.loc[:, 'notch_level'] = levels.notch_level.values
             self.sheet.face_df.loc[:, 'delta_level'] = levels.delta_level.values
-            if contact_dependent and 'repressor_level' in levels.columns:
-                self.sheet.face_df.loc[:, 'repressor_level'] = levels.repressor.values
-        else:
-            self.sheet.face_df.loc[:, 'notch_level'] = np.random.rand(self.sheet.face_df.shape[0])
-            self.sheet.face_df.loc[:, 'delta_level'] = np.random.rand(self.sheet.face_df.shape[0])
             if contact_dependent:
-                self.sheet.face_df.loc[:, 'repressor_level'] = np.random.rand(self.sheet.face_df.shape[0])
+                if 'repressor_level' in levels.columns:
+                    self.sheet.face_df.loc[:, 'repressor_level'] = levels.repressor.values
+                else:
+                    self.sheet.face_df.loc[:, 'repressor_level'] = np.random.rand(self.sheet.face_df.shape[0]) * maximal_repressor_level
+        else:
+            self.sheet.face_df.loc[:, 'notch_level'] = np.random.rand(self.sheet.face_df.shape[0]) * maximal_notch_level
+            self.sheet.face_df.loc[:, 'delta_level'] = np.random.rand(self.sheet.face_df.shape[0]) * maximal_delta_level
+            if contact_dependent:
+                self.sheet.face_df.loc[:, 'repressor_level'] = np.random.rand(self.sheet.face_df.shape[0]) * maximal_repressor_level
             # self.sheet.face_df.loc[:, 'notch_level'] = 1
             # self.sheet.face_df.loc[:, 'delta_level'] = 0
         if random_sensitivity:
             self.sheet.face_df.loc[:, 'notch_sensitivity'] = np.random.rand(self.sheet.face_df.shape[0])
 
-    def simulate(self, t_end, dt, notch_inhibition=False, only_differentiation=False, random_forces=False,
+    def simulate(self, t_end, dt, only_differentiation=False, random_forces=False,
                  aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False,
-                 divisions=True, intercalations=True, delaminations=True, ablated_cells=[],
-                 l=3, m=3, mu=10, rho=10, xhi=10, betaN=1, betaD=1, betaR=1, kt=1, gammaR=1, sensitivity_aging_rate=10,
+                 divisions=True, intercalations=True, delaminations=True, ablated_cells=[], sensitivity_aging_rate=0,
                  division_area=1.3, intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
-                 viscosity=3, effectors=None, mechanosensitivity=0, tension_effectors=None):
+                 viscosity=3, effectors=None, quasi_static=False, quasi_static_threshold=0.01):
         manager = EventManager("face")
         # manager.append(self.get_ablation_function(2))
         if not no_differentiation:
             if contact_dependent_differentiation:
-                manager.append(self.lateral_inhibition_model.get_length_dependent_differentiation_function(l=l, m=m, mu=mu, rho=rho, xhi=xhi, betaN=betaN,
-                                                                                  betaD=betaD, betaR=betaR, kt=kt, gammaR=gammaR,
-                                                                                  inhibition=notch_inhibition,
-                                                                                  mechanosensitivity=mechanosensitivity,
-                                                                                  tension_effectors=tension_effectors), dt=dt)
+                if not quasi_static:
+                    manager.append(self.lateral_inhibition_model.get_length_dependent_differentiation_function(dt=dt))
             else:
-                manager.append(self.lateral_inhibition_model.get_differentiation_function(l=l, m=m, mu=mu, rho=rho, betaN=betaN, betaD=betaD,
-                                                                 inhibition=notch_inhibition), dt=dt)
+                manager.append(self.lateral_inhibition_model.get_differentiation_function(dt=dt))
         if aging_sensitivity:
             manager.append(self.lateral_inhibition_model.get_aging_sensitivity_function(rate=sensitivity_aging_rate, dt=dt))
         if not only_differentiation:
@@ -286,19 +387,21 @@ class InnerEarModel:
             manager.append(self.get_random_initializer(wait_time=1, dt=dt))
         history = History(self.sheet, save_all=True)
         model = self.get_model(only_differentiation, effectors=effectors)
-        solver = IVPSolver(self.sheet, self.sheet.geom, model, manager=manager, history=history,auto_reconnect=False)
+        solver = IVPSolver(self, self.sheet, self.sheet.geom, model, manager=manager, history=history, auto_reconnect=False)
         self.sheet.vert_df['viscosity'] = viscosity
         # for diff in range(100):
         #     manager.execute(self.sheet)
         #     manager.update()
-        solver.solve(tf=t_end, dt=dt)
+        solver.solve(tf=t_end, dt=dt, quasi_static=quasi_static, quasi_static_threshold=quasi_static_threshold)
         # fig, ax = plot_forces(self.sheet, geom, model, ['x', 'y'], 1)
         # plt.show()
         return history
 
     @staticmethod
     def draw_sheet(sheet, number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
-                   for_labels=False):
+                   for_labels=False, maximal_level=1, color_by="atoh", arrange_sheet=False):
+        if arrange_sheet:
+            sheet = InnerEarModel.arrange_sheet_from_history(sheet)
         if not sheet.check_all_edge_order():
             print("bug in drawing")
             sheet.order_all_edges()
@@ -312,7 +415,12 @@ class InnerEarModel:
             color_cmap[:,3] = 1
         else:
             cmap = plt.cm.get_cmap('Greens').reversed()
-            cmap_scale = sheet.face_df.delta_level.to_numpy()
+            if color_by == "atoh":
+                cmap_scale = sheet.face_df.atoh_level.to_numpy()
+            elif color_by == "delta":
+                cmap_scale = sheet.face_df.delta_level.to_numpy() / maximal_level
+            elif color_by == "inverse_repressor":
+                cmap_scale = (maximal_level - sheet.face_df.repressor_level.to_numpy()) / maximal_level
             color_cmap = cmap(0.7*(cmap_scale - 1) + 1)
         draw_specs['face']['color'] = color_cmap
         draw_specs['face']['alpha'] = 0.5
@@ -348,23 +456,24 @@ class InnerEarModel:
         ax.set_axis_off()
         canvas = fig.canvas
         canvas.draw()
-        data = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-        data = data.reshape(canvas.get_width_height()[::-1] + (3,))
-        data0 = data[:,:,0].copy()
-        data0[data[:,:,2] != 191] = 0
-        data1 = data[:,:,1].copy()
-        data1[data[:,:,2] != 191] = 0
-        labels = np.zeros(data0.shape)
-        values1 = np.unique(data1)
-        values0 = np.unique(data0)
+        data = np.frombuffer(canvas.tostring_argb(), dtype=np.uint8)
+        data = data.reshape(canvas.get_width_height()[::-1] + (4,))
+        datar = data[:, :, 1].copy()
+        datag = data[:, :, 2].copy()
+        datab = data[:, :, 3].copy()
+        datar[datab != 191] = 0
+        datag[datab != 191] = 0
+        labels = np.zeros(datar.shape)
+        values1 = np.unique(datag)
+        values0 = np.unique(datar)
         i = 1
         for v1 in values1:
             for v0 in values0:
                 if i <= Nc:
                     if v0 != 0 or v1 != 0:
-                        cell_pixels = np.logical_and(data0 == v0, data1 == v1)
+                        cell_pixels = np.logical_and(datar == v0, datag == v1)
                         if cell_pixels.any():
-                            labels[np.logical_and(data0 == v0, data1 == v1)] = i
+                            labels[np.logical_and(datar == v0, datag == v1)] = i
                             i += 1
         np.save(path, labels.astype("uint16"))
         return 0
