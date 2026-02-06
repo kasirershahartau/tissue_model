@@ -30,17 +30,13 @@ class TopologicalEventsHandler:
                 sheet.face_df.at[cell_id, "prefered_area"] = 0
                 sheet.face_df.at[cell_id, "prefered_vol"] = 0
                 if sheet.face_df.loc[cell_id, "num_sides"] <= 3:
-                    involved_faces = self.model.get_neighbors(cell_id)
                     remove(sheet, cell_id, self.model.sheet.geom)
-                    for face in involved_faces:
-                        sheet.order_edges(face)
-                    # sheet.reset_index(order=False)
+                    sheet.reset_index(order=False)
+                    sheet.order_all_edges()
                     sheet.edge_df.sort_values(["face", "order"], inplace=True)
                     sheet.get_opposite()
                     # update geometry
                     sheet.geom.update_all(sheet)
-                    # if not sheet.check_all_edge_order():
-                    #     print("bug in delamination")
             manager.append(delamination)
             return
         return delamination
@@ -57,11 +53,8 @@ class TopologicalEventsHandler:
                 sheet.face_df.at[daughter, "id"] = daughter
                 # Update the topology
                 sheet.get_opposite()
-                involved_faces = np.intersect1d(self.model.get_neighbors(cell_id), self.model.get_neighbors(daughter))
-                involved_faces = np.hstack([involved_faces, np.array([cell_id, daughter])]).astype(int)
-                for face in involved_faces:
-                    sheet.order_edges(face)
-                # sheet.reset_index(order=False)
+                sheet.reset_index(order=False)
+                sheet.order_all_edges()
                 sheet.edge_df.sort_values(["face", "order"], inplace=True)
                 sheet.get_opposite()
                 # update geometry
@@ -86,14 +79,11 @@ class TopologicalEventsHandler:
                 # Do intercalation
                 type1_transition(sheet, edge_id)
                 # Update the topology
-                for face in involved_faces:
-                    sheet.order_edges(face)
-                # sheet.reset_index(order=False)
+                sheet.reset_index(order=False)
+                sheet.order_all_edges()
                 sheet.edge_df.sort_values(["face", "order"], inplace=True)
                 sheet.get_opposite()
                 # update geometry
                 sheet.geom.update_all(sheet)
-                # if not sheet.check_all_edge_order():
-                #     print("bug in intercalation")
             manager.append(intercalation)
         return intercalation

@@ -63,7 +63,7 @@ class LateralInhibitionModel:
             manager.append(differentiation)
         return differentiation
 
-    def get_length_dependent_differentiation_function(self, dt=1., quasi_static=False):
+    def get_length_dependent_differentiation_function(self, dt=1., quasi_static=False, atoh_by_repressor=False):
 
         def differentiation(sheet, manager):
             # Notch and delta levels of each edge
@@ -89,26 +89,31 @@ class LateralInhibitionModel:
                 if self.mechanosensitivity > 0:
                     face_stress = face_data.stress.to_numpy() / self.length_normalization_factor
                     delta_production = delta_production * self.increasing_hill(np.maximum(face_stress, 0), self.mechanosensitivity)
-                delta_notch_interaction = (notch_level * (self.length_normalization_factor / face_perimeter) *
-                                           np.matmul(contact_matrix, (delta_level / face_perimeter)))
-                notch_delta_interaction = (delta_level * (self.length_normalization_factor / face_perimeter) *
-                                           np.matmul(contact_matrix, (notch_level / face_perimeter)))
-                repressor_production = 0 if self.inhibition else self.increasing_hill(notch_delta_interaction, face_sensitivity)
-                notch_change = 1 - self.notch_repressor_degradation_ratio * notch_level - notch_delta_interaction
+                notch_with_neighboring_delta_interaction = (notch_level * (self.length_normalization_factor / face_perimeter) *
+                                           np.matmul(contact_matrix, (delta_level / face_perimeter))) # Si - notch in cell with delta in neighbors
+                delta_with_neighboring_notch_interaction = (delta_level * (self.length_normalization_factor / face_perimeter) *
+                                           np.matmul(contact_matrix, (notch_level / face_perimeter))) # Ti - delta in cell with notch in neighbors
+                repressor_production = 0 if self.inhibition else self.increasing_hill(notch_with_neighboring_delta_interaction, face_sensitivity)
+                notch_change = 1 - self.notch_repressor_degradation_ratio * notch_level - notch_with_neighboring_delta_interaction
                 delta_change = (delta_production - self.delta_repressor_degradation_ratio * delta_level -
-                                self.notch_delta_production_ratio * delta_notch_interaction)
+                                self.notch_delta_production_ratio * delta_with_neighboring_notch_interaction)
                 repressor_change = repressor_production - repressor_level
                 return np.hstack((notch_change, delta_change, repressor_change))
 
             final_y = solve_ivp(lateral_inhibition_ode, (0, dt), initial_y, t_eval=[dt]).y[:,0]
             final_notch_level = final_y[:n_faces]
+            final_notch_level = np.clip(final_notch_level, a_min=0, a_max=1)
             final_delta_level = final_y[n_faces:2 * n_faces]
+            final_delta_level = np.clip(final_delta_level, a_min=0, a_max=1)
             final_repressor_level = final_y[2 * n_faces:]
-            sheet.face_df.loc[:, "notch_level"] = np.clip(final_notch_level, a_min=0, a_max=1)
-            sheet.face_df.loc[:, "delta_level"] = np.clip(final_delta_level, a_min=0, a_max=1)
             final_repressor_level = np.clip(final_repressor_level, a_min=0, a_max=1)
+            sheet.face_df.loc[:, "notch_level"] = final_notch_level
+            sheet.face_df.loc[:, "delta_level"] = final_delta_level
             sheet.face_df.loc[:, "repressor_level"] = final_repressor_level
-            atoh_levels = self.get_atoh_level(final_repressor_level)
+            if atoh_by_repressor:
+                atoh_levels = self.get_atoh_level(final_repressor_level, activation=False)
+            else:
+                atoh_levels = self.get_atoh_level(final_delta_level, activation=True)
             sheet.face_df.loc[:,"atoh_level"] = atoh_levels
             self.model.update_cell_type_parameters(atoh_levels)
             if not quasi_static:
@@ -119,10 +124,14 @@ class LateralInhibitionModel:
         return (x ** self.m) / (a ** self.m + x ** self.m)
 
     def decreasing_hill(self, x, a):
-        return 1 / (1 + (a * x) ** self.l)
+        return (a**self.l) / ((a**self.l) + (x ** self.l))
 
-    def get_atoh_level(self, repressor_level):
-        return self.decreasing_hill(repressor_level, self.atoh_sensitivity)
+    def get_atoh_level(self, level, activation=False):
+        if activation:
+            return self.increasing_hill(level, self.atoh_sensitivity)
+        else:
+            return self.decreasing_hill(level, self.atoh_sensitivity)
+
 
     def get_aging_sensitivity_function(self, rate, dt=1.):
         def aging_sensitivity(sheet, manager):

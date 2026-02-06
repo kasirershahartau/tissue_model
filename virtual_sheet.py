@@ -97,7 +97,7 @@ class VirtualSheet(Sheet):
 
     def add_virtual_vertices(self):
         long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
-        np.random.shuffle(long)
+        # np.random.shuffle(long)
         while long.size > 0:
             edge_ind = long[0]
             edge_order = self.edge_df.at[edge_ind, "order"]
@@ -126,6 +126,7 @@ class VirtualSheet(Sheet):
             long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
             np.random.shuffle(long)
         self.edge_df.index.name = 'edge'
+        self.vert_df.index.name = 'vert'
         self.geom.update_all(self)
         # self.reset_index(order=False)
         self.edge_df.sort_values(["face", "order"], inplace=True)
@@ -198,20 +199,11 @@ class VirtualSheet(Sheet):
         return np.unique(neighbors)
 
     def get_contact_matrix(self):
-        m = np.zeros((self.face_df.shape[0], self.face_df.shape[0]))
-        for i, face in self.face_df.iterrows():
-            face_edges = self.edge_df.query("face == %d" % i)
-            contacts = dict()
-            for j, edge in face_edges.iterrows():
-                length = edge.length
-                opposite = edge.opposite
-                if opposite < 0:
-                    continue
-                neighbor = self.edge_df.loc[opposite, "face"]
-                if neighbor in contacts.keys():
-                    contacts[neighbor] = contacts[neighbor] + length
-                else:
-                    contacts[neighbor] = length
-            for neighbor in contacts.keys():
-                m[i, neighbor] = contacts[neighbor]
+        has_opposite = self.edge_df.opposite >= 0
+        faces_with_neighbors_ids = self.edge_df.loc[has_opposite, "face"].to_numpy()
+        neighbor_ids = self.edge_df.loc[self.edge_df.opposite[has_opposite], "face"].to_numpy()
+        contact_length = self.edge_df.loc[self.edge_df.opposite[has_opposite], "length"].to_numpy()
+        number_of_faces = self.face_df.shape[0]
+        m = np.bincount(faces_with_neighbors_ids*number_of_faces + neighbor_ids, weights=contact_length,
+                         minlength=number_of_faces*number_of_faces).reshape(number_of_faces, number_of_faces)
         return m
