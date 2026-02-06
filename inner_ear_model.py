@@ -31,7 +31,7 @@ class InnerEarModel:
                  l=3, m=3, betaN=1, betaD=1, inhibition=False,
                  notch_repressor_degradation_ratio=1, repressor_sensitivity=1, atoh_sensitivity=1,
                  delta_repressor_degradation_ratio=1, notch_delta_production_ratio=1,
-                 stress_effectors=None, mechanosensitivity=0, notch_sensitivity=1):
+                 stress_effectors=None, mechanosensitivity=0, notch_sensitivity=1, atoh_by_repressor=True):
         # Setting class constants
         self.CELL_TYPES = ['SC', 'HC']
         self.DIMENSIONS = ['2D']
@@ -78,7 +78,7 @@ class InnerEarModel:
         self.edge_params = {"line_tension": tension}
         self.dimensionality = '2D'
         specs = self.get_specs_2d(notch_sensitivity)
-        self.sheet.update_specs(specs)
+        self.sheet.update_specs(specs, reset=True)
         self.lateral_inhibition_model = LateralInhibitionModel(
             self, l=l, m=m, betaN=betaN, betaD=betaD, inhibition=inhibition,
             notch_repressor_degradation_ratio=notch_repressor_degradation_ratio,
@@ -87,20 +87,23 @@ class InnerEarModel:
             delta_repressor_degradation_ratio=delta_repressor_degradation_ratio,
             notch_delta_production_ratio=notch_delta_production_ratio,
             stress_effectors=stress_effectors, mechanosensitivity=mechanosensitivity)
-        self.initialize_notch_delta(random_sensitivity, saved_levels_file_path=saved_notch_delta_levels_file)
+        self.initialize_notch_delta(random_sensitivity, saved_levels_file_path=saved_notch_delta_levels_file, contact_dependent=True)
         active_edges = (self.sheet.edge_df.opposite.values >= 0).astype(int)
         self.sheet.edge_df.loc[:, 'is_active'] = active_edges
         self.sheet.vert_df.loc[list(set(self.sheet.edge_df.srce.values[np.logical_not(active_edges)])), 'is_active'] = 0
         self.sheet.vert_df.loc[list(set(self.sheet.edge_df.trgt.values[np.logical_not(active_edges)])), 'is_active'] = 0
         self.sheet.face_df.loc[:,"id"] = self.sheet.face_df.index
         self.sheet.active_verts = np.where(self.sheet.vert_df.is_active.values)[0]
-        if "atoh_level" not in self.sheet.face_df.columns:
-            if "reressor_level" in self.sheet.face_df.columns:
+        if atoh_by_repressor:
+            if "repressor_level" in self.sheet.face_df.columns:
                 self.sheet.face_df["atoh_level"] = self.lateral_inhibition_model.get_atoh_level(
-                    self.sheet.face_df.reressor_level.values)
+                    self.sheet.face_df.repressor_level.values)
             else:
                 self.sheet.face_df["atoh_level"] = self.lateral_inhibition_model.get_atoh_level(
                     self.sheet.face_df.notch_level.values)
+        else:
+            self.sheet.face_df["atoh_level"] = self.lateral_inhibition_model.get_atoh_level(
+                self.sheet.face_df.delta_level.values, activation=True)
         self.update_cell_type_parameters(self.sheet.face_df.atoh_level)
 
         self.sheet.order_all_edges()
@@ -133,7 +136,7 @@ class InnerEarModel:
             new_values = atoh_level * self.face_params[param]["HC"] + (1 - atoh_level) * self.face_params[param]["SC"]
             self.sheet.face_df.loc[differentiating_cells,param] = new_values[differentiating_cells]
 
-        new_types = (atoh_level > self.differentiation_threshold).astype(int)
+        new_types = (atoh_level > self.differentiation_threshold).astype(np.int32)
         self.sheet.face_df.loc[differentiating_cells, 'type'] = new_types[differentiating_cells]
         first_faces = self.sheet.edge_df.face.values
         opposite_to_first = self.sheet.edge_df.opposite.values
@@ -210,7 +213,7 @@ class InnerEarModel:
             return 0
 
     def get_edge_stress(self, relevant_effectors):
-        edge_data = self.sheet.edge_df[["ux", "uy"]].copy()
+        edge_data = self.sheet.edge_df[["ux", "uy", "opposite"]].copy()
         stress_model = model_factory(relevant_effectors)
         grads = stress_model.compute_gradient(self.sheet, components=True)
         norm_factor = self.sheet.specs["settings"].get("nrj_norm_factor", 1)
@@ -228,6 +231,8 @@ class InnerEarModel:
         if vert_grads:
             raise NotImplementedError
         edge_data["stress"] = edge_data.eval("((trgt_gx - srce_gx) * ux + (trgt_gy - srce_gy) * uy)/ %s" % str(norm_factor))
+        # Including the opposite edge stress (treating edges as mechanically coupled)
+        edge_data.loc[edge_data["opposite"].values > 0, "stress"] += edge_data.loc[edge_data["opposite"].index[edge_data["opposite"].values > 0], "stress"]
         return edge_data.stress
 
     def get_face_stress(self, relevant_effectors):
@@ -340,7 +345,7 @@ class InnerEarModel:
             self.sheet.face_df.loc[:, 'delta_level'] = levels.delta_level.values
             if contact_dependent:
                 if 'repressor_level' in levels.columns:
-                    self.sheet.face_df.loc[:, 'repressor_level'] = levels.repressor.values
+                    self.sheet.face_df.loc[:, 'repressor_level'] = levels.repressor_level.values
                 else:
                     self.sheet.face_df.loc[:, 'repressor_level'] = np.random.rand(self.sheet.face_df.shape[0]) * maximal_repressor_level
         else:
@@ -357,13 +362,14 @@ class InnerEarModel:
                  aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False,
                  divisions=True, intercalations=True, delaminations=True, ablated_cells=[], sensitivity_aging_rate=0,
                  division_area=1.3, intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
-                 viscosity=3, effectors=None, quasi_static=False, quasi_static_threshold=0.01):
+                 viscosity=3, effectors=None, quasi_static=False, quasi_static_threshold=0.01, atoh_by_repressor=True):
         manager = EventManager("face")
         # manager.append(self.get_ablation_function(2))
         if not no_differentiation:
             if contact_dependent_differentiation:
-                if not quasi_static:
-                    manager.append(self.lateral_inhibition_model.get_length_dependent_differentiation_function(dt=dt))
+                manager.append(self.lateral_inhibition_model.get_length_dependent_differentiation_function(dt=dt,
+                                                                                                           quasi_static=quasi_static,
+                                                                                                           atoh_by_repressor=atoh_by_repressor))
             else:
                 manager.append(self.lateral_inhibition_model.get_differentiation_function(dt=dt))
         if aging_sensitivity:
@@ -385,7 +391,7 @@ class InnerEarModel:
 
         if random_forces:
             manager.append(self.get_random_initializer(wait_time=1, dt=dt))
-        history = History(self.sheet, save_all=True)
+        history = History(self.sheet, save_every=0.1,save_all=False, dt=dt)
         model = self.get_model(only_differentiation, effectors=effectors)
         solver = IVPSolver(self, self.sheet, self.sheet.geom, model, manager=manager, history=history, auto_reconnect=False)
         self.sheet.vert_df['viscosity'] = viscosity
@@ -398,60 +404,63 @@ class InnerEarModel:
         return history
 
     @staticmethod
-    def draw_sheet(sheet, number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
+    def get_draw_sheet_method( number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
                    for_labels=False, maximal_level=1, color_by="atoh", arrange_sheet=False):
-        if arrange_sheet:
-            sheet = InnerEarModel.arrange_sheet_from_history(sheet)
-        if not sheet.check_all_edge_order():
-            print("bug in drawing")
-            sheet.order_all_edges()
-        draw_specs = tyssue.config.draw.sheet_spec()
-        if for_labels:
-            cmap_scale = sheet.face_df.id.to_numpy()
-            color_cmap = np.zeros((cmap_scale.size, 4))
-            color_cmap[:,0] = (cmap_scale%127) / 127
-            color_cmap[:,1] = ((cmap_scale//127)%127) / 127
-            color_cmap[:,2] = 0.5
-            color_cmap[:,3] = 1
-        else:
-            cmap = plt.cm.get_cmap('Greens').reversed()
-            if color_by == "atoh":
-                cmap_scale = sheet.face_df.atoh_level.to_numpy()
-            elif color_by == "delta":
-                cmap_scale = sheet.face_df.delta_level.to_numpy() / maximal_level
-            elif color_by == "inverse_repressor":
-                cmap_scale = (maximal_level - sheet.face_df.repressor_level.to_numpy()) / maximal_level
-            color_cmap = cmap(0.7*(cmap_scale - 1) + 1)
-        draw_specs['face']['color'] = color_cmap
-        draw_specs['face']['alpha'] = 0.5
-        draw_specs['face']['visible'] = True
-        if is_ordered:
-            sheet.is_ordered = True
-            sheet.edge_df.sort_values(["face", "order"], inplace=True)
+        def draw_sheet(sheet):
+            if arrange_sheet:
+                sheet = InnerEarModel.arrange_sheet_from_history(sheet)
+            # if not sheet.check_all_edge_order():
+            #     print("bug in drawing")
+            #     sheet.order_all_edges()
+            draw_specs = tyssue.config.draw.sheet_spec()
+            if for_labels:
+                cmap_scale = sheet.face_df.id.to_numpy()
+                color_cmap = np.zeros((cmap_scale.size, 4))
+                color_cmap[:,0] = (cmap_scale%127) / 127
+                color_cmap[:,1] = ((cmap_scale//127)%127) / 127
+                color_cmap[:,2] = 0.5
+                color_cmap[:,3] = 1
+            else:
+                cmap = plt.cm.get_cmap('Greens').reversed()
+                if color_by == "atoh":
+                    cmap_scale = sheet.face_df.atoh_level.to_numpy()
+                elif color_by == "delta":
+                    cmap_scale = sheet.face_df.delta_level.to_numpy() / maximal_level
+                elif color_by == "inverse_repressor":
+                    cmap_scale = (maximal_level - sheet.face_df.repressor_level.to_numpy()) / maximal_level
+                color_cmap = cmap(0.7*(cmap_scale - 1) + 1)
+            draw_specs['face']['color'] = color_cmap
+            draw_specs['face']['alpha'] = 0.5
+            draw_specs['face']['visible'] = True
+            if is_ordered:
+                sheet.is_ordered = True
+                sheet.edge_df.sort_values(["face", "order"], inplace=True)
 
-        fig, ax = sheet_view(sheet, ['x', 'y'], **draw_specs)
-        fig.set_size_inches((8, 8))
+            fig, ax = sheet_view(sheet, ['x', 'y'], **draw_specs)
+            fig.set_size_inches((8, 8))
 
-        if number_faces:
-            for face, data in sheet.face_df.iterrows():
-                ax.text(data.x, data.y, face, fontsize=14, color="red")
+            if number_faces:
+                for face, data in sheet.face_df.iterrows():
+                    ax.text(data.x, data.y, face, fontsize=14, color="red")
 
-        if number_vertices:
-            for vert, data in sheet.vert_df.iterrows():
-                ax.text(data.x, data.y + 0.02, vert, weight="bold", color="blue")
+            if number_vertices:
+                for vert, data in sheet.vert_df.iterrows():
+                    ax.text(data.x, data.y + 0.02, vert, weight="bold", color="blue")
 
-        if number_edges:
-            for edge, data in sheet.edge_df.iterrows():
-                ax.text((data.tx + data.sx)/2 - (data.tx - data.sx)/4,
-                        (data.ty + data.sy)/2 - (data.ty - data.sy)/4 + 0.02,
-                        edge, weight="bold", color="green")
+            if number_edges:
+                for edge, data in sheet.edge_df.iterrows():
+                    ax.text((data.tx + data.sx)/2 - (data.tx - data.sx)/4,
+                            (data.ty + data.sy)/2 - (data.ty - data.sy)/4 + 0.02,
+                            edge, weight="bold", color="green")
 
-        return fig, ax
+            return fig, ax
+        return draw_sheet
     @staticmethod
     def save_sheet_labels_to_numpy(sheet, path):
         # Creating labeld image
         Nc = sheet.Nc
-        fig, ax = InnerEarModel.draw_sheet(sheet, for_labels=True)
+        draw_func =  InnerEarModel.get_draw_sheet_method(sheet, for_labels=True)
+        fig, ax = draw_func(sheet)
         fig.tight_layout(pad=0)
         ax.set_axis_off()
         canvas = fig.canvas
