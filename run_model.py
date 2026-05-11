@@ -45,162 +45,172 @@ def load_sheet_from_file(initial_sheet_name, two_dim=True):
     return sheet
 
 
-def run(gammaSC_vals, psigma_vals):
+def run(gammaSC_vals, psigma_vals, gammaHC_ratio_vals, alphaHC_ratio_vals):
     for gammaSC in gammaSC_vals:
         for psigma in psigma_vals:
-            # Sheet Parameters
-            initial_sheet_name = "random_array_0"
-            load_lateral_inhibition_data_from_file = True
-            name = "stress_dependent_on_random_0_psigma-%.1f_gammaSC-%.1f_patoh-0.31"%(psigma, gammaSC)
-            max_bond_length = 0.2
-            min_bond_length = 0.05
+            for gammaHC_ratio in gammaHC_ratio_vals:
+                for alphaHC_ratio in alphaHC_ratio_vals:
+                    try:
+                        # Sheet Parameters
+                        initial_sheet_name = "random_array_0"
+                        load_lateral_inhibition_data_from_file = True
+                        name = "stress_dependent_on_random_0_psigma-%.1f_gammaSC-%.1f_pR-0.35_gammaHC_ratio-%.1f_alphaHC_ratio-%.1f"%(psigma, gammaSC, gammaHC_ratio, alphaHC_ratio)
+                        max_bond_length = 0.2
+                        min_bond_length = 0.05
 
-            # In case initial_sheet_name == "", creating a new sheet with the following parameters
-            nx = 5
-            ny = 5
-            distx = 1
-            disty = 1
+                        # In case initial_sheet_name == "", creating a new sheet with the following parameters
+                        nx = 5
+                        ny = 5
+                        distx = 1
+                        disty = 1
 
-            # Model version select
-            random_sensitivity = False
-            aging_sensitivity = False
-            only_differentiation = False
-            no_differentiation = False
-            contact_dependent_differentiation = True
-            notch_inhibition = False
-            stress_dependent = True
-            divisions = False
-            intercalations = True
-            delaminations = True
-            ablated_cells = []
-            random_forces = False
-            quasi_static = True
-            quasi_static_threshold=0.01
+                        # Model version select
+                        random_sensitivity = False
+                        aging_sensitivity = False
+                        only_differentiation = False
+                        no_differentiation = False
+                        contact_dependent_differentiation = True
+                        notch_inhibition = False
+                        stress_dependent = True
+                        divisions = False
+                        intercalations = True
+                        delaminations = True
+                        ablated_cells = []
+                        random_forces = False
+                        quasi_static = True
+                        quasi_static_threshold=0.01
 
-            # Model Parameters
-            # General parameters
-            t_end = 20
-            dt = 0.001
-            movie_frames = 100
+                        # Model Parameters
+                        # General parameters
+                        t_end = 20
+                        dt = 0.001
+                        movie_frames = 100
 
-            # 2D vertex related parameters
-            effectors = [FaceContractility, FaceAreaElasticity]
-            tension = {('HC', 'HC'): 0.05,
-                       ('HC', 'SC'): 0.05,
-                       ('SC', 'SC'): 0.05
-                       }
-            preferred_area = {'HC': 1/(4*np.pi),
-                              'SC': 1/(4*np.pi)}
-            contractility = {'HC': 2*gammaSC,
-                             'SC': gammaSC}
+                        # 2D vertex related parameters
+                        effectors = [FaceContractility, FaceAreaElasticity]
+                        tension = {('HC', 'HC'): 0.05,
+                                   ('HC', 'SC'): 0.05,
+                                   ('SC', 'SC'): 0.05
+                                   }
+                        preferred_area = {'HC': 1/(4*np.pi),
+                                          'SC': 1/(4*np.pi)}
+                        contractility = {'HC': gammaHC_ratio*gammaSC,
+                                         'SC': gammaSC}
 
-            repulsion = {'HC': 0.001,
-                         'SC': 0.}
-            repulsion_distance = {'HC': 2.0,
-                                  'SC': 0.}
-            repulsion_exponent = 7.
-            elasticity = {'HC': 5.,
-                          'SC': 1.}
+                        repulsion = {'HC': 0.001,
+                                     'SC': 0.}
+                        repulsion_distance = {'HC': 2.0,
+                                              'SC': 0.}
+                        repulsion_exponent = 7.
+                        elasticity = {'HC': alphaHC_ratio,
+                                      'SC': 1.}
 
-            # Topological events related parameters
-            division_area = 1.3
-            intercalation_length = 0.04
-            delamination_area = 0.1
-            delamination_rate = 1.2
-            viscosity = 1
+                        # Topological events related parameters
+                        division_area = 1.3
+                        intercalation_length = 0.04
+                        delamination_area = 0.1
+                        delamination_rate = 1.2
+                        viscosity = 1
 
-            # Lateral Inhibition parameters
-            differentiation_threshold = 0.5
-            l = 3  # decreasing Hill exponent
-            m = 3  # increasing Hill exponent
-            betaN = 1  # maximum production rate Notch for classical model
-            betaD = 1  # maximum production rate Delta for classical model
-            notch_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
-            repressor_sensitivity = 0.2  # PR - how much Delta production is sensitive to repressor level (sensitivity^l / (sensitivity^l + repressor^l)
-            atoh_sensitivity = 0.31  # how much Atoh1 production is sensitive to repressor level (sensitivity^l / (sensitivity^l + repressor^l)
-            atoh_by_repressor = False
-            notch_sensitivity = 0.2  # PS - how much Repressor production is sensitive to signaling level (signaling^m / (sensitivity^m + signaling^m))
-            delta_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
-            notch_delta_production_ratio = 1 # beta
-            sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
-            mechanosensitivity = psigma # Sensitivity to mechanical stress (for stress dependent version)
-            stress_effectors = [FaceContractility]  # effectors to calculate stress (for stress dependent version)
+                        # Lateral Inhibition parameters
+                        differentiation_threshold = 0.5
+                        l = 3  # decreasing Hill exponent
+                        m = 3  # increasing Hill exponent
+                        betaN = 1  # maximum production rate Notch for classical model
+                        betaD = 1  # maximum production rate Delta for classical model
+                        notch_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
+                        repressor_sensitivity = 0.35  # PR - how much Delta production is sensitive to repressor level (sensitivity^l / (sensitivity^l + repressor^l)
+                        atoh_sensitivity = 0.377  # how much Atoh1 production is sensitive to delta level (delta^l / (sensitivity^l + delta^l)
+                        atoh_by_repressor = False  # if True, Atoh1 production will be set by repressor level instead of delta (sensitivity^l / (sensitivity^l + repressor^l)
+                        notch_sensitivity = 0.2  # PS - how much Repressor production is sensitive to signaling level (signaling^m / (sensitivity^m + signaling^m))
+                        delta_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
+                        notch_delta_production_ratio = 1 # beta
+                        sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
+                        mechanosensitivity = psigma # Sensitivity to mechanical stress (for stress dependent version)
+                        stress_effectors = [FaceContractility]  # effectors to calculate stress (for stress dependent version)
 
-            if not stress_dependent:
-                mechanosensitivity = 0
-
-
-            results_dir = os.path.join("results", name)
-            if os.path.exists(results_dir):
-                overwrite = input("overwriting existing results, are you sure? (y/n)")
-                if overwrite not in ["y", "Y", "yes", "Yes"]:
-                    exit(0)
-            else:
-                os.mkdir(results_dir)
+                        if not stress_dependent:
+                            mechanosensitivity = 0
 
 
-            #  Saving model  parameters
-            params_file = os.path.join(os.path.join("results", name, name + "_parameters.txt"))
-            variables = globals().copy().items()
-            with open(params_file, "w") as f:
-                for var_name, var_value in variables:
-                    # Exclude built-in and special variables (e.g., those starting with '__')
-                    if not var_name.startswith("__") and not callable(var_value) and not isinstance(var_value, type(os)):
-                        f.write(f"{var_name}: {repr(var_value)}\n")
+                        results_dir = os.path.join("results", name)
+                        if os.path.exists(results_dir):
+                            # overwrite = input("overwriting existing results, are you sure? (y/n)")
+                            # if overwrite not in ["y", "Y", "yes", "Yes"]:
+                            #     exit(0)
+                            results_dir = results_dir + "v1"
+                        os.mkdir(results_dir)
 
-            initial_sheet_name = os.path.join("results", initial_sheet_name, initial_sheet_name)
-            name = os.path.join("results", name, name)
 
-            # Load or initialize sheet
-            if os.path.isfile("%s.hf5" % initial_sheet_name):
-                sheet = load_sheet_from_file(initial_sheet_name)
-            else:
-                sheet = initialize_sheet(nx, ny, distx, disty, max_bond_length, min_bond_length)
-            if load_lateral_inhibition_data_from_file:
-                lateral_inhibition_data_file = "%s_notch_delta_levels.pkl" % initial_sheet_name
-            else:
-                lateral_inhibition_data_file = None
-            sheet.set_maximal_bond_length(max_bond_length)
-            sheet.set_minimal_bond_length(min_bond_length)
+                        #  Saving model  parameters
+                        params_file = os.path.join(os.path.join("results", name, name + "_parameters.txt"))
+                        variables = locals().copy().items()
+                        with open(params_file, "w") as f:
+                            for var_name, var_value in variables:
+                                # Exclude built-in and special variables (e.g., those starting with '__')
+                                if not var_name.startswith("__") and not callable(var_value) and not isinstance(var_value, type(os)):
+                                    f.write(f"{var_name}: {repr(var_value)}\n")
 
-            # Initialize model
-            inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
-                                  repulsion_exp=repulsion_exponent, preferred_area=preferred_area, contractility=contractility,
-                                  elasticity=elasticity, differentiation_threshold=differentiation_threshold,
-                                  random_sensitivity=random_sensitivity,
-                                  saved_notch_delta_levels_file=lateral_inhibition_data_file,
-                                  l=l, m=m, betaN=betaN, betaD=betaD, inhibition=notch_inhibition,
-                                  notch_repressor_degradation_ratio=notch_repressor_degradation_ratio,
-                                  repressor_sensitivity=repressor_sensitivity, atoh_sensitivity=atoh_sensitivity,
-                                  delta_repressor_degradation_ratio=delta_repressor_degradation_ratio,
-                                  notch_delta_production_ratio=notch_delta_production_ratio,
-                                  stress_effectors=stress_effectors, mechanosensitivity=mechanosensitivity,
-                                  notch_sensitivity=notch_sensitivity, atoh_by_repressor=atoh_by_repressor)
-            draw_func = inner.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False, color_by="atoh")
-            fig1, ax1 = draw_func(inner.sheet)
-            plt.savefig("%s_initial.png" % name)
-            history = inner.simulate(t_end=t_end, dt=dt, only_differentiation=only_differentiation,
-                                     random_forces=random_forces, aging_sensitivity=aging_sensitivity,
-                                     no_differentiation=no_differentiation,
-                                     contact_dependent_differentiation=contact_dependent_differentiation, divisions=divisions,
-                                     intercalations=intercalations, delaminations=delaminations, ablated_cells=ablated_cells,
-                                     sensitivity_aging_rate=sensitivity_aging_rate,
-                                     division_area=division_area, intercalation_length=intercalation_length,
-                                     delamination_area=delamination_area, delamination_rate=delamination_rate,
-                                     viscosity=viscosity, effectors=effectors, quasi_static=quasi_static,
-                                     quasi_static_threshold=quasi_static_threshold, atoh_by_repressor=atoh_by_repressor)
-            if os.path.isfile("%s.hf5" % name):
-                os.remove("%s.hf5" % name)
-            history.to_archive("%s.hf5" % name)
-            inner.save_notch_delta("%s_notch_delta_levels.pkl" % name)
-            fig2, ax2 = draw_func(inner.sheet)
-            plt.savefig("%s_finale.png" % name)
-            inner.save_sheet_labels_to_numpy(inner.sheet, path="%s_labels.npy" % name)
-            inner.save_contact_matrix_to_numpy(inner.sheet, path="%s_contact_matrix.npy" % name)
-            inner.save_face_data_to_df(inner.sheet, path="%s_cells_info.pkl" % name)
-            create_gif(history, "%s.gif" % name, num_frames=movie_frames, draw_func=draw_func)
+                        initial_sheet_name = os.path.join("results", initial_sheet_name, initial_sheet_name)
+                        name = os.path.join("results", name, name)
+
+                        # Load or initialize sheet
+                        if os.path.isfile("%s.hf5" % initial_sheet_name):
+                            sheet = load_sheet_from_file(initial_sheet_name)
+                        else:
+                            sheet = initialize_sheet(nx, ny, distx, disty, max_bond_length, min_bond_length)
+                        if load_lateral_inhibition_data_from_file:
+                            lateral_inhibition_data_file = "%s_notch_delta_levels.pkl" % initial_sheet_name
+                        else:
+                            lateral_inhibition_data_file = None
+                        sheet.set_maximal_bond_length(max_bond_length)
+                        sheet.set_minimal_bond_length(min_bond_length)
+
+                        # Initialize model
+                        inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
+                                              repulsion_exp=repulsion_exponent, preferred_area=preferred_area, contractility=contractility,
+                                              elasticity=elasticity, differentiation_threshold=differentiation_threshold,
+                                              random_sensitivity=random_sensitivity,
+                                              saved_notch_delta_levels_file=lateral_inhibition_data_file,
+                                              l=l, m=m, betaN=betaN, betaD=betaD, inhibition=notch_inhibition,
+                                              notch_repressor_degradation_ratio=notch_repressor_degradation_ratio,
+                                              repressor_sensitivity=repressor_sensitivity, atoh_sensitivity=atoh_sensitivity,
+                                              delta_repressor_degradation_ratio=delta_repressor_degradation_ratio,
+                                              notch_delta_production_ratio=notch_delta_production_ratio,
+                                              stress_effectors=stress_effectors, mechanosensitivity=mechanosensitivity,
+                                              notch_sensitivity=notch_sensitivity, atoh_by_repressor=atoh_by_repressor)
+                        draw_func = inner.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False, color_by="atoh")
+                        fig1, ax1 = draw_func(inner.sheet)
+                        plt.savefig("%s_initial.png" % name)
+                        history = inner.simulate(t_end=t_end, dt=dt, only_differentiation=only_differentiation,
+                                                 random_forces=random_forces, aging_sensitivity=aging_sensitivity,
+                                                 no_differentiation=no_differentiation,
+                                                 contact_dependent_differentiation=contact_dependent_differentiation, divisions=divisions,
+                                                 intercalations=intercalations, delaminations=delaminations, ablated_cells=ablated_cells,
+                                                 sensitivity_aging_rate=sensitivity_aging_rate,
+                                                 division_area=division_area, intercalation_length=intercalation_length,
+                                                 delamination_area=delamination_area, delamination_rate=delamination_rate,
+                                                 viscosity=viscosity, effectors=effectors, quasi_static=quasi_static,
+                                                 quasi_static_threshold=quasi_static_threshold, atoh_by_repressor=atoh_by_repressor)
+                        if os.path.isfile("%s.hf5" % name):
+                            os.remove("%s.hf5" % name)
+                        history.to_archive("%s.hf5" % name)
+                        inner.save_notch_delta("%s_notch_delta_levels.pkl" % name)
+                        fig2, ax2 = draw_func(inner.sheet)
+                        plt.savefig("%s_finale.png" % name)
+                        inner.save_sheet_labels_to_numpy(inner.sheet, path="%s_labels.npy" % name)
+                        inner.save_contact_matrix_to_numpy(inner.sheet, path="%s_contact_matrix.npy" % name)
+                        inner.save_face_data_to_df(inner.sheet, path="%s_cells_info.pkl" % name)
+                        create_gif(history, os.path.join(os.getcwd(), "%s.gif" % name), num_frames=movie_frames, draw_func=draw_func)
+                    except Exception as e:
+                        print(e)
+                        continue
 
 if __name__ == "__main__":
-    gammaSC_vals = [0.1, 0.2, 0.3, 0.4]
-    psigma_vals = [2.0]
-    run(gammaSC_vals, psigma_vals)
+    gammaSC_vals = [0.01]
+    psigma_vals = [0.0]
+    gammaHC_ratio_vals = [6.0, 8.0, 10.0, 20.0]
+    alphaHC_ratio_vals = [1.0]
+
+
+    run(gammaSC_vals, psigma_vals, gammaHC_ratio_vals, alphaHC_ratio_vals)
