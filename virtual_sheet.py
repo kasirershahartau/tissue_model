@@ -1,7 +1,10 @@
+import time
+
 from tyssue import Sheet, config
 from tyssue import PlanarGeometry as geom
 from tyssue.topology.base_topology import add_vert, collapse_edge
 import numpy as np
+MAX_ITER_TIME = 3600
 
 class VirtualSheet(Sheet):
     """ An epithelium tissue with virtual vertices, to allow for rounded apical morphology"""
@@ -97,7 +100,8 @@ class VirtualSheet(Sheet):
 
     def add_virtual_vertices(self):
         long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
-        # np.random.shuffle(long)
+        np.random.shuffle(long)
+        adding_start = time.time()
         while long.size > 0:
             edge_ind = long[0]
             edge_order = self.edge_df.at[edge_ind, "order"]
@@ -125,6 +129,9 @@ class VirtualSheet(Sheet):
                     self.edge_df.loc[increase_order.index, "order"] += 1
             long = self.edge_df[self.edge_df["length"] > self.maximal_bond_length].index.to_numpy()
             np.random.shuffle(long)
+            iter_time = time.time() - adding_start
+            if iter_time > MAX_ITER_TIME:
+                raise("TIMEOUT ERROR")
         self.edge_df.index.name = 'edge'
         self.vert_df.index.name = 'vert'
         self.geom.update_all(self)
@@ -207,3 +214,19 @@ class VirtualSheet(Sheet):
         m = np.bincount(faces_with_neighbors_ids*number_of_faces + neighbor_ids, weights=contact_length,
                          minlength=number_of_faces*number_of_faces).reshape(number_of_faces, number_of_faces)
         return m
+
+    def get_face_area(self):
+        data = self.face_df[["area", "id"]].copy()
+        data.set_index("id", inplace=True)
+        return data["area"]
+
+    def get_face_perimeter(self):
+        data = self.face_df[["perimeter", "id"]].copy()
+        data.set_index("id", inplace=True)
+        return data["perimeter"]
+
+    def get_face_roundness(self):
+        data = self.face_df[["area", "perimeter", "id"]].copy()
+        data["roundness"] = 4*np.pi*data["area"]/(data["perimeter"]**2)
+        data.set_index("id", inplace=True)
+        return data["roundness"]
