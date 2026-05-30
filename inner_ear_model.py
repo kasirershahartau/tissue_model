@@ -6,8 +6,7 @@
 import os.path
 import sys
 import tyssue
-from tyssue import config, History
-from tyssue.draw import sheet_view
+from tyssue import config, History, HistoryHdf5
 from tyssue.behaviors import EventManager
 from solvers import IVPSolver
 from tyssue.dynamics import model_factory
@@ -18,7 +17,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 
 from empty_effector import EmptyAffector
-from topologocal_events import TopologicalEventsHandler
+from topological_events import TopologicalEventsHandler
 from lateral_inhibition_model import LateralInhibitionModel
 
 class InnerEarModel:
@@ -61,9 +60,8 @@ class InnerEarModel:
             tension[('HC', 'SC')] = tension[('SC', 'HC')]
         elif ('HC', 'SC') in tension:
             tension[('SC', 'HC')] = tension[('HC', 'SC')]
-        self.sheet = self.arrange_sheet_from_history(sheet)
-        self.sheet.initiate_edge_order()
         sheet.repulsion_exp = repulsion_exp
+        self.sheet = sheet
         length_normalization_factor = self.get_average_face_perimeter()
         preferred_area['HC'] *= length_normalization_factor ** 2
         preferred_area['SC'] *= length_normalization_factor ** 2
@@ -105,30 +103,9 @@ class InnerEarModel:
             self.sheet.face_df["atoh_level"] = self.lateral_inhibition_model.get_atoh_level(
                 self.sheet.face_df.delta_level.values, activation=True)
         self.update_cell_type_parameters(self.sheet.face_df.atoh_level)
-
         self.sheet.order_all_edges()
 
         return
-
-    @staticmethod
-    def arrange_sheet_from_history(sheet):
-        if 'vert' in sheet.vert_df.columns:
-            if np.isnan(sheet.vert_df['vert']).any():
-                sheet.vert_df.set_index('index', inplace=True)
-                sheet.vert_df.drop(columns=['vert'], inplace=True)
-            else:
-                sheet.vert_df.set_index('vert', inplace=True)
-        if 'time' in sheet.vert_df.columns:
-            sheet.vert_df.drop('time', inplace=True, axis=1)
-        if 'edge' in sheet.edge_df.columns:
-            sheet.edge_df.set_index('edge', inplace=True)
-        if 'time' in sheet.edge_df.columns:
-            sheet.edge_df.drop('time', inplace=True, axis=1)
-        if 'face' in sheet.face_df.columns:
-            sheet.face_df.set_index('face', inplace=True)
-        if 'time' in sheet.face_df.columns:
-            sheet.face_df.drop('time', inplace=True, axis=1)
-        return sheet
 
     def update_cell_type_parameters(self, atoh_level):
         differentiating_cells = self.sheet.face_df.query('type >= 0').index
@@ -157,7 +134,7 @@ class InnerEarModel:
         self.sheet.face_df.loc[:, "prefered_area"] = np.random.rand(self.sheet.face_df.shape[0],)
         self.sheet.face_df.loc[:, "prefered_vol"] = self.sheet.face_df.loc[:, "prefered_area"]
         self.sheet.face_df.loc[:, "contractility"] = np.random.rand(self.sheet.face_df.shape[0],)/5
-        self.sheet.edge_df.loc[:, "line_tension"] = np.random.rand(self.sheet.edge_df.shape[0],)/10
+        # self.sheet.edge_df.loc[:, "line_tension"] = np.random.rand(self.sheet.edge_df.shape[0],)/10
 
     def get_specs_2d(self, notch_sensitivity):
         specs = {'vert': {'is_active':1,
@@ -362,10 +339,48 @@ class InnerEarModel:
                  aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False,
                  divisions=True, intercalations=True, delaminations=True, ablated_cells=[], sensitivity_aging_rate=0,
                  division_area=1.3, intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
-                 viscosity=3, effectors=None, quasi_static=False, quasi_static_threshold=0.01, atoh_by_repressor=True):
+                 viscosity=3, effectors=None, quasi_static=False, quasi_static_threshold=0.01, atoh_by_repressor=True,
+                 history_file=None, save_interval=None,
+                 max_displacement=None, max_disp_factor=0.25,
+                 dt_min_factor=0.0001, dt_increase_factor=1.1,
+                 until_steady_state=False, lateral_inhibition_threshold=1e-3):
+        """Run the simulation until ``t_end`` (or, if
+        ``until_steady_state`` is True, until the dynamics settle).
+
+        Steady-state stopping (``until_steady_state=True``)
+        ---------------------------------------------------
+        Stops as soon as the per-step change in the relevant
+        quantities falls below threshold. ``t_end`` then acts as a
+        wall-clock safety cap.
+
+        - Mechanical criterion: ``max(|new_pos - old_pos|) <
+          quasi_static_threshold`` for every active vertex.
+        - Lateral-inhibition criterion:
+          ``max(|new - old|) < lateral_inhibition_threshold`` across
+          whichever of ``notch_level``, ``delta_level``,
+          ``repressor_level`` are present on ``face_df``.
+
+        Which criterion is required depends on the existing
+        differentiation flags:
+
+        - ``only_differentiation=True``: ONLY the lateral-inhibition
+          criterion (positions don't move when there are no
+          mechanics) — the mechanical check is skipped.
+        - ``no_differentiation=True``: ONLY the mechanical criterion
+          (LI levels don't change when there's no differentiation
+          manager) — the LI check is skipped.
+        - Otherwise: BOTH criteria must hold simultaneously.
+
+        A topology change during a step always fails the LI check
+        for that step (so the system has to settle for at least one
+        full step AFTER any division / delamination / T1 before it
+        can declare steady state).
+        """
         manager = EventManager("face")
         # manager.append(self.get_ablation_function(2))
-        if not no_differentiation:
+        if no_differentiation:
+            quasi_static = False
+        else:
             if contact_dependent_differentiation:
                 manager.append(self.lateral_inhibition_model.get_length_dependent_differentiation_function(dt=dt,
                                                                                                            quasi_static=quasi_static,
@@ -391,24 +406,82 @@ class InnerEarModel:
 
         if random_forces:
             manager.append(self.get_random_initializer(wait_time=1, dt=dt))
-        history = History(self.sheet, save_every=0.1,save_all=False, dt=dt)
+
+        # Set viscosity BEFORE creating HistoryHdf5 so its dtype is
+        # captured at init.
+        self.sheet.vert_df['viscosity'] = viscosity
+
+        # IMPORTANT: run a geometry update before constructing
+        # HistoryHdf5. ``InnerEarModel.__init__`` calls
+        # ``update_specs(reset=True)`` which resets derived edge
+        # columns (notably ``sub_area``) back to their integer defaults
+        # from the spec dict. Once the solver runs ``set_pos`` for the
+        # first time it calls ``geom.update_all`` which recomputes
+        # ``sub_area = nz/2`` as a float, and HistoryHdf5's strict
+        # dtype check (captured at HistoryHdf5 init time) then trips
+        # with "There is a change of datatype in edge table in
+        # {'sub_area': dtype('int64')} columns". Updating the geometry
+        # here makes the captured dtypes match the steady state.
+        self.sheet.geom.update_all(self.sheet)
+
+        # Pass history_file="some/path.hf5" to record on-the-fly to disk
+        # — useful for diagnosing hangs (e.g. add_virtual_vertices infinite
+        # loop): the partial archive can be opened from another process
+        # while the simulation is still running. Without it we fall back
+        # to in-memory History (faster for short runs).
+        if history_file is not None:
+            # Remove an existing file so HistoryHdf5 doesn't auto-rename.
+            if os.path.isfile(history_file):
+                os.remove(history_file)
+            history = HistoryHdf5(self.sheet, save_every=0.1, dt=dt,
+                                   hf5file=history_file, overwrite=True)
+        else:
+            history = History(self.sheet, save_every=0.1, save_all=False, dt=dt)
         model = self.get_model(only_differentiation, effectors=effectors)
         solver = IVPSolver(self, self.sheet, self.sheet.geom, model, manager=manager, history=history, auto_reconnect=False)
-        self.sheet.vert_df['viscosity'] = viscosity
-        # for diff in range(100):
-        #     manager.execute(self.sheet)
-        #     manager.update()
-        solver.solve(tf=t_end, dt=dt, quasi_static=quasi_static, quasi_static_threshold=quasi_static_threshold)
+
+        # Translate the differentiation flags into the solver's
+        # steady-state check flags. ``only_differentiation`` means
+        # there's no mechanical evolution to wait on (only LI must
+        # converge). ``no_differentiation`` means LI levels don't
+        # evolve (only mechanics must settle). The remaining default
+        # asks for BOTH to converge before halting.
+        check_mech = bool(until_steady_state) and not bool(only_differentiation)
+        check_li = bool(until_steady_state) and not bool(no_differentiation)
+        if until_steady_state and not (check_mech or check_li):
+            # only_differentiation AND no_differentiation are both True
+            # — that's contradictory. Warn rather than silently looping
+            # forever with no halt criterion.
+            import warnings as _w
+            _w.warn(
+                "until_steady_state=True but BOTH only_differentiation "
+                "and no_differentiation are set; steady-state stop "
+                "cannot fire and the simulation will run to t_end."
+            )
+
+        solver.solve(
+            tf=t_end, dt=dt,
+            quasi_static=quasi_static, quasi_static_threshold=quasi_static_threshold,
+            max_displacement=max_displacement,
+            max_disp_factor=max_disp_factor,
+            dt_min_factor=dt_min_factor,
+            dt_increase_factor=dt_increase_factor,
+            save_interval=save_interval,
+            until_steady_state=until_steady_state,
+            lateral_inhibition_threshold=lateral_inhibition_threshold,
+            check_mechanical_steady=check_mech,
+            check_lateral_inhibition_steady=check_li,
+        )
         # fig, ax = plot_forces(self.sheet, geom, model, ['x', 'y'], 1)
         # plt.show()
         return history
 
     @staticmethod
-    def get_draw_sheet_method( number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
+    def get_draw_sheet_method(number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
                    for_labels=False, maximal_level=1, color_by="atoh", arrange_sheet=False):
         def draw_sheet(sheet):
             if arrange_sheet:
-                sheet = InnerEarModel.arrange_sheet_from_history(sheet)
+                sheet.arrange_sheet_from_history()
             # if not sheet.check_all_edge_order():
             #     print("bug in drawing")
             #     sheet.order_all_edges()
@@ -436,6 +509,7 @@ class InnerEarModel:
                 sheet.is_ordered = True
                 sheet.edge_df.sort_values(["face", "order"], inplace=True)
 
+            sheet_view = sheet.get_sheet_view_method()
             fig, ax = sheet_view(sheet, ['x', 'y'], **draw_specs)
             fig.set_size_inches((8, 8))
 

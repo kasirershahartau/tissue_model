@@ -34,15 +34,15 @@ def redraw(load_name, save_name, movie=True, maximal_number_of_frames_to_save=10
     number_of_frames_to_save = min(number_of_time_points, maximal_number_of_frames_to_save)
 
     save_path = os.path.join("results", load_name, save_name)
-    static_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
-                                         arrange_sheet=True, color_by=color_by, maximal_level=maximal_level)
+    static_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
+                                         arrange_sheet=False, color_by=color_by, maximal_level=maximal_level)
     fig1, ax1 = static_draw_func(initial_sheet)
     plt.savefig("%s_initial.png" % save_path)
     fig2, ax2 =static_draw_func(final_sheet)
     plt.savefig("%s_finale.png" % save_path)
     if movie:
         gif_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
-                                             arrange_sheet=True, color_by=color_by, maximal_level=maximal_level)
+                                             arrange_sheet=False, color_by=color_by, maximal_level=maximal_level)
         create_gif(history, os.path.join(os.getcwd(), "%s.gif" % save_path), num_frames=number_of_frames_to_save,
                    draw_func=gif_draw_func)
     return 0
@@ -60,7 +60,7 @@ def find_maximal_level_final_frame(load_name,  type_by='atoh_level'):
     history = HistoryHdf5.from_archive("%s.hf5" % load_path, eptm_class=VirtualSheet)
     last_time_point = np.max(history.time_stamps)
     final_sheet = history.retrieve(last_time_point)
-    final_sheet = InnerEarModel.arrange_sheet_from_history(final_sheet)
+    final_sheet.arrange_sheet_from_history()
     face_ids = find_non_boundary_cells(final_sheet)
     level = final_sheet.face_df.loc[face_ids, type_by]
     return np.max(level)
@@ -182,6 +182,9 @@ def calc_area_change_after_ablation(load_name, ablated_cells=[], end_frame=3, ty
                                                                                  only_for_these_cells=neighbors))
     final_sheet = history.retrieve(end_frame)
     final_sheet = InnerEarModel.arrange_sheet_from_history(final_sheet)
+    exist_in_final_frame = final_sheet.face_df.id.values
+    HC_neighbors_of_ablated = np.intersect1d(HC_neighbors_of_ablated, exist_in_final_frame)
+    SC_neighbors_of_ablated = np.intersect1d(SC_neighbors_of_ablated, exist_in_final_frame)
     initial_face_area = initial_sheet.get_face_area()
     initial_HC_area_next_to_ablated = initial_face_area.loc[HC_neighbors_of_ablated].values
     initial_SC_area_next_to_ablated = initial_face_area.loc[SC_neighbors_of_ablated].values
@@ -298,7 +301,17 @@ def compare_to_experimental_results(model_name, experimental_stage, results_type
     return calc_vectorial_distance(model_results, experimental_results, maximal_n=max_number_of_neighbors,
                                    continous=continues)
 
+def compare_model_mechanics_to_experiments(model_name, experimental_stage):
+    raise NotImplementedError
+
+
 if __name__ == "__main__":
+    load_name = "random_periodic_array_test2"
+
+    save_name = "until_crash"
+    redraw(load_name,
+           save_name, movie=True, maximal_number_of_frames_to_save=100, color_by="delta",
+           maximal_level=find_maximal_level_final_frame(load_name, "delta_level"))
     # gammaSC_vals = [0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
     # psigma_vals = [8.0]
     # # gammaSC_vals = [0.5]
@@ -385,48 +398,58 @@ if __name__ == "__main__":
     # print("HC avg area change:%f"%np.average(HC_res))
     # print("SC avg area change:%f"%np.average(SC_res))
 
-    gammaSC_vals = [0.01]
-    psigma_vals = [0.0]
-    gammaHC_ratio_vals = [2.0, 4.0, 6.0, 8.0, 10.0, 20.0]
-    alphaHC_ratio_vals = [1.0]
-    results = []
-    for gammaSC in gammaSC_vals:
-        for psigma in psigma_vals:
-            for gammaHC_ratio in gammaHC_ratio_vals:
-                for alphaHC_ratio in alphaHC_ratio_vals:
-                    name = "stress_dependent_on_random_0_psigma-%.1f_gammaSC-%.1f_pR-0.35_gammaHC_ratio-%.1f_alphaHC_ratio-%.1f" % (
-                    psigma, gammaSC, gammaHC_ratio, alphaHC_ratio)
-                    load_name = name
-                    try:
-                        # save_name = "delta"
-                        # redraw(load_name,
-                        #        save_name,movie=True, maximal_number_of_frames_to_save=100, color_by="delta",
-                        #        maximal_level=find_maximal_level_final_frame(load_name, "delta_level"))
+    # gammaSC_vals = [0.01]
+    # psigma_vals = [0.0]
+    # gammaHC_ratio_vals = [2.0, 4.0, 6.0, 8.0, 10.0, 20.0]
+    # alphaHC_ratio_vals = [1.0]
+    # results = []
+    # HC_change = []
+    # SC_change = []
+    # ratio = []
+    # for gammaSC in gammaSC_vals:
+    #     for psigma in psigma_vals:
+    #         for gammaHC_ratio in gammaHC_ratio_vals:
+    #             for alphaHC_ratio in alphaHC_ratio_vals:
+                    # name = "stress_dependent_on_random_0_psigma-%.1f_gammaSC-%.1f_pR-0.35_gammaHC_ratio-%.1f_alphaHC_ratio-%.1f_ablation" % (
+                    # psigma, gammaSC, gammaHC_ratio, alphaHC_ratio)
+                    # load_name = "random_periodic_array_test"
+                    # try:
+                    #     save_name = "until_crash"
+                    #     redraw(load_name,
+                    #            save_name,movie=True, maximal_number_of_frames_to_save=100, color_by="delta",
+                    #            maximal_level=find_maximal_level_final_frame(load_name, "delta_level"))
                         # save_name = "atoh"
                         # redraw(load_name,
                         #        save_name, movie=True, maximal_number_of_frames_to_save=100, color_by="atoh",
                         #        maximal_level=find_maximal_level_final_frame(load_name, "atoh_level"))
-                        HC_res = calc_roundness_for_last_time_point(load_name, cell_type='HC',
-                                           type_by='atoh_level', threshold=None, HC_above_threshold=True,
-                                           only_for_these_cells=None)
-                        SC_res = calc_roundness_for_last_time_point(load_name, cell_type='SC',
-                                                                    type_by='atoh_level', threshold=None,
-                                                                    HC_above_threshold=True,
-                                                                    only_for_these_cells=None)
-                        HC_avg = np.average(HC_res)
-                        SC_avg = np.average(SC_res)
-                        ratio_avg = HC_avg/SC_avg
-                        results.append((gammaSC, gammaHC_ratio, alphaHC_ratio, HC_avg, SC_avg, ratio_avg))
-                    except Exception as e:
-                        print(e)
-                        continue
-    results = np.array(results)
-    gammaSC_arr = results[:, 0]
-    gammaHC_arr = results[:, 1]
-    alphaHC_arr = results[:, 2]
-    HC_roundness_arr = results[:, 3]
-    SC_roundness_arr = results[:, 4]
-    roundness_ratio_arr = results[:, 5]
+                        # HC_res, SC_res = calc_area_change_after_ablation(load_name,ablated_cells=[81, 91, 212, 280, 386], end_frame=4)
+                        # HC_change.append(np.average(HC_res))
+                        # SC_change.append(np.average(SC_res))
+                        # ratio.append(np.average(HC_res)/np.average(SC_res))
+                        # HC_res = calc_roundness_for_last_time_point(load_name, cell_type='HC',
+                        #                    type_by='atoh_level', threshold=None, HC_above_threshold=True,
+                        #                    only_for_these_cells=None)
+                        # SC_res = calc_roundness_for_last_time_point(load_name, cell_type='SC',
+                        #                                             type_by='atoh_level', threshold=None,
+                        #                                             HC_above_threshold=True,
+                        #                                             only_for_these_cells=None)
+                        # HC_avg = np.average(HC_res)
+                        # SC_avg = np.average(SC_res)
+                        # ratio_avg = HC_avg/SC_avg
+                        # results.append((gammaSC, gammaHC_ratio, alphaHC_ratio, HC_avg, SC_avg, ratio_avg))
+                    # except Exception as e:
+                    #     print(e)
+                    #     continue
+    # plt.plot(gammaHC_ratio_vals, HC_change, label="HC change")
+    # plt.plot(gammaHC_ratio_vals, SC_change, label="SC change")
+    # plt.plot(gammaHC_ratio_vals, ratio, label="HC/SC change ratio")
+    # results = np.array(results)
+    # gammaSC_arr = results[:, 0]
+    # gammaHC_arr = results[:, 1]
+    # alphaHC_arr = results[:, 2]
+    # HC_roundness_arr = results[:, 3]
+    # SC_roundness_arr = results[:, 4]
+    # roundness_ratio_arr = results[:, 5]
 
     # plt.plot(gammaHC_arr, HC_roundness_arr, "*", label="HC roundness")
     # plt.plot(gammaHC_arr, SC_roundness_arr, "*", label="SC roundness")
@@ -470,3 +493,4 @@ if __name__ == "__main__":
     # fig1.show()
     # fig2.show()
     # fig3.show()
+    # plt.show()

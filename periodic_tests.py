@@ -1,14 +1,14 @@
-import numpy as np
 import atexit
 import logging
 import os, shutil, sys
+import numpy as np
 from tyssue import HistoryHdf5
 from tyssue.draw.plt_draw import create_gif
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
-from post_processing import compare_model_mechanics_to_experiments
+
 
 # --------------------------------------------------------------------------- #
 # Debug logging                                                               #
@@ -104,6 +104,7 @@ def _disable_debug_log(handler):
     except Exception:
         pass
 
+
 def initialize_sheet(nx, ny, distx=1, disty=1, max_bond_length=0.5, min_bond_length=0.05, periodic=True):
     sheet = VirtualSheet.planar_virtual_sheet_2d(
         'basic2D',  # a name or identifier for this sheet
@@ -127,23 +128,11 @@ def load_sheet_from_file(initial_sheet_name, two_dim=True):
     return sheet
 
 
-def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, ablated_cells=None,
-        only_differentiation=False, no_differentiation=False, end_on_steady_state=True, t_end=10, dt=0.01,
-        random_forces=False, name=None, continue_existing_run=False):
+def run():
     # Sheet Parameters
-    if continue_existing_run:
-        initial_sheet_name = name
-        name += "part2"
-    if initial_sheet_name is None:
-        initial_sheet_name = ""
-
+    initial_sheet_name = ""
     load_lateral_inhibition_data_from_file = True
-    if name is None:
-        name = "periodic_from%s_gammaSC-%.2f_gammaHC_ratio-.2%f_alphaHC_ratio-%.2f_psigma-%.2f"%(initial_sheet_name, gammaSC, gammaHC_ratio, alphaHC_ratio, psigma)
-    if ablated_cells is not None:
-        name += "ablated"
-        for cell in ablated_cells:
-            name += "_%d" % cell
+    name = "random_periodic_array_test3"
     max_bond_length = 0.2
     min_bond_length = 0.05
 
@@ -156,16 +145,18 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     # Model version select
     random_sensitivity = False
     aging_sensitivity = False
+    only_differentiation = False
+    no_differentiation = True
     contact_dependent_differentiation = True
     notch_inhibition = False
     stress_dependent = False
-    divisions = False
+    divisions = True
     intercalations = True
     delaminations = True
-    if ablated_cells is None:
-        ablated_cells = []
-    quasi_static = True
-    quasi_static_threshold = 0.01
+    ablated_cells = []
+    random_forces = True
+    quasi_static = False
+    quasi_static_threshold=0.01
 
     # Model Parameters
     # General parameters
@@ -179,17 +170,17 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                ('HC', 'SC'): 0.05,
                ('SC', 'SC'): 0.05
                }
-    preferred_area = {'HC': 1 / (4 * np.pi),
-                      'SC': 1 / (4 * np.pi)}
-    contractility = {'HC': gammaSC * gammaHC_ratio,
-                     'SC': gammaSC}
+    preferred_area = {'HC': 1/(4*np.pi),
+                      'SC': 1/(4*np.pi)}
+    contractility = {'HC': 0.1,
+                     'SC': 0.01}
 
     repulsion = {'HC': 0.001,
                  'SC': 0.}
     repulsion_distance = {'HC': 2.0,
                           'SC': 0.}
     repulsion_exponent = 7.
-    elasticity = {'HC': alphaHC_ratio,
+    elasticity = {'HC': 1.,
                   'SC': 1.}
 
     # Topological events related parameters
@@ -206,40 +197,37 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     betaN = 1  # maximum production rate Notch for classical model
     betaD = 1  # maximum production rate Delta for classical model
     notch_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
-    repressor_sensitivity = 0.4 # PR - how much Delta production is sensitive to repressor level (sensitivity^l / (sensitivity^l + repressor^l)
+    repressor_sensitivity = 0.35  # PR - how much Delta production is sensitive to repressor level (sensitivity^l / (sensitivity^l + repressor^l)
     atoh_sensitivity = 0.377  # how much Atoh1 production is sensitive to delta level (delta^l / (sensitivity^l + delta^l)
     atoh_by_repressor = False  # if True, Atoh1 production will be set by repressor level instead of delta (sensitivity^l / (sensitivity^l + repressor^l)
     notch_sensitivity = 0.2  # PS - how much Repressor production is sensitive to signaling level (signaling^m / (sensitivity^m + signaling^m))
     delta_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
-    notch_delta_production_ratio = 1  # beta
+    notch_delta_production_ratio = 1 # beta
     sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
-    mechanosensitivity = psigma  # Sensitivity to mechanical stress (for stress dependent version)
+    mechanosensitivity = 0 # Sensitivity to mechanical stress (for stress dependent version)
     stress_effectors = [FaceContractility]  # effectors to calculate stress (for stress dependent version)
-    li_steady_state_threshold=0.001
 
     if not stress_dependent:
         mechanosensitivity = 0
 
+
     results_dir = os.path.join("results", name)
-    if continue_existing_run:
-        if not os.path.exists(results_dir):
-            print("Directory %s doesn't exist. Unable to continue from existing run." % results_dir)
-            return name
-    else:
-        if os.path.exists(results_dir):
-            print("Directory %s already exists" % results_dir)
-            return name
-        os.mkdir(results_dir)
+    if os.path.exists(results_dir):
+        # Pass --force / -f to overwrite without prompting (handy for CI
+        # and headless runs); otherwise ask.
+        force_flag = any(arg in ("--force", "-f") for arg in sys.argv[1:])
+        if not force_flag and sys.stdin.isatty():
+            overwrite = input("overwriting existing results, are you sure? (y/n)")
+            if overwrite not in ["y", "Y", "yes", "Yes"]:
+                exit(0)
+        shutil.rmtree(results_dir)
+
+    os.mkdir(results_dir)
+
 
     #  Saving model  parameters
-    params_file = os.path.join(os.path.join(results_dir, name + "_parameters.txt"))
-    if continue_existing_run and os.path.exists(params_file):
-        last = int(name[-1])
-        name[-1] = str(last + 1)
-        params_file = os.path.join(os.path.join(results_dir, name + "_parameters.txt"))
+    params_file = os.path.join(os.path.join("results", name, name + "_parameters.txt"))
     variables = locals().copy().items()
-
-
     with open(params_file, "w") as f:
         for var_name, var_value in variables:
             # Exclude built-in and special variables (e.g., those starting with '__')
@@ -259,6 +247,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
 
     initial_sheet_name = os.path.join("results", initial_sheet_name, initial_sheet_name)
     name = os.path.join("results", name, name)
+
     try:
         # Load or initialize sheet
         if os.path.isfile("%s.hf5" % initial_sheet_name):
@@ -284,17 +273,14 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                               notch_delta_production_ratio=notch_delta_production_ratio,
                               stress_effectors=stress_effectors, mechanosensitivity=mechanosensitivity,
                               notch_sensitivity=notch_sensitivity, atoh_by_repressor=atoh_by_repressor)
-        draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
-                                                color_by="atoh")
+        draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False, color_by="atoh")
         fig1, ax1 = draw_func(inner.sheet)
         plt.savefig("%s_initial.png" % name)
         # Pass the archive path so HistoryHdf5 writes each snapshot on the
         # fly; the partial file can be opened in another process while the
         # simulation is still running (useful for diagnosing hangs).
         history_file = "%s.hf5" % name
-        history = inner.simulate(t_end=t_end, dt=dt, until_steady_state=end_on_steady_state,
-                                 lateral_inhibition_threshold=li_steady_state_threshold,
-                                 only_differentiation=only_differentiation,
+        history = inner.simulate(t_end=t_end, dt=dt, only_differentiation=only_differentiation,
                                  random_forces=random_forces, aging_sensitivity=aging_sensitivity,
                                  no_differentiation=no_differentiation,
                                  contact_dependent_differentiation=contact_dependent_differentiation, divisions=divisions,
@@ -311,12 +297,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         inner.save_sheet_labels_to_numpy(inner.sheet, path="%s_labels.npy" % name)
         inner.save_contact_matrix_to_numpy(inner.sheet, path="%s_contact_matrix.npy" % name)
         inner.save_face_data_to_df(inner.sheet, path="%s_cells_info.pkl" % name)
-        gif_func = inner.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
-                                               color_by="atoh",
+        gif_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False, color_by="atoh",
                                                arrange_sheet=True)
         create_gif(history, os.path.join(os.getcwd(), "%s.gif" % name), num_frames=movie_frames, draw_func=gif_func)
         run_log.info("run() finished successfully")
-        return name
     except BaseException:
         # ``BaseException`` (not ``Exception``) covers Ctrl+C
         # (KeyboardInterrupt) too — the user may stop a stuck run
@@ -332,80 +316,6 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         #  (b) a re-run inside the same Python session doesn't keep
         #      writing to the previous run's file.
         _disable_debug_log(log_handler)
-        return name
-
-def create_random_arrays(n):
-    for i in range(n):
-        print("Running random array %d" % i)
-        gammaSC = 0.01
-        gammaHC_ratio = 10
-        alphaHC_ratio = 1
-        psigma = 1
-        name = run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, name="random_periodic_array%d" % i,
-                    random_forces=True, end_on_steady_state=False, t_end=100, dt=0.01)
-        print("Finished %s"%name)
-
-def initialize_differentiated_arrays(initial_sheets, gammaSC, gammaHC_ratio, alphaHC_ratio, psigma):
-    for initial in initial_sheets:
-        print("Running on initial sheet:\n%s\nwith initial parameters:\n" % initial,
-              "gammaSC=%.2f ,gammaHC_ratio=%.2f ,alphaHC_ratio=%.2f, psigma=%.2" % (gammaSC, gammaHC_ratio, alphaHC_ratio, psigma)
-                                                                        )
-        name = run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial)
-        print("Finished running: %s" % name)
-    return 0
-
-def find_mechanical_parameters(experimental_stage, initial_gammaSC, initial_gammaHC_ratio, initial_alphaHC_ratio,
-                               initial_sheets, step_size, ablated_cells=[]):
-    """ performs gradient descent to find best fitting mechanical parameters"""
-    grad = np.ones((3,)) * step_size * 2
-    score = 0
-    current_params = np.array([initial_gammaSC, initial_gammaHC_ratio, initial_alphaHC_ratio])
-    while np.linalg.norm(grad) > step_size/2:
-        initial_sheet_grads = []
-        scores = []
-        for initial in initial_sheets:
-            current_grad = np.zeros((3,))
-            print("Running on initial sheet:\n%s\nwith initial parameters:\n"%initial,
-                  "gammaSC=%.2f ,gammaHC_ratio=%.2f ,alphaHC_ratio=%.2f"%(current_params[0],current_params[1],current_params[2]))
-            base_name = run(current_params[0], current_params[1], current_params[2], 0, initial, no_differentiation=True)
-            print("Running on initial sheet:\n%s\nwith initial parameters:\n" % base_name,
-                  "gammaSC=%.2f ,gammaHC_ratio=%.2f ,alphaHC_ratio=%.2f" % (current_params[0], current_params[1],
-                                                                            current_params[2]),
-                  "\nAblating cells" + str(ablated_cells))
-            with_ablation_name = run(current_params[0], current_params[1], current_params[2], 0, base_name,
-                                     no_differentiation=True, ablated_cells=ablated_cells)
-            score = compare_model_mechanics_to_experiments(with_ablation_name, experimental_stage)
-            scores.append(score)
-            print("Score is:%f"%score)
-            for param_idx in range(current_params.size):
-                current_params[param_idx] += step_size
-                print("Running on initial sheet:\n%s\nwith initial parameters:\n" % base_name,
-                      "gammaSC=%.2f ,gammaHC_ratio=%.2f ,alphaHC_ratio=%.2f" % (current_params[0], current_params[1],
-                                                                                current_params[2]))
-                changed_name = run(current_params[0], current_params[1], current_params[2], 0, base_name,
-                           no_differentiation=True)
-                print("Running on initial sheet:\n%s\nwith initial parameters:\n" % changed_name,
-                      "gammaSC=%.2f ,gammaHC_ratio=%.2f ,alphaHC_ratio=%.2f" % (current_params[0], current_params[1],
-                                                                                current_params[2]),
-                      "\nAblating cells" + str(ablated_cells))
-                changed_with_ablation_name = run(current_params[0], current_params[1], current_params[2], 0,
-                                         changed_name,
-                                         no_differentiation=True, ablated_cells=[12, 13, 14, 15])
-                updated_score = compare_model_mechanics_to_experiments(changed_with_ablation_name, experimental_stage)
-                print("Updated score is:%f" % score)
-                current_grad[param_idx] = (updated_score - score) / step_size
-                current_params[param_idx] -= step_size
-            print("Gradient = " + str(current_grad))
-            initial_sheet_grads.append(current_grad)
-        grad = np.average(np.array(initial_sheet_grads), axis=0)
-        score = np.average(scores)
-        current_params = current_params + grad*step_size
-    print("Best params: gammaSC=%.2f ,gammaHC_ratio=%.2f ,alphaHC_ratio=%.2f"%(current_params[0],current_params[1],current_params[2]))
-    print("Best score: %f" % score)
-    return current_params
-
-
-
 
 if __name__ == "__main__":
-    create_random_arrays(10)
+    run()
