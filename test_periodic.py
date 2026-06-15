@@ -725,6 +725,93 @@ class TestHistoryRoundTrip:
         loaded.get_opposite()
         assert (loaded.edge_df["opposite"] < 0).sum() == 0
 
+    def test_legacy_archive_without_flag_loads_nonperiodic(self, tmp_path):
+        """An archive whose face_df lacks the ``_periodic_flag``
+        metadata (legacy: written before the flag was stashed on every
+        snapshot) loads as NON-periodic by default. Recomputing the
+        geometry then unwraps boundary-crossing faces into
+        domain-spanning edges — the root cause of the t=25 resume
+        blow-up."""
+        from tyssue import History, HistoryHdf5
+        sheet = _build_sheet(nx=4, ny=4)
+        # Strip the stash columns to simulate a legacy archive.
+        sheet.face_df = sheet.face_df.drop(
+            columns=["_periodic_flag", "_periodic_Lx", "_periodic_Ly"],
+            errors="ignore",
+        )
+        archive = tmp_path / "legacy.hf5"
+        hist = History(sheet, save_every=1.0, save_all=True, dt=1.0)
+        hist.record(time_stamp=0.0)
+        hist.to_archive(str(archive))
+
+        loaded_hist = HistoryHdf5.from_archive(str(archive), eptm_class=VirtualSheet)
+        loaded = loaded_hist.retrieve(float(np.max(loaded_hist.time_stamps)))
+        loaded.arrange_sheet_from_history(two_dim=True)  # no fallback box
+        # Without the flag and without a fallback box, the sheet is
+        # silently non-periodic — this is exactly the failure mode.
+        assert loaded.periodic is False
+
+    def test_force_periodic_box_recovers_legacy_archive(self, tmp_path):
+        """``arrange_sheet_from_history(force_periodic_box=(Lx, Ly))``
+        re-establishes periodicity on a legacy archive that lacks the
+        flag, so recomputing the geometry keeps boundary faces intact
+        (positive areas, no domain-spanning edges)."""
+        from tyssue import History, HistoryHdf5
+        sheet = _build_sheet(nx=4, ny=4)
+        Lx, Ly = sheet.Lx, sheet.Ly
+        sheet.face_df = sheet.face_df.drop(
+            columns=["_periodic_flag", "_periodic_Lx", "_periodic_Ly"],
+            errors="ignore",
+        )
+        archive = tmp_path / "legacy.hf5"
+        hist = History(sheet, save_every=1.0, save_all=True, dt=1.0)
+        hist.record(time_stamp=0.0)
+        hist.to_archive(str(archive))
+
+        loaded_hist = HistoryHdf5.from_archive(str(archive), eptm_class=VirtualSheet)
+        loaded = loaded_hist.retrieve(float(np.max(loaded_hist.time_stamps)))
+        loaded.arrange_sheet_from_history(
+            two_dim=True, force_periodic_box=(Lx, Ly),
+        )
+        loaded.initiate_edge_order()
+
+        # Periodicity re-established from the fallback box.
+        assert loaded.periodic is True
+        assert loaded.Lx == Lx and loaded.Ly == Ly
+
+        # The decisive check: re-stitch + recompute geometry and
+        # confirm it stays healthy — no negative areas, no
+        # domain-spanning edges (which is what broke the resume).
+        loaded.get_opposite()
+        loaded.geom.update_all(loaded)
+        assert (loaded.face_df["area"] > 0).all(), (
+            "force-periodic recovery still left non-positive areas"
+        )
+        assert loaded.edge_df["length"].max() < Lx / 2, (
+            "force-periodic recovery left a domain-spanning edge: "
+            f"max length {loaded.edge_df['length'].max():.3f} >= Lx/2"
+        )
+
+    def test_present_flag_wins_over_force_box(self, tmp_path):
+        """When the archive DOES carry the flag, the stored Lx/Ly take
+        precedence over a (possibly wrong) fallback box."""
+        from tyssue import History, HistoryHdf5
+        sheet = _build_sheet(nx=3, ny=2)
+        archive = tmp_path / "p32.hf5"
+        hist = History(sheet, save_every=1.0, save_all=True, dt=1.0)
+        hist.record(time_stamp=0.0)
+        hist.to_archive(str(archive))
+
+        loaded_hist = HistoryHdf5.from_archive(str(archive), eptm_class=VirtualSheet)
+        loaded = loaded_hist.retrieve(float(np.max(loaded_hist.time_stamps)))
+        # Pass a deliberately WRONG fallback box — the stored flag
+        # must override it.
+        loaded.arrange_sheet_from_history(
+            two_dim=True, force_periodic_box=(999.0, 999.0),
+        )
+        assert loaded.periodic is True
+        assert loaded.Lx == sheet.Lx and loaded.Ly == sheet.Ly
+
 
 # --------------------------------------------------------------------------- #
 # Layer 7d — multi-event handler robustness                                    #
@@ -976,6 +1063,122 @@ class TestFaceDivisionWalkRobustness:
         assert (sheet.face_df["area"] > 0).all(), (
             "negative-area face after single division: "
             f"{sheet.face_df.index[sheet.face_df['area'] <= 0].tolist()}"
+        )
+
+
+class TestDegenerateDivisionRollback:
+    """``index_preserving_cell_division`` calls ``geom.update_all`` after
+    ``index_preserving_face_division`` and inspects the resulting
+    daughter / mother areas. If either is degenerate (below
+    ``min_area_ratio`` × prefered_area) the division is rolled back
+    by feeding the daughter into ``index_preserving_remove_face``,
+    which merges the sliver back into the mother.
+
+    Without the rollback the bug observed in
+    ``results/random_periodic_array1/`` at t=17.654 would propagate
+    a near-zero-but-NEGATIVE-area daughter into the next solver
+    step, which then rejects every dt down to dt_min and raises
+    ``RuntimeError`` on edge-crossing.
+
+    Driving the bug from real geometry is delicate, so the tests
+    here force the failure path with a monkeypatch on
+    ``index_preserving_face_division`` and verify the rollback
+    contract."""
+
+    @staticmethod
+    def _build():
+        sheet = _setup_periodic_sheet_with_settings(nx=4, ny=4)
+        sheet.face_df["prefered_area"] = 1.0
+        return sheet
+
+    def test_degenerate_daughter_is_rolled_back(self, monkeypatch):
+        """When the (mocked) face-division leaves the daughter with a
+        microscopically negative area, ``index_preserving_cell_division``
+        must call ``index_preserving_remove_face`` on it and return
+        ``None``."""
+        import topological_events as tev
+        sheet = self._build()
+        face = _pick_interior_face(sheet)
+
+        # Spy on the rollback entry-point.
+        rollback_called = {"n": 0}
+        original_remove = tev.index_preserving_remove_face
+        def remove_spy(sheet, face_label):
+            rollback_called["n"] += 1
+            return original_remove(sheet, face_label)
+        monkeypatch.setattr(tev, "index_preserving_remove_face", remove_spy)
+
+        # Mock face_division: append a daughter row + re-attribute
+        # three of the mother's edges to it so the rollback's
+        # ``remove_face`` has a real face to act on.
+        def stub_face_division(sheet, mother, vert_a, vert_b):
+            sheet.face_df = pd.concat(
+                [sheet.face_df, sheet.face_df.loc[mother:mother]],
+                ignore_index=True,
+            )
+            sheet.face_df.index.name = "face"
+            daughter = int(sheet.face_df.index[-1])
+            m_edges = sheet.edge_df[sheet.edge_df["face"] == mother].index[:3]
+            sheet.edge_df.loc[m_edges, "face"] = daughter
+            return daughter
+        monkeypatch.setattr(tev, "index_preserving_face_division", stub_face_division)
+
+        # Inject a fake geom that BEHAVES exactly like the real
+        # ``PeriodicPlanarGeometry`` except its ``update_all`` stamps
+        # a microscopically NEGATIVE area on the just-created daughter.
+        # Subclassing means ``face_projected_pos`` and the other
+        # geom helpers used by ``get_division_edges`` /
+        # ``index_preserving_add_vert`` still work as normal — only
+        # the area landing on the daughter is doctored.
+        real_geom = sheet.geom
+        class _BadAreaGeom(real_geom):
+            @classmethod
+            def update_all(cls, sheet_):
+                real_geom.update_all(sheet_)
+                d = sheet_.face_df.index[-1]
+                sheet_.face_df.at[d, "area"] = -0.004
+
+        result = tev.index_preserving_cell_division(sheet, face, _BadAreaGeom)
+
+        assert result is None, (
+            f"expected None on degenerate-daughter rollback; got {result}"
+        )
+        assert rollback_called["n"] == 1, (
+            f"expected exactly 1 call to index_preserving_remove_face "
+            f"for the rollback; got {rollback_called['n']}"
+        )
+
+    def test_normal_division_returns_daughter_unchanged(self, monkeypatch):
+        """When the division produces a healthy daughter (positive
+        area above threshold) the rollback path must NOT fire."""
+        import topological_events as tev
+        sheet = self._build()
+        face = _pick_interior_face(sheet)
+        sheet.specs.setdefault("face", {})
+        sheet.specs["face"]["unique_id_max"] = int(
+            sheet.face_df["unique_id"].astype(int).max()
+        )
+
+        rollback_called = {"n": 0}
+        original_remove = tev.index_preserving_remove_face
+        def remove_spy(sheet, face_label):
+            rollback_called["n"] += 1
+            return original_remove(sheet, face_label)
+        monkeypatch.setattr(tev, "index_preserving_remove_face", remove_spy)
+
+        # Real division → healthy daughter with positive area.
+        daughter = tev.index_preserving_cell_division(sheet, face, sheet.geom)
+
+        assert daughter is not None, (
+            "healthy division returned None — rollback shouldn't fire"
+        )
+        assert rollback_called["n"] == 0, (
+            f"rollback fired on a healthy division ({rollback_called['n']} "
+            f"calls to index_preserving_remove_face)"
+        )
+        assert sheet.face_df.at[daughter, "area"] > 0, (
+            f"daughter area should be positive; got "
+            f"{sheet.face_df.at[daughter, 'area']}"
         )
 
 
@@ -2080,6 +2283,953 @@ class TestOrderAllEdgesResilient:
 
 
 # --------------------------------------------------------------------------- #
+# Layer 7c-bis — resume an interrupted run on the SAME history file            #
+# --------------------------------------------------------------------------- #
+
+
+class TestDropCorruptedSnapshots:
+    """``post_processing.drop_corrupted_snapshots`` removes snapshots
+    whose face table carries a non-positive area — the fingerprint of
+    a failed non-periodic resume that re-recorded unwrapped (negative
+    area) geometry over a good snapshot."""
+
+    @staticmethod
+    def _write(path, rows_per_time):
+        """rows_per_time: dict {t: area_array}. Writes a minimal
+        face/vert table archive (only what the cleanup reads/removes)."""
+        import pandas as pd
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with pd.HDFStore(path, "w") as store:
+            for t, areas in rows_per_time.items():
+                n = len(areas)
+                face = pd.DataFrame({
+                    "area": np.asarray(areas, dtype=float),
+                    "perimeter": np.full(n, 3.4),
+                    "time": np.full(n, float(t)),
+                }, index=pd.Index(range(n), name="face"))
+                store.append("face", face, data_columns=["time"])
+                vert = pd.DataFrame({
+                    "x": np.linspace(0, 1, n), "time": np.full(n, float(t)),
+                }, index=pd.Index(range(n), name="vert"))
+                store.append("vert", vert, data_columns=["time"])
+
+    def test_dry_run_reports_without_modifying(self, tmp_path):
+        import pandas as pd
+        from post_processing import drop_corrupted_snapshots
+        path = str(tmp_path / "h.hf5")
+        self._write(path, {0.0: [1.0, 1.0], 1.0: [1.0, 1.0], 2.0: [1.0, -3.0]})
+        before = os.path.getsize(path)
+        dropped = drop_corrupted_snapshots(path, dry_run=True)
+        assert dropped == [2.0], f"dry run should flag t=2.0, got {dropped}"
+        # File untouched.
+        with pd.HDFStore(path, "r") as store:
+            times = sorted(store.select("face", columns=["time"])["time"].unique())
+        assert times == [0.0, 1.0, 2.0]
+
+    def test_removes_only_corrupted_snapshots(self, tmp_path):
+        import pandas as pd
+        from post_processing import drop_corrupted_snapshots
+        path = str(tmp_path / "h.hf5")
+        self._write(path, {0.0: [1.0, 1.0], 1.0: [1.0, 1.0], 2.0: [1.0, -3.0]})
+        dropped = drop_corrupted_snapshots(path)
+        assert dropped == [2.0]
+        with pd.HDFStore(path, "r") as store:
+            ftimes = sorted(store.select("face", columns=["time"])["time"].unique())
+            vtimes = sorted(store.select("vert", columns=["time"])["time"].unique())
+        assert ftimes == [0.0, 1.0], "corrupted snapshot not removed from face"
+        assert vtimes == [0.0, 1.0], "corrupted snapshot not removed from vert"
+
+    def test_clean_archive_untouched(self, tmp_path):
+        from post_processing import drop_corrupted_snapshots
+        path = str(tmp_path / "h.hf5")
+        self._write(path, {0.0: [1.0, 1.0], 1.0: [1.0, 1.0]})
+        dropped = drop_corrupted_snapshots(path)
+        assert dropped == [], "a clean archive should drop nothing"
+
+    def test_idempotent(self, tmp_path):
+        from post_processing import drop_corrupted_snapshots
+        path = str(tmp_path / "h.hf5")
+        self._write(path, {0.0: [1.0, 1.0], 2.0: [1.0, -3.0]})
+        drop_corrupted_snapshots(path)
+        # Second pass finds nothing left to drop.
+        assert drop_corrupted_snapshots(path) == []
+
+
+class TestResumeFromTime:
+    """``inner_ear_model._truncate_history_file`` + a pre-seeded
+    ``solver.prev_t`` together let a crashed run be resumed by
+    re-running with ``continue_from_time=t0``: the existing archive
+    is truncated at ``t0`` and the solver picks up at ``t0`` writing
+    INTO THE SAME FILE — no parallel ``_part2`` archive."""
+
+    def test_truncate_keeps_rows_up_to_and_including_t0(self, tmp_path):
+        """All snapshots with time <= t0 must survive; everything
+        strictly later must be dropped."""
+        import pandas as pd
+        from inner_ear_model import _truncate_history_file
+
+        path = str(tmp_path / "probe.hf5")
+        with pd.HDFStore(path, "w") as store:
+            for t in [0.0, 0.5, 1.0, 1.5, 2.0]:
+                store.append(
+                    "vert",
+                    pd.DataFrame({"x": [0.0, 1.0], "time": [t, t]}),
+                    data_columns=["time"],
+                )
+                store.append(
+                    "edge",
+                    pd.DataFrame({"srce": [0], "trgt": [1], "time": [t]}),
+                    data_columns=["time"],
+                )
+
+        _truncate_history_file(path, 1.0)
+
+        v_times = sorted(pd.read_hdf(path, "vert")["time"].unique())
+        e_times = sorted(pd.read_hdf(path, "edge")["time"].unique())
+        assert v_times == [0.0, 0.5, 1.0], (
+            f"vert truncation kept wrong rows: {v_times}"
+        )
+        assert e_times == [0.0, 0.5, 1.0], (
+            f"edge truncation kept wrong rows: {e_times}"
+        )
+
+    def test_truncate_at_boundary_keeps_t0_exactly(self, tmp_path):
+        """Truncating at exactly an existing time stamp must keep
+        that snapshot (the rewind point is INCLUSIVE)."""
+        import pandas as pd
+        from inner_ear_model import _truncate_history_file
+
+        path = str(tmp_path / "probe.hf5")
+        with pd.HDFStore(path, "w") as store:
+            for t in [0.0, 0.5, 1.0]:
+                store.append(
+                    "vert",
+                    pd.DataFrame({"x": [0.0], "time": [t]}),
+                    data_columns=["time"],
+                )
+
+        _truncate_history_file(path, 0.5)
+
+        kept = sorted(pd.read_hdf(path, "vert")["time"].unique())
+        assert kept == [0.0, 0.5], f"boundary truncation: {kept}"
+
+    def test_truncate_noop_on_missing_file(self, tmp_path):
+        """Resume probing a missing archive must not crash — the
+        caller may be re-running with continue_from_time set even
+        though no archive yet exists."""
+        from inner_ear_model import _truncate_history_file
+        missing = str(tmp_path / "nope.hf5")
+        # Should silently no-op rather than raise.
+        _truncate_history_file(missing, 1.0)
+
+    def test_solver_resumes_from_seeded_prev_t(self, monkeypatch):
+        """Seeding ``solver.prev_t`` and ``history.time`` must make
+        ``solver.solve(tf=tf)`` advance from the resume time to
+        ``tf`` — i.e. ``tf`` is the absolute (cumulative) end time,
+        not "another tf units of work"."""
+        sheet, solver = TestAdaptiveDt._build_solver(
+            monkeypatch, velocity_fn=lambda t, pos: np.zeros_like(pos),
+        )
+        RESUME_T = 17.654
+        solver.prev_t = RESUME_T
+        solver.history.time = RESUME_T
+
+        solver.solve(
+            tf=RESUME_T + 0.03, dt=0.01,
+            max_displacement=1.0, save_interval=0.01,
+        )
+
+        # Filter to the SOLVER-emitted snapshots; the History's
+        # constructor records a free t=0 row that's a fixture
+        # artefact, not part of what we're testing.
+        all_ts = sorted(set(round(t, 6) for t in solver.history.time_stamps))
+        solver_ts = [t for t in all_ts if t >= RESUME_T - 1e-6]
+
+        assert solver_ts, "solver emitted no snapshots after resume"
+        assert min(solver_ts) >= RESUME_T - 1e-6, (
+            f"solver started before the seeded resume time: {min(solver_ts)}"
+        )
+        assert max(solver_ts) >= RESUME_T + 0.03 - 1e-6, (
+            f"solver didn't reach tf={RESUME_T + 0.03}: "
+            f"max stamp = {max(solver_ts)}"
+        )
+
+    def test_rewrite_for_resume_lets_record_append(self, tmp_path):
+        """The crux of the resume-crash fix, exercised end-to-end with
+        real objects.
+
+        A bare row-level truncate leaves the original table layout
+        (3D coords like ``z``, a different column order) in place, so
+        the resumed run's first ``record()`` append dies with pandas'
+        ``cannot match existing table structure for [...]``.
+        ``_rewrite_history_for_resume`` transcribes the kept rows into
+        exactly the structure ``record()`` will produce, so the append
+        lines up.
+
+        We build a real periodic sheet, write a real multi-snapshot
+        HistoryHdf5 (whose tables carry the 3D ``z`` columns and the
+        periodic-metadata columns), reload it the way the resume path
+        does (``arrange_sheet_from_history(two_dim=True)`` → drops z),
+        rewrite, and then record a fresh snapshot — which must NOT
+        raise the structure error."""
+        import pandas as pd
+        from tyssue import HistoryHdf5
+        from inner_ear_model import _rewrite_history_for_resume
+
+        archive = str(tmp_path / "resume_struct.hf5")
+
+        # --- Build a real periodic sheet and write a 3-snapshot
+        # archive with its natural (3D, periodic-stamped) structure.
+        np.random.seed(0)
+        src_sheet = VirtualSheet.planar_virtual_sheet_2d(
+            "rs", nx=4, ny=4, distx=1.0, disty=1.0,
+            maximal_bond_length=10.0, minimal_bond_length=0.05,
+            periodic=True, draw_debug=False,
+        )
+        src_sheet.vert_df["viscosity"] = 1.0
+        src_sheet.geom.update_all(src_sheet)
+        src_hist = HistoryHdf5(src_sheet, save_every=None, dt=1.0,
+                               hf5file=archive, overwrite=True)
+        for t in (0.0, 1.0, 2.0):
+            src_hist.record(time_stamp=float(t))
+        # The on-disk vert table must carry the 3D ``z`` column — this
+        # is precisely what the resumed (2D) sheet won't have.
+        with pd.HDFStore(archive, "r") as store:
+            assert "z" in store["vert"].columns, (
+                "fixture precondition failed: archive should carry z"
+            )
+
+        # --- Reload the way the resume path does: retrieve + arrange
+        # to 2D (drops z), then build a fresh HistoryHdf5 from the 2D
+        # sheet (captures the no-z structure record() will write).
+        reload_hist = HistoryHdf5.from_archive(archive, eptm_class=VirtualSheet)
+        resumed = reload_hist.retrieve(1.0)
+        resumed.arrange_sheet_from_history(two_dim=True)
+        resumed.initiate_edge_order()
+        resumed.vert_df["viscosity"] = 1.0
+        if hasattr(resumed, "_stash_periodic_metadata"):
+            resumed._stash_periodic_metadata()
+        resumed.geom.update_all(resumed)
+
+        live_hist = HistoryHdf5(resumed, save_every=None, dt=1.0,
+                                hf5file=archive, overwrite=True)
+        assert "z" not in live_hist.columns["vert"], (
+            "resumed 2D sheet unexpectedly still tracks a z column"
+        )
+
+        # --- Rewrite the kept portion (t <= 1.0) to match. ---
+        _rewrite_history_for_resume(archive, 1.0, live_hist)
+
+        # The tail snapshot (t=2.0) must be gone; t=0 and t=1 kept.
+        with pd.HDFStore(archive, "r") as store:
+            kept_times = sorted(store.select("vert", columns=["time"])["time"].unique())
+            assert kept_times == [0.0, 1.0], (
+                f"rewrite kept wrong snapshots: {kept_times}"
+            )
+            assert "z" not in store["vert"].columns, (
+                "rewrite kept the legacy z column"
+            )
+
+        # --- The acid test: record() a new snapshot. Pre-fix this
+        # raised ``cannot match existing table structure``. ---
+        live_hist.save_every = None  # mirror what the solver does
+        live_hist.time = 1.0
+        live_hist.record(time_stamp=1.5)  # must NOT raise
+
+        reloaded = HistoryHdf5.from_archive(archive, eptm_class=VirtualSheet)
+        final_times = sorted(np.asarray(reloaded.time_stamps))
+        assert 1.5 in [round(t, 6) for t in final_times], (
+            f"new snapshot not recorded: {final_times}"
+        )
+        # Periodicity must survive the rewrite (we re-stashed).
+        s = reloaded.retrieve(1.5)
+        s.arrange_sheet_from_history(two_dim=True)
+        assert s.periodic is True, "periodicity lost after resume rewrite"
+
+
+class TestLateralInhibitionLevelsPreservedOnLoad:
+    """The lateral-inhibition columns (notch_level, delta_level,
+    repressor_level) USED to be lost when a sheet was loaded from
+    HDF5 history and handed to ``InnerEarModel``: the constructor
+    called ``update_specs(reset=True)`` with these columns in the
+    spec dict, which overwrote the loaded values with the spec
+    defaults (1.0), and then a separate pickle side-channel was
+    needed to restore them.
+
+    The fix is two-pronged: drop the LI keys from the spec dict in
+    :meth:`InnerEarModel.get_specs_2d` (so the loaded values
+    survive ``update_specs``) and teach :meth:`initialize_notch_delta`
+    to preserve columns that are already populated. This test class
+    pins both halves of that contract so the pickle scaffolding
+    stays gone."""
+
+    @staticmethod
+    def _build_inner(sheet):
+        from inner_ear_model import InnerEarModel
+        return InnerEarModel(
+            sheet,
+            tension={('HC', 'HC'): 0.05, ('HC', 'SC'): 0.05, ('SC', 'SC'): 0.05},
+            repulsion={'HC': 0., 'SC': 0.},
+            repulsion_distance={'HC': 0., 'SC': 0.},
+            preferred_area={'HC': 0.5, 'SC': 0.5},
+            contractility={'HC': 0.1, 'SC': 0.1},
+            elasticity={'HC': 1., 'SC': 1.},
+        )
+
+    @staticmethod
+    def _fresh_sheet(name):
+        np.random.seed(0)
+        return VirtualSheet.planar_virtual_sheet_2d(
+            name, nx=4, ny=4, distx=1.0, disty=1.0,
+            maximal_bond_length=10.0, minimal_bond_length=0.05,
+            periodic=True, draw_debug=False,
+        )
+
+    def test_fresh_sheet_gets_randomised_LI_levels(self):
+        sheet = self._fresh_sheet("fresh")
+        # Fresh sheet must not carry LI columns yet.
+        assert "notch_level" not in sheet.face_df.columns
+        assert "delta_level" not in sheet.face_df.columns
+
+        inner = self._build_inner(sheet)
+        for col in ("notch_level", "delta_level", "repressor_level"):
+            assert col in inner.sheet.face_df.columns, (
+                f"InnerEarModel didn't seed {col!r} on a fresh sheet"
+            )
+            v = inner.sheet.face_df[col].to_numpy()
+            assert v.std() > 1e-6, (
+                f"{col!r} ended up constant on a fresh sheet; "
+                f"expected random initialisation"
+            )
+
+    def test_preloaded_LI_levels_survive_constructor(self):
+        """The continued-run case: sheet was loaded from history,
+        the LI columns are already populated, and the constructor
+        must NOT clobber them."""
+        sheet = self._fresh_sheet("preloaded")
+        Nf = sheet.Nf
+        notch_in = np.linspace(0.0, 1.0, Nf)
+        delta_in = np.linspace(1.0, 0.0, Nf)
+        rep_in = np.full(Nf, 0.42)
+        sheet.face_df["notch_level"] = notch_in
+        sheet.face_df["delta_level"] = delta_in
+        sheet.face_df["repressor_level"] = rep_in
+
+        inner = self._build_inner(sheet)
+
+        notch_out = inner.sheet.face_df["notch_level"].to_numpy()
+        delta_out = inner.sheet.face_df["delta_level"].to_numpy()
+        rep_out = inner.sheet.face_df["repressor_level"].to_numpy()
+        np.testing.assert_allclose(notch_out, notch_in, err_msg=(
+            "notch_level got overwritten by InnerEarModel.__init__ — "
+            "the loaded values must survive update_specs(reset=True)"
+        ))
+        np.testing.assert_allclose(delta_out, delta_in, err_msg=(
+            "delta_level got overwritten by InnerEarModel.__init__"
+        ))
+        np.testing.assert_allclose(rep_out, rep_in, err_msg=(
+            "repressor_level got overwritten by InnerEarModel.__init__"
+        ))
+
+    def test_legacy_archive_without_repressor_gets_topped_up(self):
+        """An older archive may have notch + delta but no repressor
+        column. Preserve the two it has, randomise just the missing
+        one."""
+        sheet = self._fresh_sheet("legacy")
+        Nf = sheet.Nf
+        notch_in = np.linspace(0.0, 1.0, Nf)
+        delta_in = np.linspace(1.0, 0.0, Nf)
+        sheet.face_df["notch_level"] = notch_in
+        sheet.face_df["delta_level"] = delta_in
+        # NB: no repressor_level set.
+
+        inner = self._build_inner(sheet)
+
+        np.testing.assert_allclose(
+            inner.sheet.face_df["notch_level"].to_numpy(), notch_in,
+        )
+        np.testing.assert_allclose(
+            inner.sheet.face_df["delta_level"].to_numpy(), delta_in,
+        )
+        assert "repressor_level" in inner.sheet.face_df.columns, (
+            "repressor_level should be added when missing"
+        )
+        assert inner.sheet.face_df["repressor_level"].std() > 1e-6, (
+            "repressor_level was added but with constant values; "
+            "expected random initialisation"
+        )
+
+    def test_saved_notch_delta_levels_file_parameter_removed(self):
+        """The pickle side-channel is dead — confirm the keyword is
+        actually gone from the public InnerEarModel signature so a
+        caller that still relies on it gets a clean TypeError instead
+        of silently no-oping."""
+        from inner_ear_model import InnerEarModel
+        import inspect
+        sig = inspect.signature(InnerEarModel.__init__)
+        assert "saved_notch_delta_levels_file" not in sig.parameters, (
+            "saved_notch_delta_levels_file is still a constructor "
+            "parameter; the pickle side-channel was supposed to go"
+        )
+
+    def test_randomize_notch_delta_levels_flag_overrides_preservation(self):
+        """``randomize_notch_delta_levels=True`` should reseed the
+        LI columns even when the loaded sheet already carries
+        values — the opt-in escape hatch for parameter sweeps that
+        want to re-use a saved geometry but start each sweep point
+        from a fresh LI distribution."""
+        sheet = self._fresh_sheet("force_random")
+        Nf = sheet.Nf
+        notch_in = np.linspace(0.0, 1.0, Nf)
+        delta_in = np.linspace(1.0, 0.0, Nf)
+        rep_in = np.full(Nf, 0.42)
+        sheet.face_df["notch_level"] = notch_in
+        sheet.face_df["delta_level"] = delta_in
+        sheet.face_df["repressor_level"] = rep_in
+
+        from inner_ear_model import InnerEarModel
+        np.random.seed(123)  # determinism for the sanity asserts below
+        inner = InnerEarModel(
+            sheet,
+            tension={('HC', 'HC'): 0.05, ('HC', 'SC'): 0.05, ('SC', 'SC'): 0.05},
+            repulsion={'HC': 0., 'SC': 0.},
+            repulsion_distance={'HC': 0., 'SC': 0.},
+            preferred_area={'HC': 0.5, 'SC': 0.5},
+            contractility={'HC': 0.1, 'SC': 0.1},
+            elasticity={'HC': 1., 'SC': 1.},
+            randomize_notch_delta_levels=True,
+        )
+        notch_out = inner.sheet.face_df["notch_level"].to_numpy()
+        delta_out = inner.sheet.face_df["delta_level"].to_numpy()
+        rep_out = inner.sheet.face_df["repressor_level"].to_numpy()
+
+        # The values should have CHANGED (the loaded sentinels were
+        # overwritten by fresh randomisation).
+        assert not np.allclose(notch_out, notch_in), (
+            "randomize_notch_delta_levels=True did NOT replace "
+            "the loaded notch_level values"
+        )
+        assert not np.allclose(delta_out, delta_in), (
+            "randomize_notch_delta_levels=True did NOT replace "
+            "the loaded delta_level values"
+        )
+        assert not np.allclose(rep_out, rep_in), (
+            "randomize_notch_delta_levels=True did NOT replace "
+            "the loaded repressor_level values"
+        )
+        # ... and they should be non-trivially varied (not all zero,
+        # not all the same value — proves we got real randomisation
+        # rather than a column of zeros).
+        assert notch_out.std() > 1e-6
+        assert delta_out.std() > 1e-6
+        assert rep_out.std() > 1e-6
+
+    def test_randomize_flag_default_keeps_loaded_values(self):
+        """Confirm the override is genuinely OPT-IN: leaving the
+        flag at its default ``False`` keeps the historical
+        preserve-loaded-values behaviour the previous test class
+        already pins."""
+        sheet = self._fresh_sheet("default_preserves")
+        Nf = sheet.Nf
+        notch_in = np.linspace(0.0, 1.0, Nf)
+        sheet.face_df["notch_level"] = notch_in
+        sheet.face_df["delta_level"] = notch_in[::-1]
+        sheet.face_df["repressor_level"] = np.full(Nf, 0.123)
+
+        inner = self._build_inner(sheet)  # randomize_notch_delta_levels=False (default)
+
+        np.testing.assert_allclose(
+            inner.sheet.face_df["notch_level"].to_numpy(), notch_in,
+            err_msg="default behaviour silently re-randomised the LI levels",
+        )
+
+
+class TestForkFromSnapshot:
+    """``continue_from_time`` with ``continue_existing_run=False`` is
+    "fork" mode: load the chosen snapshot of the source archive,
+    write into a NEW folder, start fresh at t=0. The source archive
+    MUST stay byte-identical — this is the load-only path."""
+
+    @staticmethod
+    def _write_minimal_history(path, sheet, times):
+        """Use HistoryHdf5 to write a few snapshots of ``sheet`` at
+        ``times`` so ``load_sheet_from_file(time_point=t)`` has real
+        history rows to retrieve."""
+        import os
+        from tyssue import HistoryHdf5
+        # Make sure the directory exists.
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            os.remove(path)
+        # geom.update_all so the dtype check inside HistoryHdf5
+        # doesn't trip on int → float migrations later.
+        sheet.geom.update_all(sheet)
+        hist = HistoryHdf5(
+            sheet, save_every=None, dt=0.01,
+            hf5file=path, overwrite=True,
+        )
+        for t in times:
+            # Wiggle a single vertex so retrieve() returns different
+            # data at different times — confirms we're picking the
+            # right snapshot.
+            sheet.vert_df.iloc[0, sheet.vert_df.columns.get_loc("x")] = float(t) * 0.01
+            sheet.geom.update_all(sheet)
+            hist.record(time_stamp=float(t))
+        return hist
+
+    def test_load_sheet_from_file_with_explicit_time_point(self, tmp_path):
+        """``load_sheet_from_file(time_point=t)`` must retrieve the
+        chosen snapshot — NOT the last one."""
+        from run_model import load_sheet_from_file
+        np.random.seed(0)
+        sheet = VirtualSheet.planar_virtual_sheet_2d(
+            "fork_src", nx=2, ny=2, distx=1.0, disty=1.0,
+            maximal_bond_length=10.0, minimal_bond_length=0.05,
+            periodic=True, draw_debug=False,
+        )
+        sheet.vert_df["viscosity"] = 1.0
+        # New convention: load_sheet_from_file(name) reads
+        # ``<name>/history.hf5``.
+        name_dir = tmp_path / "fork_src"
+        name_dir.mkdir()
+        path_prefix = str(name_dir)
+        self._write_minimal_history(
+            os.path.join(path_prefix, "history.hf5"), sheet,
+            times=[0.5, 1.0, 1.5, 2.0],
+        )
+
+        # Load at the MIDDLE snapshot, not the last.
+        loaded = load_sheet_from_file(path_prefix, time_point=1.0)
+        # The wiggled vertex's x-coord encodes the snapshot time
+        # (we set it to 0.01*t in _write_minimal_history).
+        wiggled_x = float(loaded.vert_df.iloc[0]["x"])
+        assert abs(wiggled_x - 0.01) < 1e-9, (
+            f"loaded sheet doesn't match t=1.0 snapshot: "
+            f"vert0.x={wiggled_x} (expected 0.01)"
+        )
+
+        # And the historical default (time_point=None → last) still
+        # gives the LAST snapshot — guard against my edit silently
+        # changing the default behaviour.
+        loaded_last = load_sheet_from_file(path_prefix)
+        last_x = float(loaded_last.vert_df.iloc[0]["x"])
+        assert abs(last_x - 0.02) < 1e-9, (
+            f"default load didn't grab the last snapshot: vert0.x={last_x}"
+        )
+
+    def test_fork_from_snapshot_does_not_modify_source_archive(
+        self, tmp_path,
+    ):
+        """The fork path must read the source archive in ONLY mode —
+        not delete it, not truncate it, not append to it. Verify by
+        comparing the file's bytes before and after."""
+        import shutil, hashlib
+        from run_model import load_sheet_from_file
+        from inner_ear_model import _truncate_history_file
+
+        np.random.seed(0)
+        sheet = VirtualSheet.planar_virtual_sheet_2d(
+            "src", nx=2, ny=2, distx=1.0, disty=1.0,
+            maximal_bond_length=10.0, minimal_bond_length=0.05,
+            periodic=True, draw_debug=False,
+        )
+        sheet.vert_df["viscosity"] = 1.0
+        # New convention: load_sheet_from_file(name) reads
+        # ``<name>/history.hf5``.
+        name_dir = tmp_path / "src"
+        name_dir.mkdir()
+        path_prefix = str(name_dir)
+        archive = os.path.join(path_prefix, "history.hf5")
+        self._write_minimal_history(
+            archive, sheet, times=[0.5, 1.0, 1.5],
+        )
+
+        def _hash(p):
+            with open(p, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        digest_before = _hash(archive)
+
+        # The fork path only ever calls ``load_sheet_from_file`` on
+        # the source — it never calls ``_truncate_history_file``
+        # (that's the resume path). Exercise the load and verify
+        # the archive is byte-identical afterward.
+        _ = load_sheet_from_file(path_prefix, time_point=1.0)
+        digest_after = _hash(archive)
+        assert digest_after == digest_before, (
+            "source archive changed after fork-mode load — "
+            "load_sheet_from_file must be read-only"
+        )
+
+        # As a separate guarantee: confirm _truncate_history_file
+        # WOULD modify the archive, so the byte-identity check above
+        # actually means something.
+        sentinel_path = str(name_dir / "copy.hf5")
+        shutil.copy(archive, sentinel_path)
+        _truncate_history_file(sentinel_path, 1.0)
+        assert _hash(sentinel_path) != digest_before, (
+            "_truncate_history_file is supposed to mutate the file; "
+            "if this assertion fails the byte-identity test above "
+            "isn't really testing anything"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Layer 7c-ter — saved-time-point artefacts cross-consistency                  #
+# --------------------------------------------------------------------------- #
+
+
+def _find_example_artefact_dirs():
+    """Locate every ``results/<name>/`` folder that has the full
+    triple of artefacts written by ``save_data_of_a_given_time_point``:
+    ``<name>.hf5`` + ``<name>_contact_matrix.npy`` + ``<name>.npy``.
+
+    Returns a list of ``(name, base_path_without_suffix)`` tuples,
+    sorted so failing tests reproduce in a stable order. Empty
+    when none of the example folders are present — which is fine,
+    ``pytest`` will then skip the parametrised consistency tests
+    via ``pytest.skip`` below.
+    """
+    out = []
+    root = os.path.join("results")
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root)):
+        base = os.path.join(root, name, name)
+        if (os.path.isfile(base + ".hf5")
+                and os.path.isfile(base + "_contact_matrix.npy")
+                and os.path.isfile(base + ".npy")):
+            out.append((name, base))
+    return out
+
+
+_EXAMPLE_ARTEFACT_DIRS = _find_example_artefact_dirs()
+
+
+class TestSavedTimePointArtefactsConsistent:
+    """The three artefacts written by
+    ``post_processing.save_data_of_a_given_time_point``:
+
+    * ``<name>.hf5`` — a single-snapshot ``HistoryHdf5`` archive
+      built from ``extract_time_point_to_new_history``;
+    * ``<name>_contact_matrix.npy`` — a ``(N, N)`` matrix where
+      ``N = max(unique_id) + 1`` and entry ``(i, j)`` is the sum
+      of edge lengths between faces with ``unique_id == i`` and
+      ``unique_id == j``;
+    * ``<name>.npy`` — a 2-D unsigned-integer label image with
+      ``0`` for boundary and positive integer labels for cells.
+
+    The pipeline that produced them takes one path through the
+    runtime, but each artefact is materialised by a different
+    code path (``History.to_archive``, ``get_contact_matrix``,
+    ``save_sheet_labels_to_numpy``). If any of them silently
+    drifts from the others — e.g. the HDF5 round-trip duplicates
+    rows but the matrix is computed before that, or the labeling
+    sweep misses cells — downstream analysis (post-processing,
+    comparison to experiment) consumes inconsistent data without
+    noticing.
+
+    These tests pin the cross-consistency contract on the example
+    artefacts shipped under ``results/random_periodic_array*_for_*/``
+    and skip cleanly when none of those folders are present (so
+    a CI box without the example data still passes).
+
+    Implementation note: ``save_data_of_a_given_time_point`` now
+    removes any stale archive before writing, so freshly-saved
+    HF5 files hold exactly one copy of each row. Some LEGACY
+    example archives (saved before that fix) still carry every
+    row twice — ``History.to_archive`` opens the file in ``"a"``
+    (append) mode, so re-touching the same path stacked a second
+    copy. The contact matrix and label image were always computed
+    on the clean in-memory sheet BEFORE that round-trip, so the
+    consistency check deduplicates the reloaded face/edge frames
+    by index before reconstructing. The dedup is a no-op on the
+    fixed single-copy archives and only does real work on the
+    legacy doubled ones — keeping it makes the test robust to
+    both."""
+
+    @staticmethod
+    def _load_artefacts(base):
+        """Open the HF5, retrieve the single snapshot, defensively
+        deduplicate index-collided rows (a no-op on archives saved
+        after the ``save_data_of_a_given_time_point`` remove-before-
+        write fix; necessary for legacy doubled archives), and load
+        the matrix + image."""
+        # Local import so the module still imports on hosts where
+        # tyssue's HDF5 stack is missing (CI without h5py / tables).
+        from tyssue import HistoryHdf5
+        history = HistoryHdf5.from_archive(
+            base + ".hf5", eptm_class=VirtualSheet,
+        )
+        ts = list(np.asarray(history.time_stamps))
+        assert len(ts) >= 1, f"{base}.hf5 has no recorded times"
+        # save_data_of_a_given_time_point only ever extracts one
+        # snapshot, so we use the first (== only) recorded time.
+        t = float(ts[0])
+        sheet = history.retrieve(t)
+        sheet.arrange_sheet_from_history(two_dim=True)
+        # Deduplicate by index — see class docstring for why.
+        sheet.face_df = sheet.face_df[~sheet.face_df.index.duplicated()].copy()
+        sheet.edge_df = sheet.edge_df[~sheet.edge_df.index.duplicated()].copy()
+        contact_matrix = np.load(base + "_contact_matrix.npy")
+        label_image = np.load(base + ".npy")
+        return history, sheet, contact_matrix, label_image, t
+
+    # ----- HDF5 archive shape ----------------------------------------
+    @pytest.mark.parametrize(
+        "name,base",
+        _EXAMPLE_ARTEFACT_DIRS,
+        ids=[n for n, _ in _EXAMPLE_ARTEFACT_DIRS] or ["no-examples"],
+    )
+    def test_history_archive_is_single_snapshot(self, name, base):
+        if not _EXAMPLE_ARTEFACT_DIRS:
+            pytest.skip("no example artefact folders present")
+        history, sheet, _, _, t = self._load_artefacts(base)
+        ts = sorted(set(round(float(x), 9) for x in np.asarray(history.time_stamps)))
+        assert ts == [round(t, 9)], (
+            f"{name}: archive should hold a single snapshot, "
+            f"got time stamps {ts}"
+        )
+        # Deduplicated sheet must be a valid epithelium: positive
+        # face count, every edge points at a face that exists.
+        assert sheet.Nf > 0
+        live_faces = set(sheet.face_df.index)
+        stray = sheet.edge_df[~sheet.edge_df["face"].isin(live_faces)]
+        assert stray.empty, (
+            f"{name}: {len(stray)} edges reference dead face labels "
+            f"(face_df / edge_df out of sync after dedup)"
+        )
+
+    # ----- Contact matrix structure ---------------------------------
+    @pytest.mark.parametrize(
+        "name,base",
+        _EXAMPLE_ARTEFACT_DIRS,
+        ids=[n for n, _ in _EXAMPLE_ARTEFACT_DIRS] or ["no-examples"],
+    )
+    def test_contact_matrix_is_square_symmetric_and_sized_to_unique_ids(
+        self, name, base,
+    ):
+        if not _EXAMPLE_ARTEFACT_DIRS:
+            pytest.skip("no example artefact folders present")
+        _, sheet, contact_matrix, _, _ = self._load_artefacts(base)
+        assert contact_matrix.ndim == 2, (
+            f"{name}: contact matrix isn't 2-D"
+        )
+        assert contact_matrix.shape[0] == contact_matrix.shape[1], (
+            f"{name}: contact matrix isn't square: {contact_matrix.shape}"
+        )
+        N_expected = int(sheet.face_df["unique_id"].astype(int).max()) + 1
+        assert contact_matrix.shape[0] == N_expected, (
+            f"{name}: contact matrix is {contact_matrix.shape[0]}x{contact_matrix.shape[0]} "
+            f"but history's max unique_id + 1 is {N_expected}"
+        )
+        # Entries must be non-negative real lengths.
+        assert (contact_matrix >= 0).all(), (
+            f"{name}: contact matrix has negative entries — "
+            f"min = {contact_matrix.min()}"
+        )
+        # Pairwise symmetry: contact(i,j) == contact(j,i).
+        np.testing.assert_allclose(
+            contact_matrix, contact_matrix.T,
+            atol=1e-9,
+            err_msg=(
+                f"{name}: contact matrix is not symmetric — "
+                f"max asymmetry = "
+                f"{np.abs(contact_matrix - contact_matrix.T).max()}"
+            ),
+        )
+
+    # ----- Flagship: matrix == reconstruction from history ----------
+    @pytest.mark.parametrize(
+        "name,base",
+        _EXAMPLE_ARTEFACT_DIRS,
+        ids=[n for n, _ in _EXAMPLE_ARTEFACT_DIRS] or ["no-examples"],
+    )
+    def test_contact_matrix_matches_history_reconstruction(
+        self, name, base,
+    ):
+        """Reconstruct the contact matrix from the (deduplicated)
+        ``edge_df`` + ``face_df`` using exactly the formula in
+        ``VirtualSheet.get_contact_matrix`` — bincount of
+        ``f_uid * N + o_uid`` weighted by edge length. Result must
+        equal the saved ``.npy`` to machine precision. This is
+        what "consistent" actually means."""
+        if not _EXAMPLE_ARTEFACT_DIRS:
+            pytest.skip("no example artefact folders present")
+        _, sheet, contact_matrix, _, _ = self._load_artefacts(base)
+        edge_df = sheet.edge_df
+        face_df = sheet.face_df
+        has_opp = edge_df["opposite"] >= 0
+        fids = edge_df.loc[has_opp, "face"].to_numpy().astype(int)
+        opp_idx = edge_df.loc[has_opp, "opposite"].to_numpy().astype(int)
+        o_fids = edge_df.loc[opp_idx, "face"].to_numpy().astype(int)
+        f_uids = face_df.loc[fids, "unique_id"].to_numpy().astype(int)
+        o_uids = face_df.loc[o_fids, "unique_id"].to_numpy().astype(int)
+        lengths = edge_df.loc[opp_idx, "length"].to_numpy()
+        N = int(max(f_uids.max(), o_uids.max())) + 1
+        rebuilt = np.bincount(
+            f_uids * N + o_uids,
+            weights=lengths,
+            minlength=N * N,
+        ).reshape(N, N)
+
+        assert rebuilt.shape == contact_matrix.shape, (
+            f"{name}: shape mismatch — saved {contact_matrix.shape}, "
+            f"reconstructed {rebuilt.shape}"
+        )
+        np.testing.assert_allclose(
+            rebuilt, contact_matrix,
+            atol=1e-9,
+            err_msg=(
+                f"{name}: saved contact matrix doesn't match the "
+                f"reconstruction from history (max abs diff = "
+                f"{np.abs(rebuilt - contact_matrix).max():.3e})"
+            ),
+        )
+        # And confirm the sparsity pattern: every nonzero ``(i, j)``
+        # in the matrix corresponds to a pair of faces that share
+        # at least one edge in the history.
+        nz_pairs = set(zip(*np.where(contact_matrix > 0)))
+        adjacent_pairs = set(zip(f_uids.tolist(), o_uids.tolist()))
+        stray = nz_pairs - adjacent_pairs
+        assert not stray, (
+            f"{name}: contact matrix has {len(stray)} nonzero "
+            f"(i, j) entries that don't correspond to any "
+            f"edge-sharing face pair in the history; sample: "
+            f"{sorted(stray)[:5]}"
+        )
+
+    # ----- Geometric sanity: row sum == perimeter -------------------
+    @pytest.mark.parametrize(
+        "name,base",
+        _EXAMPLE_ARTEFACT_DIRS,
+        ids=[n for n, _ in _EXAMPLE_ARTEFACT_DIRS] or ["no-examples"],
+    )
+    def test_contact_matrix_row_sum_equals_face_perimeter(
+        self, name, base,
+    ):
+        """For a closed periodic mesh every edge is shared between
+        exactly two faces, so the sum of row ``i`` of the contact
+        matrix must equal the perimeter of the cell with
+        ``unique_id == i``. This catches missing-edge bugs that
+        the matrix-vs-rebuild check would miss when BOTH the
+        matrix and the reconstruction are wrong in the same way."""
+        if not _EXAMPLE_ARTEFACT_DIRS:
+            pytest.skip("no example artefact folders present")
+        _, sheet, contact_matrix, _, _ = self._load_artefacts(base)
+        # Map unique_id → perimeter on the (deduplicated) face_df.
+        uid_to_perim = (
+            sheet.face_df[["unique_id", "perimeter"]]
+            .drop_duplicates("unique_id")
+            .set_index("unique_id")["perimeter"]
+            .to_dict()
+        )
+        row_sums = contact_matrix.sum(axis=1)
+        offenders = []
+        for uid, peri in uid_to_perim.items():
+            uid = int(uid)
+            if uid >= contact_matrix.shape[0]:
+                continue
+            rs = float(row_sums[uid])
+            # Periodic interior cells: rs should equal perimeter.
+            # Boundary (open) cells would have rs < perimeter, but
+            # the example archives here are periodic so we expect
+            # the strict equality. Loose atol to absorb fp noise.
+            if abs(rs - peri) > 1e-6 * max(1.0, peri):
+                offenders.append((uid, peri, rs))
+        assert not offenders, (
+            f"{name}: {len(offenders)} cell(s) have row-sum != "
+            f"perimeter (first few: "
+            f"{[(u, round(p, 6), round(r, 6)) for u, p, r in offenders[:5]]})"
+        )
+
+    # ----- Label image structure ------------------------------------
+    @pytest.mark.parametrize(
+        "name,base",
+        _EXAMPLE_ARTEFACT_DIRS,
+        ids=[n for n, _ in _EXAMPLE_ARTEFACT_DIRS] or ["no-examples"],
+    )
+    def test_label_image_basic_structure(self, name, base):
+        if not _EXAMPLE_ARTEFACT_DIRS:
+            pytest.skip("no example artefact folders present")
+        _, _, _, label_image, _ = self._load_artefacts(base)
+        assert label_image.ndim == 2, (
+            f"{name}: label image isn't 2-D: shape={label_image.shape}"
+        )
+        # ``save_sheet_labels_to_numpy`` casts to uint16 explicitly.
+        # Tolerate any unsigned integer dtype.
+        assert np.issubdtype(label_image.dtype, np.unsignedinteger), (
+            f"{name}: label image dtype is {label_image.dtype}, "
+            f"expected unsigned integer (uint16 per "
+            f"save_sheet_labels_to_numpy)"
+        )
+        # 0 must be present — that's the boundary / gap colour.
+        assert (label_image == 0).any(), (
+            f"{name}: label image has no boundary (0-valued) pixels"
+        )
+        # ... and dominate the image (most of the canvas is the
+        # padding / between-cell area, not inside cells). The
+        # observed range on the example archives is ~98-99% (cells
+        # render small in the 800x800 canvas), so this bound is
+        # deliberately loose — it only catches "100% boundary"
+        # (nothing rendered) and "0% boundary" (no spacing).
+        boundary_frac = float((label_image == 0).sum()) / label_image.size
+        assert 0.05 < boundary_frac < 0.9999, (
+            f"{name}: boundary pixels are {boundary_frac:.2%} of the "
+            f"image — outside the sane 5%-99.99% range; either every "
+            f"cell got rendered or none did"
+        )
+
+    # ----- Label image vs history --------------------------------------
+    @pytest.mark.parametrize(
+        "name,base",
+        _EXAMPLE_ARTEFACT_DIRS,
+        ids=[n for n, _ in _EXAMPLE_ARTEFACT_DIRS] or ["no-examples"],
+    )
+    def test_label_image_cell_count_consistent_with_history(
+        self, name, base,
+    ):
+        """The label image's positive-integer labels should
+        roughly match ``sheet.Nf`` after dedup. ``Nf`` is the
+        absolute upper bound (the labeller stops at ``Nc == Nf``),
+        and the lower bound has to allow for some rendering loss
+        — adjacent faces with very close ``id`` values can share
+        a color bucket after matplotlib quantises to uint8. A 50%
+        floor catches catastrophic divergence (e.g. only a handful
+        of cells appearing) without flagging the cosmetic
+        ~10% rendering loss seen on the real examples."""
+        if not _EXAMPLE_ARTEFACT_DIRS:
+            pytest.skip("no example artefact folders present")
+        _, sheet, _, label_image, _ = self._load_artefacts(base)
+        positive_labels = np.unique(label_image)
+        positive_labels = positive_labels[positive_labels > 0]
+        n_labels = int(len(positive_labels))
+        n_face = int(sheet.Nf)
+        assert n_labels > 0, (
+            f"{name}: label image has no positive labels at all"
+        )
+        assert n_labels <= n_face, (
+            f"{name}: label image has {n_labels} unique positive "
+            f"labels but the sheet has only {n_face} faces — the "
+            f"labeller can't produce more"
+        )
+        ratio = n_labels / max(n_face, 1)
+        assert ratio >= 0.5, (
+            f"{name}: label image covers only {n_labels}/{n_face} "
+            f"= {ratio:.2%} of the cells (expected ≥ 50% — "
+            f"likely a rendering or color-overflow bug)"
+        )
+        # The labeller assigns labels 1..Nc as it sweeps the
+        # rendered colour space, so labels are contiguous starting
+        # at 1 modulo (a) collisions in the color → label sweep
+        # and (b) ``Nc`` not being reached. The TIGHTER invariant is:
+        # max label ≤ Nf. Loose enough to survive matplotlib quirks.
+        assert int(positive_labels.max()) <= n_face, (
+            f"{name}: largest label = {int(positive_labels.max())} "
+            f"exceeds Nf={n_face}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Layer 7c — adaptive dt + negative area safety net                            #
 # --------------------------------------------------------------------------- #
 
@@ -2310,8 +3460,9 @@ class TestSteadyStateStop:
         return sheet, solver
 
     def test_mechanical_only_steady_stops_immediately(self, monkeypatch):
-        """Zero velocity → every step is mechanically steady, and the
-        solver should stop on the FIRST accepted step."""
+        """Zero velocity → every step is mechanically steady. With
+        ``steady_state_min_steps=1`` (the old single-step behaviour)
+        the solver should stop on the FIRST accepted step."""
         sheet, solver = self._build(
             monkeypatch, velocity_fn=lambda t, pos: np.zeros_like(pos),
         )
@@ -2323,11 +3474,11 @@ class TestSteadyStateStop:
             quasi_static_threshold=1e-6,
             check_mechanical_steady=True,
             check_lateral_inhibition_steady=False,
+            steady_state_min_steps=1,
         )
-        # We should have ended near t ≈ initial_dt (one step), not at
-        # tf=1000.
-        assert solver.prev_t < 1.0, (
-            f"expected early stop, but prev_t = {solver.prev_t}"
+        # min_steps=1 → ends after a single accepted step (~initial_dt).
+        assert solver.prev_t < 0.05, (
+            f"expected stop after one step, but prev_t = {solver.prev_t}"
         )
 
     def test_mechanical_not_steady_runs_to_tf(self, monkeypatch):
@@ -2443,6 +3594,81 @@ class TestSteadyStateStop:
         assert solver.prev_t >= 0.02 - 1e-9, (
             f"expected at least two accepted steps before stopping, "
             f"got prev_t = {solver.prev_t}"
+        )
+
+    def test_requires_min_steps_consecutive_steady_steps(self, monkeypatch):
+        """With ``steady_state_min_steps=4`` and zero velocity (every
+        step mechanically steady), the solver must run for EXACTLY 4
+        consecutive steady steps before halting — not 1. The 4th
+        accepted step is where the streak first reaches the threshold."""
+        sheet, solver = self._build(
+            monkeypatch, velocity_fn=lambda t, pos: np.zeros_like(pos),
+        )
+        # Count accepted steps via a set_pos spy.
+        n_accepted = [0]
+        original = solver.set_pos
+        def spy(new_pos):
+            n_accepted[0] += 1
+            original(new_pos)
+        solver.set_pos = spy
+
+        solver.solve(
+            tf=1000.0, dt=0.01,
+            max_displacement=1.0, save_interval=0.01,
+            until_steady_state=True,
+            quasi_static_threshold=1e-6,
+            check_mechanical_steady=True,
+            check_lateral_inhibition_steady=False,
+            dt_increase_factor=1.0,  # keep dt constant so steps == time/dt
+            steady_state_min_steps=4,
+        )
+        # Exactly 4 accepted steps: streak 1,2,3,4 → halt on the 4th.
+        assert n_accepted[0] == 4, (
+            f"expected exactly 4 accepted steps for min_steps=4, "
+            f"got {n_accepted[0]}"
+        )
+
+    def test_blip_resets_streak(self, monkeypatch):
+        """A single non-steady step in the middle of a steady run must
+        RESET the streak, so the solver can't halt until it has
+        ``steady_state_min_steps`` CONSECUTIVE steady steps AFTER the
+        blip."""
+        # Velocity is zero (mech steady) except on the 3rd accepted
+        # step, where it spikes above the threshold for one step.
+        call = [0]
+        def velocity(t, pos):
+            call[0] += 1
+            if call[0] == 3:
+                # One big-but-uniform shove: a rigid translation keeps
+                # areas positive (no C-reject) but the per-step
+                # displacement exceeds quasi_static_threshold, so this
+                # step is NOT mechanically steady → resets the streak.
+                return np.ones_like(pos) * 1.0
+            return np.zeros_like(pos)
+
+        sheet, solver = self._build(monkeypatch, velocity_fn=velocity)
+        n_accepted = [0]
+        original = solver.set_pos
+        def spy(new_pos):
+            n_accepted[0] += 1
+            original(new_pos)
+        solver.set_pos = spy
+
+        solver.solve(
+            tf=1000.0, dt=0.01,
+            max_displacement=1.0, save_interval=0.01,
+            until_steady_state=True,
+            quasi_static_threshold=1e-4,  # 1.0*0.01 = 0.01 > 1e-4 → blip not steady
+            check_mechanical_steady=True,
+            check_lateral_inhibition_steady=False,
+            dt_increase_factor=1.0,
+            steady_state_min_steps=3,
+        )
+        # Steps: 1 steady(streak1), 2 steady(streak2), 3 BLIP(streak0),
+        # 4 steady(1), 5 steady(2), 6 steady(3 → halt). 6 accepted.
+        assert n_accepted[0] == 6, (
+            f"expected the mid-run blip to reset the streak (6 accepted "
+            f"steps total), got {n_accepted[0]}"
         )
 
 
@@ -2642,3 +3868,83 @@ class TestNonPeriodicUnaffected:
         assert (sheet.edge_df["opposite"] < 0).sum() > 0
         # All areas positive
         assert (sheet.face_df["area"] > 0).all()
+
+
+class TestGifOutputNameShortening:
+    """``create_gif`` shells out to ImageMagick's ``convert`` with the
+    full output path; a too-long path makes ``convert`` fail (Windows
+    MAX_PATH). ``_shorten_gif_output`` truncates the FILE NAME only —
+    keeping the directory — so the convert call gets a path it can
+    write."""
+
+    @staticmethod
+    def _import():
+        from post_processing import _shorten_gif_output, _MAX_GIF_PATH_LEN
+        return _shorten_gif_output, _MAX_GIF_PATH_LEN
+
+    def test_short_path_unchanged(self):
+        _shorten, _ = self._import()
+        p = os.path.join("base", "results", "run1", "run1.gif")
+        assert _shorten(p) == p
+
+    def test_long_name_shortened_directory_preserved(self):
+        _shorten, MAX = self._import()
+        # A ~100-char run name in a results/<name>/ directory — the
+        # shape run_model.run() produces.
+        longname = "periodic_run_" + "x" * 120
+        directory = os.path.join("base", "results", longname)
+        output = os.path.join(directory, longname + ".gif")
+        assert len(output) > MAX  # precondition: actually too long
+
+        res = _shorten(output)
+        # Directory is kept EXACTLY; only the file name changed.
+        assert os.path.dirname(res) == directory
+        # Result fits the budget and is still a .gif.
+        assert len(res) <= MAX
+        assert res.endswith(".gif")
+        # The stem prefix is preserved so the file is still
+        # recognisable.
+        assert os.path.basename(res).startswith(longname[:10])
+
+    def test_distinct_long_names_get_distinct_files(self):
+        _shorten, MAX = self._import()
+        directory = os.path.join("base", "results")
+        stem = "run_" + "y" * 120
+        o1 = os.path.join(directory, stem + "_alpha.gif")
+        o2 = os.path.join(directory, stem + "_beta.gif")
+        s1, s2 = _shorten(o1), _shorten(o2)
+        # Hash suffix keeps distinct long names from colliding.
+        assert os.path.basename(s1) != os.path.basename(s2)
+        assert len(s1) <= MAX and len(s2) <= MAX
+
+    def test_shortening_is_deterministic(self):
+        _shorten, _ = self._import()
+        o = os.path.join("base", "results", "z" * 200, "z" * 200 + ".gif")
+        assert _shorten(o) == _shorten(o)
+
+    def test_create_gif_safe_forwards_to_create_gif(self, monkeypatch):
+        """``create_gif_safe`` must pass the (possibly shortened) path
+        plus all kwargs straight through to the underlying
+        ``create_gif``."""
+        import post_processing as pp
+        captured = {}
+
+        def fake_create_gif(history, output, **kwargs):
+            captured["output"] = output
+            captured["kwargs"] = kwargs
+            return "ok"
+
+        monkeypatch.setattr(pp, "create_gif", fake_create_gif)
+
+        longname = "run_" + "w" * 150
+        directory = os.path.join("base", "results", longname)
+        output = os.path.join(directory, longname + ".gif")
+
+        ret = pp.create_gif_safe(
+            history="HIST", output=output, num_frames=42, draw_func="DF",
+        )
+        assert ret == "ok"
+        # Path was shortened (kept directory) and kwargs forwarded.
+        assert os.path.dirname(captured["output"]) == directory
+        assert len(captured["output"]) <= pp._MAX_GIF_PATH_LEN
+        assert captured["kwargs"] == {"num_frames": 42, "draw_func": "DF"}

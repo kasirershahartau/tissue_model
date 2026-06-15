@@ -52,7 +52,8 @@ class IVPSolver(EulerSolver):
               until_steady_state=False,
               lateral_inhibition_threshold=0.0,
               check_mechanical_steady=True,
-              check_lateral_inhibition_steady=True):
+              check_lateral_inhibition_steady=True,
+              steady_state_min_steps=4):
         """Solves the ODE from the current time to tf with ADAPTIVE dt
         and edge-crossing safety nets.
 
@@ -118,6 +119,16 @@ class IVPSolver(EulerSolver):
             flipped its orientation) the positions are reverted; dt is
             halved.
 
+        steady_state_min_steps : int, default 4
+            How many CONSECUTIVE accepted steps must satisfy the
+            steady-state criteria before the run halts. The default
+            of 4 means "no significant change for more than 3 steps".
+            The streak resets to zero whenever a step fails the
+            criteria, a topology change occurs, OR a step is rejected
+            (displacement / negative-area / solver failure) — so a
+            single transient blip restarts the count. Set to 1 to
+            recover the old "halt on the first steady step" behaviour.
+
         Steady-state detection
         ----------------------
         When ``until_steady_state`` is True, after every ACCEPTED step
@@ -133,6 +144,12 @@ class IVPSolver(EulerSolver):
         all hold to stop. A topology change in the same step always
         forces ``li_ok = False`` (face counts can't be compared
         meaningfully across divisions / delaminations).
+
+        The run only halts once these criteria have held for
+        ``steady_state_min_steps`` consecutive accepted steps — a
+        single in-between step that drifts (or a rejected step, or a
+        division / delamination / T1) resets the counter, so brief
+        excursions can't trigger a premature stop.
         """
         initial_dt = float(dt)
         dt = initial_dt
@@ -177,6 +194,12 @@ class IVPSolver(EulerSolver):
         current_t = float(self.prev_t)
         next_save_t = current_t + save_interval
 
+        # Number of CONSECUTIVE accepted steps that have satisfied the
+        # steady-state criteria. We only halt once this reaches
+        # ``steady_state_min_steps`` — a single drifting / rejected /
+        # topology-changing step resets it to zero.
+        steady_streak = 0
+
         # Record the initial state.
         self._record_at(current_t, dt)
 
@@ -203,6 +226,7 @@ class IVPSolver(EulerSolver):
                         current_t, dt, exc,
                     )
                     dt *= 0.5
+                    steady_streak = 0  # a failed step breaks the steady run
                     if dt < dt_min:
                         raise RuntimeError(
                             f"dt fell below {dt_min:.3e} (initial {initial_dt:.3e}) "
@@ -225,6 +249,7 @@ class IVPSolver(EulerSolver):
                     worst_vert_label = worst_idx
                 if disp > max_displacement:
                     dt *= 0.5
+                    steady_streak = 0  # rejected step breaks the steady run
                     if dt < dt_min:
                         # Also report the worst-offending vertex when we
                         # finally give up so the user can inspect it.
@@ -260,6 +285,7 @@ class IVPSolver(EulerSolver):
                 # area flips sign. Revert and retry with smaller dt.
                 if (self.eptm.face_df["area"] < 0).any():
                     dt *= 0.5
+                    steady_streak = 0  # rejected step breaks the steady run
                     if dt < dt_min:
                         self._record_at(current_t, dt)
                         raise RuntimeError(
@@ -344,11 +370,21 @@ class IVPSolver(EulerSolver):
                     else:
                         li_ok = True
 
+                    # Require the criteria to hold for several
+                    # CONSECUTIVE accepted steps. One drifting step
+                    # (or a topology change, which forces li_ok=False)
+                    # resets the streak, so a brief lull can't trigger
+                    # a premature halt.
                     if mech_ok and li_ok:
+                        steady_streak += 1
+                    else:
+                        steady_streak = 0
+
+                    if steady_streak >= steady_state_min_steps:
                         log.info(
-                            "steady state reached at t=%g "
-                            "(mech_ok=%s, li_ok=%s)",
-                            current_t, mech_ok, li_ok,
+                            "steady state reached at t=%g after %d "
+                            "consecutive steady steps (mech_ok=%s, li_ok=%s)",
+                            current_t, steady_streak, mech_ok, li_ok,
                         )
                         # Record this state before breaking so the
                         # history's final frame is the steady-state

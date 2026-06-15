@@ -241,7 +241,19 @@ class VirtualSheet(Sheet):
             self.Lx, self.Ly, self.vert_df, self.edge_df
         )
 
-    def arrange_sheet_from_history(self, two_dim=True):
+    def arrange_sheet_from_history(self, two_dim=True, force_periodic_box=None):
+        """Reconstruct a sheet loaded from a HistoryHdf5 archive.
+
+        ``force_periodic_box`` : optional ``(Lx, Ly)``
+            Fallback used ONLY when the archive's ``face_df`` carries no
+            ``_periodic_flag`` metadata. Legacy archives written before
+            the metadata was stashed on every snapshot come back with
+            the flag missing, which would silently load them as
+            non-periodic. When the caller knows the run is periodic
+            (it always is in this model) it can pass the box dimensions
+            here and periodicity is re-established. A present flag
+            always takes precedence over this fallback.
+        """
         if 'vert' in self.vert_df.columns:
             if np.isnan(self.vert_df['vert']).any():
                 self.vert_df.set_index('index', inplace=True)
@@ -267,6 +279,17 @@ class VirtualSheet(Sheet):
                 columns=["_periodic_flag", "_periodic_Lx", "_periodic_Ly"],
                 inplace=True, errors="ignore",
             )
+            self.geom = PeriodicGeom
+        elif force_periodic_box is not None:
+            # Legacy archive with no stored periodic metadata: trust the
+            # caller-supplied box and re-establish the periodic state so
+            # the periodic geometry (vertex wrapping + per-face unfold)
+            # runs. Without this the sheet would load as non-periodic
+            # and boundary-crossing faces would unwrap into
+            # domain-spanning edges.
+            self.periodic = True
+            self.Lx = float(force_periodic_box[0])
+            self.Ly = float(force_periodic_box[1])
             self.geom = PeriodicGeom
         if two_dim:
             self.coords = ['x', 'y']
@@ -610,10 +633,12 @@ class VirtualSheet(Sheet):
     def get_contact_matrix(self):
         has_opposite = self.edge_df.opposite >= 0
         faces_with_neighbors_ids = self.edge_df.loc[has_opposite, "face"].to_numpy()
+        face_unique_ids = self.face_df.loc[faces_with_neighbors_ids, "unique_id"].to_numpy()
         neighbor_ids = self.edge_df.loc[self.edge_df.opposite[has_opposite], "face"].to_numpy()
+        neighbors_unique_ids = self.face_df.loc[neighbor_ids, "unique_id"].to_numpy()
         contact_length = self.edge_df.loc[self.edge_df.opposite[has_opposite], "length"].to_numpy()
-        number_of_faces = self.face_df.shape[0]
-        m = np.bincount(faces_with_neighbors_ids*number_of_faces + neighbor_ids, weights=contact_length,
+        number_of_faces = max(np.max(face_unique_ids), np.max(neighbors_unique_ids)) + 1
+        m = np.bincount(face_unique_ids*number_of_faces + neighbors_unique_ids, weights=contact_length,
                          minlength=number_of_faces*number_of_faces).reshape(number_of_faces, number_of_faces)
         return m
 

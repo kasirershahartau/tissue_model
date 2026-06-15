@@ -3,10 +3,10 @@ import logging
 import os, shutil, sys
 import numpy as np
 from tyssue import HistoryHdf5
-from tyssue.draw.plt_draw import create_gif
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
+from post_processing import create_gif_safe
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 
 
@@ -131,7 +131,9 @@ def load_sheet_from_file(initial_sheet_name, two_dim=True):
 def run():
     # Sheet Parameters
     initial_sheet_name = ""
-    load_lateral_inhibition_data_from_file = True
+    # ``load_lateral_inhibition_data_from_file`` USED to live here
+    # as the trigger for the pickle side-channel. The LI columns
+    # now travel with the HDF5 history file.
     name = "random_periodic_array_test3"
     max_bond_length = 0.2
     min_bond_length = 0.05
@@ -255,17 +257,16 @@ def run():
         else:
             sheet = initialize_sheet(nx, ny, distx, disty, max_bond_length, min_bond_length)
         assert (sheet.edge_df["opposite"] < 0).sum() == 0
-        if load_lateral_inhibition_data_from_file:
-            lateral_inhibition_data_file = "%s_notch_delta_levels.pkl" % initial_sheet_name
-        else:
-            lateral_inhibition_data_file = None
+
+        # The LI levels (notch / delta / repressor) travel with the
+        # HDF5 history now — see InnerEarModel.initialize_notch_delta.
+        # No more ``<name>_notch_delta_levels.pkl`` side-channel.
 
         # Initialize model
         inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
                               repulsion_exp=repulsion_exponent, preferred_area=preferred_area, contractility=contractility,
                               elasticity=elasticity, differentiation_threshold=differentiation_threshold,
                               random_sensitivity=random_sensitivity,
-                              saved_notch_delta_levels_file=lateral_inhibition_data_file,
                               l=l, m=m, betaN=betaN, betaD=betaD, inhibition=notch_inhibition,
                               notch_repressor_degradation_ratio=notch_repressor_degradation_ratio,
                               repressor_sensitivity=repressor_sensitivity, atoh_sensitivity=atoh_sensitivity,
@@ -291,7 +292,12 @@ def run():
                                  viscosity=viscosity, effectors=effectors, quasi_static=quasi_static,
                                  quasi_static_threshold=quasi_static_threshold, atoh_by_repressor=atoh_by_repressor,
                                  history_file=history_file)
-        inner.save_notch_delta("%s_notch_delta_levels.pkl" % name)
+        # ``inner.save_notch_delta(...)`` USED to be called here. The
+        # HDF5 history now carries the LI levels on every snapshot,
+        # so the dedicated pickle export is no longer part of the
+        # standard run pipeline. (The ``save_notch_delta`` method
+        # itself is kept on InnerEarModel as a stand-alone utility
+        # for ad-hoc exports.)
         fig2, ax2 = draw_func(inner.sheet)
         plt.savefig("%s_finale.png" % name)
         inner.save_sheet_labels_to_numpy(inner.sheet, path="%s_labels.npy" % name)
@@ -299,7 +305,7 @@ def run():
         inner.save_face_data_to_df(inner.sheet, path="%s_cells_info.pkl" % name)
         gif_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False, color_by="atoh",
                                                arrange_sheet=True)
-        create_gif(history, os.path.join(os.getcwd(), "%s.gif" % name), num_frames=movie_frames, draw_func=gif_func)
+        create_gif_safe(history, os.path.join(os.getcwd(), "%s.gif" % name), num_frames=movie_frames, draw_func=gif_func)
         run_log.info("run() finished successfully")
     except BaseException:
         # ``BaseException`` (not ``Exception``) covers Ctrl+C

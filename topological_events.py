@@ -455,10 +455,55 @@ def index_preserving_remove_face(sheet, face):
 
     return new_vert
 
-def index_preserving_cell_division(sheet, mother, geom, angle=None):
+def index_preserving_cell_division(sheet, mother, geom, angle=None,
+                                    min_area_ratio=0.01):
+    """Divide ``mother`` along a cleavage line at ``angle`` (random
+    when ``None``).
+
+    Returns the daughter face label on success, ``None`` on failure
+    (cell not alive, no valid cleavage edges, or the division
+    produced a degenerate polygon).
+
+    Degenerate-result rollback
+    --------------------------
+    ``index_preserving_face_division`` only guarantees the
+    combinatorial topology of the result (≥3 edges per side). The
+    GEOMETRIC consequence — a daughter whose perimeter self-crosses,
+    so the signed area is microscopically negative — only shows up
+    after ``geom.update_all`` recomputes the polygon areas. That
+    case manifested in ``results/random_periodic_array1/`` at
+    t=17.654: ``get_division_edges`` picked two virtual sub-edges so
+    close together on the mother's perimeter that the resulting
+    5-vertex daughter was a self-touching sliver with signed area
+    -4.5e-3. The solver then rejected every subsequent dt down to
+    dt_min and crashed.
+
+    To avoid that, after the division we evaluate both polygons.
+    A degenerate split is one where:
+      (a) either side has a non-positive area, OR
+      (b) the smaller-area side is less than
+          ``min_area_ratio`` × the larger-area side.
+
+    Both checks are pure RATIOS between the two post-division
+    polygons — they're indifferent to whatever
+    ``mother_area_before`` happened to be, which is important
+    because callers sometimes pre-set ``face_df["area"]`` to an
+    artificial sentinel (e.g. the multi-division tests load
+    ``area = 999`` to mark "must divide"; the real area only
+    materialises after ``geom.update_all``).
+
+    On failure we roll back by calling
+    ``index_preserving_remove_face`` on the daughter. ``remove_face``
+    collapses the daughter's vertices into a single centroid which
+    the surrounding mother absorbs — the cell ends up unchanged-ish,
+    slightly remeshed, and the caller (``get_division_function``)
+    marks it as tried and continues. On the next manager pass
+    mechanics will have shifted things, and a fresh random angle is
+    likely to succeed.
+    """
     if not sheet.face_df.loc[mother, "is_alive"]:
         logger.warning("Cell %s is not alive and cannot divide", mother)
-        return
+        return None
 
     # For periodic sheets there's no global vertex shift to worry about:
     # PeriodicPlanarGeometry.face_projected_pos already projects the
@@ -469,12 +514,60 @@ def index_preserving_cell_division(sheet, mother, geom, angle=None):
     # throughout.
     edge_a, edge_b = get_division_edges(sheet, mother, geom, angle=angle, axis="x")
     if edge_a is None:
-        return
+        return None
 
     vert_a, *_ = index_preserving_add_vert(sheet, edge_a)
     vert_b, *_ = index_preserving_add_vert(sheet, edge_b)
     sheet.vert_df.index.name = "vert"
     daughter = index_preserving_face_division(sheet, mother, vert_a, vert_b)
+    if daughter is None:
+        return None
+
+    # --- Degeneracy check ----------------------------------------------
+    # Areas are computed by geom.update_all after the division. Without
+    # this update, face_df.area still holds the pre-division mother area
+    # and the freshly-appended daughter row inherits that value via
+    # pd.concat — both look fine and the check would let the bad
+    # polygon through.
+    geom.update_all(sheet)
+    if daughter not in sheet.face_df.index or mother not in sheet.face_df.index:
+        # face_division shouldn't be dropping rows, but if for any
+        # reason the labels disappeared just bail without further
+        # damage.
+        return None
+    d_area = float(sheet.face_df.at[daughter, "area"])
+    m_area = float(sheet.face_df.at[mother, "area"])
+
+    # Pure RATIO check between the two post-division polygons. This
+    # is independent of any pre-division ``face_df["area"]`` value
+    # (which can be a sentinel — see the docstring).
+    small = min(d_area, m_area)
+    large = max(d_area, m_area)
+    is_degenerate = (
+        small <= 0.0
+        or (large > 0 and small < float(min_area_ratio) * large)
+    )
+    if is_degenerate:
+        logger.warning(
+            "Division of cell %s gave degenerate polygon "
+            "(mother area=%.4g, daughter area=%.4g, "
+            "min/max ratio=%.4g, threshold=%.2g); rolling back via "
+            "index_preserving_remove_face on the daughter so the bad "
+            "geometry doesn't reach the solver.",
+            mother, m_area, d_area,
+            (small / large) if large > 0 else float("-inf"),
+            min_area_ratio,
+        )
+        try:
+            index_preserving_remove_face(sheet, daughter)
+        except Exception as exc:
+            logger.error(
+                "Rollback of degenerate division on cell %s failed (%s); "
+                "the daughter row may still be present on the sheet.",
+                mother, exc,
+            )
+        return None
+
     return daughter
 
 def index_preserving_face_division(sheet, mother, vert_a, vert_b):
