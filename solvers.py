@@ -1,7 +1,55 @@
+import time
 import numpy as np
-from scipy.integrate import solve_ivp
 from tyssue.solvers.viscous import EulerSolver, log
 from tqdm import tqdm
+
+
+def count_folded_faces(eptm, tol=0.3):
+    """Number of faces whose polygon has FOLDED OVER ITSELF (self-intersected).
+
+    Detected via the polygon turning number: walking a face's edges in
+    ``order`` and summing the signed turn angle between consecutive edge
+    vectors gives ``±2π`` (turning number ``±1``) for ANY simple polygon —
+    convex or not — and deviates from ``±1`` once the perimeter crosses
+    itself. The check is therefore SOUND (a simple polygon is exactly ``±1``
+    by the turning-number theorem, so no false positives) and O(Ne).
+
+    This complements the negative-signed-area check: a cell that folds over a
+    neighbour keeps a POSITIVE signed area (the two lobes partly cancel), so
+    the ``area < 0`` net misses it — yet such a fold is exactly the
+    unphysical "cells growing into each other" configuration. ``tol`` is the
+    allowed deviation of ``|turning number|`` from 1; 0.3 only flags clear
+    self-intersections (turning number near 0) and leaves a wide margin over
+    the floating-point error of a simple polygon's exact ``±1``.
+    """
+    e = eptm.edge_df
+    if e.shape[0] == 0:
+        return 0
+    cols = ["face", "dx", "dy"] + (["order"] if "order" in e.columns else [])
+    ed = e[cols]
+    ed = ed.sort_values(["face", "order"]) if "order" in e.columns else ed.sort_values(["face"])
+    face = ed["face"].to_numpy()
+    vx = ed["dx"].to_numpy()
+    vy = ed["dy"].to_numpy()
+    n = len(face)
+    # First index of each contiguous same-face run, and the last edge of each.
+    change = np.empty(n, bool)
+    change[0] = True
+    change[1:] = face[1:] != face[:-1]
+    run_start = np.maximum.accumulate(np.where(change, np.arange(n), 0))
+    is_last = np.empty(n, bool)
+    is_last[:-1] = face[1:] != face[:-1]
+    is_last[-1] = True
+    # "Next" edge cyclically within the face (the last edge wraps to the first).
+    nxt = np.arange(n) + 1
+    nxt[is_last] = run_start[is_last]
+    wx = vx[nxt]
+    wy = vy[nxt]
+    ang = np.arctan2(vx * wy - vy * wx, vx * wx + vy * wy)
+    starts = np.where(change)[0]
+    turn = np.add.reduceat(ang, starts) / (2.0 * np.pi)
+    return int(np.count_nonzero(np.abs(np.abs(turn) - 1.0) > tol))
+
 
 class IVPSolver(EulerSolver):
     def __init__(self,
@@ -45,7 +93,7 @@ class IVPSolver(EulerSolver):
         self.history.record(time_stamp=t)
 
     def solve(self, tf, dt, on_topo_change=None, topo_change_args=(),
-              method='RK45', quasi_static=False, quasi_static_threshold=0.01,
+              method=None, quasi_static=False, quasi_static_threshold=0.01,
               max_displacement=None, max_disp_factor=0.25,
               dt_min_factor=0.001, dt_increase_factor=1.1,
               save_interval=None,
@@ -53,9 +101,17 @@ class IVPSolver(EulerSolver):
               lateral_inhibition_threshold=0.0,
               check_mechanical_steady=True,
               check_lateral_inhibition_steady=True,
-              steady_state_min_steps=4):
+              steady_state_min_steps=4,
+              tolerate_unavoidable_folds=True,
+              max_wall_seconds=None, min_progress_rate=None,
+              progress_window_seconds=30.0):
         """Solves the ODE from the current time to tf with ADAPTIVE dt
         and edge-crossing safety nets.
+
+        Each accepted iteration advances the sheet with a single explicit
+        forward-Euler step (see the body for why this is exact for this
+        position-independent mechanics RHS). ``method`` is accepted for
+        backward compatibility but no longer used.
 
         Parameters
         ----------
@@ -203,9 +259,60 @@ class IVPSolver(EulerSolver):
         # Record the initial state.
         self._record_at(current_t, dt)
 
+        # Baseline number of self-intersecting (folded) faces. The fold safety
+        # net (check C2 below) rejects a step only if it INCREASES this count —
+        # i.e. the mechanics introduces a NEW fold — rather than rejecting any
+        # absolute fold. Some saved initial sheets already contain a few folded
+        # cells (a pre-existing degeneracy); an absolute check would reject
+        # every step and the run could never start. We still forbid the
+        # mechanics from making things worse, and allow it to improve.
+        prev_folded = count_folded_faces(self.eptm)
+
+        # Non-progress safety net (optional; for parameter fits). A pathological
+        # parameter region can make the run CRAWL — dt pinned tiny by buckling
+        # spikes, the sharp-corner collapse churning every step — so it would
+        # take hours/days to reach tf. Rather than burn that time, bail with a
+        # RuntimeError (which find_mechanical_parameters scores worst-case).
+        # Two independent limits, both default OFF:
+        #   max_wall_seconds   - hard cap on total solve() wall-clock time.
+        #   min_progress_rate  - floor on SIMULATION-time advanced per wall-clock
+        #                        second, measured over a sliding window; catches
+        #                        "stuck at a tiny dt / progressing very slowly"
+        #                        EARLY, before the full wall-clock budget.
+        _start_wall = time.monotonic()
+        _progress_wall = _start_wall
+        _progress_sim = current_t
+
         pbar = tqdm(total=tf - current_t, unit="t", smoothing=0.05)
         try:
             while current_t < tf:
+                if max_wall_seconds is not None or min_progress_rate is not None:
+                    _now = time.monotonic()
+                    if (max_wall_seconds is not None
+                            and _now - _start_wall > max_wall_seconds):
+                        log.warning("stopping at t=%g: wall-clock budget %.0fs "
+                                    "exceeded (elapsed %.0fs)", current_t,
+                                    max_wall_seconds, _now - _start_wall)
+                        self._record_at(current_t, dt)
+                        raise RuntimeError(
+                            f"simulation exceeded its wall-clock budget "
+                            f"({max_wall_seconds:g}s) at t={current_t:g} of "
+                            f"tf={tf:g}; stopping for worst-case scoring")
+                    if (min_progress_rate is not None
+                            and _now - _progress_wall >= progress_window_seconds):
+                        _rate = (current_t - _progress_sim) / (_now - _progress_wall)
+                        if _rate < min_progress_rate:
+                            log.warning("stopping at t=%g: progress %.3g sim-time/s "
+                                        "over last %.0fs < floor %.3g", current_t,
+                                        _rate, _now - _progress_wall, min_progress_rate)
+                            self._record_at(current_t, dt)
+                            raise RuntimeError(
+                                f"simulation progressing too slowly ({_rate:.3g} "
+                                f"sim-time/s < {min_progress_rate:g}) over the last "
+                                f"{_now - _progress_wall:.0f}s at t={current_t:g}; "
+                                f"stopping for worst-case scoring")
+                        _progress_wall = _now
+                        _progress_sim = current_t
                 pos = self.current_pos
                 # Snapshot lateral-inhibition levels at the START of
                 # the iteration so the post-manager comparison sees
@@ -217,12 +324,26 @@ class IVPSolver(EulerSolver):
                 else:
                     old_li = None
                 try:
-                    new_pos = solve_ivp(
-                        self.ode_func, (0, dt), pos, t_eval=[dt]
-                    ).y[:, 0]
-                except Exception as exc:  # numerical failure inside scipy
-                    log.warning(
-                        "solve_ivp failed at t=%g (dt=%g): %s; shrinking dt",
+                    # Explicit forward-Euler step.
+                    #
+                    # ``ode_func`` (the mechanics RHS) reads the CURRENT
+                    # sheet geometry and ignores the position argument an
+                    # ODE integrator would feed it — it never calls
+                    # ``set_pos`` to move the sheet to an intermediate RK
+                    # stage. With a position-independent RHS every stage of
+                    # an adaptive integrator returns the identical vector,
+                    # so the exact integral over (0, dt) collapses to a
+                    # single Euler step ``new = pos + dt * f(pos)``. The
+                    # previous implementation called ``solve_ivp`` here,
+                    # which evaluated the (expensive) gradient ~8 times per
+                    # accepted step to recompute the very same constant —
+                    # this gives a bit-for-bit equivalent result (verified
+                    # to ~1e-16) with ONE gradient evaluation per step.
+                    dot_r = self.ode_func(0.0, pos)
+                    new_pos = pos + dt * dot_r
+                except Exception as exc:  # numerical failure in the gradient
+                    log.debug(
+                        "force evaluation failed at t=%g (dt=%g): %s; shrinking dt",
                         current_t, dt, exc,
                     )
                     dt *= 0.5
@@ -230,7 +351,7 @@ class IVPSolver(EulerSolver):
                     if dt < dt_min:
                         raise RuntimeError(
                             f"dt fell below {dt_min:.3e} (initial {initial_dt:.3e}) "
-                            f"after solve_ivp failure at t={current_t:g}: {exc}"
+                            f"after force-evaluation failure at t={current_t:g}: {exc}"
                         )
                     continue
 
@@ -268,7 +389,7 @@ class IVPSolver(EulerSolver):
                     # Upgraded from DEBUG to WARNING so the user sees
                     # which vertex is the troublemaker without enabling
                     # debug logging.
-                    log.warning(
+                    log.debug(
                         "step rejected at t=%g: vertex %d moved %.3e (cap %.3e); dt -> %.3e",
                         current_t, worst_vert_label, disp, max_displacement, dt,
                     )
@@ -281,9 +402,19 @@ class IVPSolver(EulerSolver):
                 self.set_pos(new_pos)
 
                 # --- C: negative-area safety net ---
-                # If an edge crossed through a face, that face's signed
-                # area flips sign. Revert and retry with smaller dt.
-                if (self.eptm.face_df["area"] < 0).any():
+                # If an edge crossed through a face, that face's signed area
+                # flips sign. Revert and retry with smaller dt. EXCEPTION: a
+                # DELAMINATING cell (type == -1) is deliberately collapsing to
+                # zero/negative area on its way to removal by the delamination
+                # handler, so a negative area there is expected, not an edge
+                # crossing. Ignore those — otherwise the inherited inversion
+                # (created by the manager, present at the start of the next
+                # step) is rejected on every retry down to the dt floor and the
+                # run dies before the manager can remove the cell.
+                neg_area = self.eptm.face_df["area"] < 0
+                if "type" in self.eptm.face_df.columns:
+                    neg_area = neg_area & (self.eptm.face_df["type"] != -1)
+                if neg_area.any():
                     dt *= 0.5
                     steady_streak = 0  # rejected step breaks the steady run
                     if dt < dt_min:
@@ -292,17 +423,87 @@ class IVPSolver(EulerSolver):
                             f"dt fell below {dt_min:.3e} (initial {initial_dt:.3e}) "
                             f"at t={current_t:g}: edge crossing produced negative area"
                         )
-                    log.warning(
+                    log.debug(
                         "step rejected at t=%g: negative face area detected; "
                         "dt -> %.3e", current_t, dt,
                     )
                     self.set_pos(pos)  # restore previous positions
                     continue
 
+                # --- C2: self-intersecting (folded) face safety net ---
+                # A cell that folds over a neighbour keeps a POSITIVE signed
+                # area, so check C above misses it. Detect the fold from the
+                # polygon turning number. We only react to a step that ADDS a
+                # fold (count rises above the running baseline) — several saved
+                # initial sheets already carry a few folded cells, which must
+                # not block the run.
+                #
+                # A new fold is one of two kinds: TRANSIENT (caused by too large
+                # a step — a smaller step wouldn't cross) or INHERENT (the
+                # tissue is genuinely overlapping in this configuration). We
+                # shrink dt to dodge the transient kind; but if the fold
+                # survives all the way down to the dt floor it is inherent, and
+                # shrinking further would only deadlock the run. In a full
+                # differentiation run such folds are long-lived yet harmless —
+                # they form and persist for many steps and resolve later as the
+                # tissue develops (divisions / rearrangements via the topology
+                # manager below), exactly as before this safety net existed — so
+                # by default we TOLERATE them at the floor and carry on. A
+                # mechanics-only parameter fit, where a fold means cells
+                # over-packed past the available area and nothing will resolve
+                # it, can opt into the strict behaviour
+                # (tolerate_unavoidable_folds=False) so dt collapse raises and
+                # the fit worker scores those parameters worst-case.
+                n_folded = count_folded_faces(self.eptm)
+                new_folds = n_folded - prev_folded
+                if new_folds > 0:
+                    if dt * 0.5 >= dt_min:
+                        # Retry with a smaller step — might dodge the crossing.
+                        self.set_pos(pos)  # restore the last good positions
+                        dt *= 0.5
+                        steady_streak = 0  # rejected step breaks the steady run
+                        log.debug(
+                            "step rejected at t=%g: %d new self-intersecting "
+                            "face(s) (%d total); dt -> %.3e",
+                            current_t, new_folds, n_folded, dt,
+                        )
+                        continue
+                    if not tolerate_unavoidable_folds:
+                        self._record_at(current_t, dt)
+                        raise RuntimeError(
+                            f"dt fell below {dt_min:.3e} (initial "
+                            f"{initial_dt:.3e}) at t={current_t:g}: a step "
+                            f"introduced {new_folds} new self-intersecting "
+                            f"face(s) ({n_folded} total; cells folding / "
+                            f"overlapping)"
+                        )
+                    log.debug(
+                        "fold-floor at t=%g: tolerating %d unavoidable self-"
+                        "intersecting face(s) (%d total); relying on tissue "
+                        "development / topology to resolve",
+                        current_t, new_folds, n_folded,
+                    )
+                    # Fall through and accept the step with the floored dt; the
+                    # dt ratchet grows it back on subsequent calm steps.
+
                 # Step accepted.
                 current_t += dt
                 self.eptm.settings["dt"] = dt
                 self.prev_t = current_t
+                # New baseline (mechanics only — refreshed again after the
+                # manager below, since topology events can change the count).
+                prev_folded = n_folded
+
+                # NOTE on periodic boundaries: the per-step displacement below
+                # (new_pos - pos) is already correct even for a periodic sheet and
+                # needs NO minimum-image handling. new_pos = pos + dt*f(pos) is the
+                # raw forward-Euler step and is never re-wrapped, and an accepted
+                # step moves less than max_displacement (~ max_disp_factor *
+                # min_bond_length << box/2), so the difference is the vertex's true
+                # motion, never an apparent full-box jump. (Min-image would only be
+                # needed when differencing two INDEPENDENTLY-wrapped positions —
+                # e.g. across saved history frames — which this is not; and it must
+                # NOT be applied here, since folding could mask a genuine blow-up.)
 
                 # Topology events / differentiation / random forces.
                 if self.manager is not None:
@@ -321,6 +522,10 @@ class IVPSolver(EulerSolver):
                     self.geom.update_all(self.eptm)
                     self._refresh_active_verts()
                     self.manager.update()
+                    # Topology events (T1 / division / delamination / virtual
+                    # vertex changes) can add or remove folds, so re-baseline
+                    # the fold count against the post-manager state.
+                    prev_folded = count_folded_faces(self.eptm)
 
                 # Capture the topology-change flag BEFORE the handler
                 # below resets it — the steady-state check (further
@@ -329,7 +534,9 @@ class IVPSolver(EulerSolver):
                 # element-wise old/new LI comparison.
                 topo_changed_this_step = bool(self.eptm.topo_changed)
                 if self.eptm.topo_changed:
-                    log.info("Topology changed")
+                    # The specific topological events (T1 / division / ... ) log
+                    # themselves via log_topo_event; a bare "topology changed"
+                    # per step was redundant noise, so it was removed.
                     if on_topo_change is not None:
                         on_topo_change(*topo_change_args)
                     self.eptm.topo_changed = False
@@ -343,8 +550,10 @@ class IVPSolver(EulerSolver):
                 # explicitly the user's call).
                 if until_steady_state:
                     if check_mechanical_steady:
+                        # Raw (new_pos - pos) is periodicity-correct — see the
+                        # NOTE where the step is accepted above.
                         mech_ok = bool(
-                            np.abs(new_pos - pos).max() < quasi_static_threshold
+                            np.abs(new_pos - pos).max()/dt < quasi_static_threshold
                         )
                     else:
                         mech_ok = True
@@ -406,10 +615,21 @@ class IVPSolver(EulerSolver):
                 # Ratchet dt back toward the initial value as things calm down.
                 dt = min(dt * dt_increase_factor, initial_dt)
 
-                # tqdm progress in SIMULATION time, not iterations.
-                pbar.update(current_t - pbar.n)
+                # tqdm progress in SIMULATION time, not iterations. The bar is
+                # purely cosmetic — and on Windows a console write can fail
+                # intermittently with OSError [Errno 22], which previously
+                # killed multi-hour runs. A display failure must NEVER abort the
+                # simulation, so swallow anything tqdm raises (and stop updating
+                # it once it has broken, to avoid retrying every step).
+                try:
+                    pbar.update(current_t - pbar.n)
+                except Exception:
+                    pbar.disable = True
         finally:
-            pbar.close()
+            try:
+                pbar.close()
+            except Exception:
+                pass
 
         # Make sure the final state is always recorded, even if it
         # doesn't land on a save boundary.

@@ -12,6 +12,34 @@ logger = logging.getLogger(name=__name__)
 log = logger
 MAX_ITER = 100
 
+
+def log_topo_event(event_logger, sheet, succeeded, message, *args):
+    """Document a topological event per the run's verbosity policy
+    (``sheet.verbose_log``, set by ``simulate`` from ``run(verbose_log=...)``):
+
+      * a SUCCESS is logged at INFO, but ONLY in a verbose run;
+      * a FAILURE is logged at DEBUG, ALWAYS — so a quiet run's log still
+        records every failed/rejected event (the DEBUG-level debug.log handler
+        captures it).
+
+    ``event_logger`` is the CALLING module's logger so ``%(name)s`` stays
+    accurate; ``stacklevel=2`` makes ``%(filename)s:%(lineno)d`` point at the
+    call site rather than this helper.
+    """
+    if succeeded:
+        if getattr(sheet, "verbose_log", False):
+            event_logger.info(message, *args, stacklevel=2)
+    else:
+        event_logger.debug(message, *args, stacklevel=2)
+
+
+def log_topo_trace(event_logger, sheet, message, *args):
+    """Low-level DEBUG trace of a topological SUB-step (closing a face,
+    splitting a vertex, ...), emitted only in a verbose run so a quiet run's
+    log holds just failed/rejected events."""
+    if getattr(sheet, "verbose_log", False):
+        event_logger.debug(message, *args, stacklevel=2)
+
 def _min_image_midpoint(sheet, vert_indices):
     coords_arr = sheet.vert_df.loc[vert_indices, sheet.coords].to_numpy()
     if not getattr(sheet, "periodic", False):
@@ -45,8 +73,22 @@ class TopologicalEventsHandler:
             sheet.face_df.loc[cell_id, "type"] = -1
             sheet.face_df.loc[cell_id, "contractility"] = 10
             sheet.face_df.loc[cell_id, "area_elasticity"] = 20
-            sheet.face_df.loc[cell_id, "preferred_area"] = 0
-            sheet.face_df.loc[cell_id, "preferred_volume"] = 0
+            # The model uses tyssue's (misspelled) "prefered_area"/"prefered_vol"
+            # columns — matching the delamination handler. The previous correctly
+            # spelled "preferred_area"/"preferred_volume" wrote a dead column, so
+            # the ablated cell kept its normal (large) preferred area and, with
+            # the raised area_elasticity, BALLOONED instead of collapsing —
+            # squeezing a neighbour into a negative area and crashing the solver.
+            sheet.face_df.loc[cell_id, "prefered_area"] = 0
+            sheet.face_df.loc[cell_id, "prefered_vol"] = 0
+            # With a nonzero target perimeter (shape_index>0), a dying cell would
+            # otherwise shrink its area to 0 but hold perimeter at P0 -> a
+            # degenerate sliver. Drive its perimeter to 0 too so it collapses to a
+            # point (no-op when P0=0 / the column is absent).
+            if "prefered_perimeter" in sheet.face_df.columns:
+                sheet.face_df.loc[cell_id, "prefered_perimeter"] = 0
+            log_topo_event(logger, sheet, True,
+                           "ablation: tagged cell %d for removal", cell_id)
             return
         return ablation
 
@@ -68,15 +110,30 @@ class TopologicalEventsHandler:
                 sheet.face_df.loc[cell_id, "contractility"] = 10
                 sheet.face_df.at[cell_id, "prefered_area"] = 0
                 sheet.face_df.at[cell_id, "prefered_vol"] = 0
+                # Also drive target perimeter to 0 (shape_index>0 case) so the
+                # cell collapses to a point rather than a P0-perimeter sliver.
+                if "prefered_perimeter" in sheet.face_df.columns:
+                    sheet.face_df.at[cell_id, "prefered_perimeter"] = 0
 
-            # Second pass: cells that have shrunk to <=3 sides are
-            # actually removed. We re-query after each removal — like
-            # the division handler, we can't trust a snapshot because
-            # the inner reset_index renumbers face labels.
+            # Second pass: remove cells that have shrunk to a triangle (<=3
+            # sides) OR collapsed to a degenerate (<=0) area. We re-query after
+            # each removal — like the division handler, we can't trust a
+            # snapshot because the inner reset_index renumbers face labels.
             tried_ids = set()
             while True:
+                # num_sides is ONLY refreshed by the division handler; with
+                # divisions off it stays frozen at the initial (large) values,
+                # so the `num_sides <= 3` test never fires and shrinking
+                # delaminating cells are never removed — they keep collapsing
+                # until one inverts (negative area) and kills the solver.
+                # Recompute it from the live edge counts every pass. The
+                # `area <= 0` clause is a backstop: a delaminating cell that
+                # inverts before reaching <=3 sides is still removed (the
+                # solver tolerates a type==-1 negative area precisely so this
+                # handler gets the chance to clean it up).
+                sheet.face_df["num_sides"] = sheet.edge_df.groupby("face").size()
                 candidates = sheet.face_df.query(
-                    f"area < {crit_area} & num_sides <= 3"
+                    f"area < {crit_area} & ((num_sides <= 3) | (area <= 0))"
                     " & is_alive == 1"
                 )
                 if "id" in candidates.columns and len(tried_ids):
@@ -91,10 +148,9 @@ class TopologicalEventsHandler:
                         sheet, cell_id, self.model.sheet.geom,
                     )
                 except Exception as exc:
-                    log.warning(
-                        "remove_face on %d raised %s; skipping",
-                        cell_id, type(exc).__name__,
-                    )
+                    log_topo_event(logger, sheet, False,
+                                   "delamination: remove_face on cell %d raised "
+                                   "%s; skipping", cell_id, type(exc).__name__)
                     tried_ids.add(cell_uid)
                     continue
                 sheet.reset_index(order=False)
@@ -102,6 +158,8 @@ class TopologicalEventsHandler:
                 sheet.edge_df.sort_values(["face", "order"], inplace=True)
                 sheet.get_opposite()
                 sheet.geom.update_all(sheet)
+                log_topo_event(logger, sheet, True,
+                               "delamination: removed cell (uid %d)", cell_uid)
             manager.append(delamination)
             return
         return delamination
@@ -146,6 +204,9 @@ class TopologicalEventsHandler:
                     sheet, cell_id, sheet.geom,
                 )
                 if daughter is None:
+                    log_topo_event(logger, sheet, False,
+                                   "division: cell (uid %d) found no valid "
+                                   "split; skipping", cell_uid)
                     tried_ids.add(cell_uid)
                     continue
                 sheet.face_df.at[daughter, "id"] = daughter
@@ -174,6 +235,9 @@ class TopologicalEventsHandler:
                 sheet.edge_df.sort_values(["face", "order"], inplace=True)
                 sheet.get_opposite()
                 sheet.geom.update_all(sheet)
+                log_topo_event(logger, sheet, True,
+                               "division: cell (uid %d) divided into a new "
+                               "daughter", cell_uid)
                 # Sanity check: a successful division should leave BOTH
                 # mother and daughter with strictly positive area. If
                 # the perimeter walk in ``index_preserving_face_division``
@@ -213,11 +277,34 @@ class TopologicalEventsHandler:
             # with a stale edge_id after ``reset_index`` had renumbered
             # the edges, leading to a T1 on the wrong edge (or on a
             # vertex that no longer exists).
+            def _resync():
+                # Restore a clean, contiguous index and a consistent derived
+                # state (order / opposite / geometry).
+                sheet.reset_index(order=False)
+                sheet.order_all_edges()
+                sheet.edge_df.sort_values(["face", "order"], inplace=True)
+                sheet.get_opposite()
+                sheet.geom.update_all(sheet)
+
+            # A T1 is NOT atomic: ``index_preserving_type1_transition`` runs
+            # ``collapse_edge(..., reindex=False)`` — dropping edges and leaving
+            # a GAPPY index — BEFORE the split / tri-face removal that may
+            # raise. A skipped T1 therefore leaves a partially collapsed sheet
+            # with a non-contiguous edge index.
+            #
+            # We must NOT reset_index between skipped attempts: reset_index
+            # renumbers vertices, which would invalidate the (srce, trgt) keys
+            # in ``tried`` and let the same failing edge be retried forever
+            # (each retry collapses another edge). So we keep the index gappy
+            # through the loop — every operation here is label-based, and
+            # ``is_virtual_edge`` is given the ACTUAL labels (NOT
+            # ``np.arange(shape[0])``, which assumes a contiguous 0..N-1 range
+            # and raised "KeyError: [...] not in index" on the gappy index).
+            # Any partial collapse is cleaned up by a single resync at the end.
             tried = set()
+            pending_resync = False
             while True:
-                is_virtual = sheet.is_virtual_edge(
-                    np.arange(sheet.edge_df.shape[0])
-                )
+                is_virtual = sheet.is_virtual_edge(sheet.edge_df.index.to_numpy())
                 real_edges = sheet.edge_df[~is_virtual]
                 candidates = real_edges.query(
                     "is_active > 0 & length < %f" % crit_edge_length
@@ -238,20 +325,32 @@ class TopologicalEventsHandler:
                 try:
                     ret = index_preserving_type1_transition(sheet, edge_id)
                 except Exception as exc:
-                    log.warning(
-                        "T1 on edge %d (srce=%d, trgt=%d) raised %s; skipping",
-                        edge_id, s, t, type(exc).__name__,
-                    )
+                    log_topo_event(logger, sheet, False,
+                                   "intercalation: T1 on edge %d (srce=%d, "
+                                   "trgt=%d) raised %s; skipping",
+                                   edge_id, s, t, type(exc).__name__)
                     tried.add((s, t))
+                    pending_resync = True  # collapse may have run before raising
                     continue
                 if ret is not None and ret < 0:
+                    log_topo_event(logger, sheet, False,
+                                   "intercalation: T1 on edge (srce=%d, trgt=%d) "
+                                   "returned %s; skipping", s, t, ret)
                     tried.add((s, t))
+                    pending_resync = True  # collapse may have partially run
                     continue
-                sheet.reset_index(order=False)
-                sheet.order_all_edges()
-                sheet.edge_df.sort_values(["face", "order"], inplace=True)
-                sheet.get_opposite()
-                sheet.geom.update_all(sheet)
+                # Successful T1: clean up now. reset_index renumbers, so the
+                # stale (srce, trgt) keys in ``tried`` no longer match — clear
+                # it (the T1'd edge is gone and won't reappear as a candidate).
+                _resync()
+                log_topo_event(logger, sheet, True,
+                               "intercalation: T1 on edge (srce=%d, trgt=%d)", s, t)
+                tried = set()
+                pending_resync = False
+            # Leave a clean, contiguous index for the solver even when the final
+            # attempts were skipped partial collapses.
+            if pending_resync:
+                _resync()
             manager.append(intercalation)
         return intercalation
 
@@ -374,13 +473,13 @@ def index_preserving_close_face(eptm, face):
     This function **does not** close the adjacent and opposite
     faces. Returns the index of the new edge if created, otherwise None
     """
-    logger.debug(f"closing face {face}")
+    log_topo_trace(logger, eptm, "closing face %s", face)
     face_edges = eptm.edge_df[eptm.edge_df["face"] == face]
     srces = set(face_edges["srce"])
     trgts = set(face_edges["trgt"])
 
     if srces == trgts:
-        logger.debug("Face %d already closed", face)
+        log_topo_trace(logger, eptm, "face %d already closed", face)
         return None
     try:
         (single_srce,) = srces.difference(trgts)
@@ -412,11 +511,45 @@ def index_preserving_remove(sheet, face, geom):
     index_preserving_remove_face(sheet, face)
     geom.update_all(sheet)
 
+def _drop_antenna_spikes(sheet):
+    """Remove degenerate 'antenna' vertices — those joined to a SINGLE distinct
+    other vertex — together with their incident half-edges, cascading until
+    none remain.
+
+    Such spikes are created when :func:`index_preserving_remove_face` collapses
+    all of a removed cell's vertices onto one point ``new_vert``: any surviving
+    vertex left with a single distinct neighbour (e.g. a virtual mid-edge vertex
+    whose two endpoints both merged, or a corner left dangling) is no longer a
+    real polygon corner but a backtracking ``A->v->A`` antenna. Because that
+    spike vertex is shared by the faces on both sides, it shows up as DUPLICATE
+    ``(srce, trgt)`` half-edges in two faces — which ``drop_two_sided_faces``
+    can't see (those faces still have >2 sides) and which makes ``get_opposite``
+    emit "Duplicated (`srce`, `trgt`) values in edge_df". A real polygon corner
+    always has >=2 distinct neighbours, so peeling off the <=1 case is safe and
+    a no-op on a clean removal."""
+    while True:
+        e = sheet.edge_df
+        if e.empty:
+            return
+        nb = pd.concat([
+            e[["srce", "trgt"]].rename(columns={"srce": "v", "trgt": "n"}),
+            e[["trgt", "srce"]].rename(columns={"trgt": "v", "srce": "n"}),
+        ], ignore_index=True)
+        distinct_neighbours = nb.groupby("v")["n"].nunique()
+        spikes = distinct_neighbours.index[distinct_neighbours <= 1]
+        if not len(spikes):
+            return
+        drop = e.index[e["srce"].isin(spikes) | e["trgt"].isin(spikes)]
+        if not len(drop):
+            return
+        sheet.edge_df.drop(drop, axis=0, inplace=True)
+
+
 def index_preserving_remove_face(sheet, face):
     """Removes a face from the mesh.
 
     Returns the index of the new vert that replaces the face."""
-    logger.debug("removing face %d", face)
+    log_topo_trace(logger, sheet, "removing face %d", face)
 
     edges = sheet.edge_df[sheet.edge_df["face"] == face]
     verts = edges["srce"].unique()
@@ -440,15 +573,26 @@ def index_preserving_remove_face(sheet, face):
         warnings.warn(f"something fishy with face {face}")
         sheet.edge_df.drop(remanent, axis=0, inplace=True)
 
+    # Peel off any degenerate antenna spikes the collapse created (the source of
+    # the "Duplicated (`srce`, `trgt`)" warnings during ablation/delamination).
+    _drop_antenna_spikes(sheet)
+
     sheet.lineage.add_node(str(sheet.face_df.loc[face]['unique_id']),
                            color='black')
 
     sheet.face_df.drop(face, axis=0, inplace=True)
-    sheet.vert_df.drop(verts, axis=0, inplace=True)
 
-    logger.info("removed %d of %d vertices", len(verts), sheet.vert_df.shape[0])
-    logger.info("face %d is now dead ", face)
+    log_topo_event(logger, sheet, True,
+                   "removed face %d (dropped %d vertices; cell now dead)",
+                   face, len(verts))
     drop_two_sided_faces(sheet)
+
+    # Keep only vertices still referenced by an edge: the removed face's
+    # collapsed verts, antenna-spike orphans, and anything drop_two_sided_faces
+    # freed. (Replaces the old ``drop(verts)``, which dropped only the first of
+    # those three and so left the spike orphans behind.)
+    used = pd.unique(sheet.edge_df[["srce", "trgt"]].values.ravel())
+    sheet.vert_df = sheet.vert_df.loc[sheet.vert_df.index.intersection(used)]
 
     sheet.reset_index()
     sheet.reset_topo()
@@ -502,7 +646,8 @@ def index_preserving_cell_division(sheet, mother, geom, angle=None,
     likely to succeed.
     """
     if not sheet.face_df.loc[mother, "is_alive"]:
-        logger.warning("Cell %s is not alive and cannot divide", mother)
+        log_topo_event(logger, sheet, False,
+                       "division: cell %s is not alive and cannot divide", mother)
         return None
 
     # For periodic sheets there's no global vertex shift to worry about:
@@ -529,6 +674,28 @@ def index_preserving_cell_division(sheet, mother, geom, angle=None,
     # and the freshly-appended daughter row inherits that value via
     # pd.concat — both look fine and the check would let the bad
     # polygon through.
+    #
+    # IMPORTANT: repair the mother's and daughter's edge ``order`` first.
+    # ``index_preserving_face_division`` appends the new edges by copying
+    # an existing edge row (so they inherit a stale ``order``) and never
+    # rewrites the column, leaving e.g. order = [1, 2, 7, 6, 1] on the
+    # mother. The periodic geometry (PeriodicPlanarGeometry.update_dcoords)
+    # builds each face polygon by walking its edges in ``order`` sequence
+    # — with a broken order it produces a self-tangled polygon whose area
+    # collapses to ~0, which would trip the degeneracy test below and roll
+    # back a perfectly valid division (observed on adjacent same-category
+    # divisions in scenario 9). Re-walking just these two faces' perimeters
+    # restores a correct order so the area measurement is meaningful. The
+    # caller re-orders the whole sheet afterwards; this only fixes what the
+    # check itself needs.
+    if hasattr(sheet, "order_edges"):
+        for _f in (mother, daughter):
+            try:
+                sheet.order_edges(int(_f))
+            except (IndexError, ValueError, KeyError):
+                # A genuinely broken perimeter will surface as a
+                # degenerate area below and be rolled back as before.
+                pass
     geom.update_all(sheet)
     if daughter not in sheet.face_df.index or mother not in sheet.face_df.index:
         # face_division shouldn't be dropping rows, but if for any
@@ -548,8 +715,9 @@ def index_preserving_cell_division(sheet, mother, geom, angle=None,
         or (large > 0 and small < float(min_area_ratio) * large)
     )
     if is_degenerate:
-        logger.warning(
-            "Division of cell %s gave degenerate polygon "
+        log_topo_event(
+            logger, sheet, False,
+            "division: cell %s gave degenerate polygon "
             "(mother area=%.4g, daughter area=%.4g, "
             "min/max ratio=%.4g, threshold=%.2g); rolling back via "
             "index_preserving_remove_face on the daughter so the bad "
@@ -701,22 +869,48 @@ def index_preserving_type1_transition(sheet, edge01, *, remove_tri_faces=True, m
 
 
     """
-    if (
-        getattr(sheet, "periodic", False)
-        and "is_periodic" in sheet.edge_df.columns
-        and bool(sheet.edge_df.at[edge01, "is_periodic"])
-    ):
-        return _periodic_t1_transition(
-            sheet, edge01,
-            remove_tri_faces=remove_tri_faces,
-            multiplier=multiplier,
-        )
+    # A T1 is NOT atomic internally: ``collapse_edge(reindex=False)`` drops edges
+    # and merges vertices BEFORE ``index_preserving_split_vert`` / tri-face
+    # removal, any of which can raise. A partially-applied T1 leaves DUPLICATE
+    # (srce, trgt) half-edges — a non-manifold mesh that ``reset_topo`` /
+    # antenna-spike healing CAN'T repair (seen as the "NON-spike duplicate ...
+    # [cross-face]" warnings during intercalation). Snapshot the topology and
+    # restore it on ANY failure so a failed T1 is a clean no-op; the caller
+    # (e.g. the intercalation handler) then just marks the edge as tried.
+    _edge_bak = sheet.edge_df.copy()
+    _vert_bak = sheet.vert_df.copy()
+    _face_bak = sheet.face_df.copy()
 
-    return _bulk_t1_transition(
-        sheet, edge01,
-        remove_tri_faces=remove_tri_faces,
-        multiplier=multiplier,
-    )
+    def _restore():
+        sheet.edge_df = _edge_bak
+        sheet.vert_df = _vert_bak
+        sheet.face_df = _face_bak
+
+    try:
+        if (
+            getattr(sheet, "periodic", False)
+            and "is_periodic" in sheet.edge_df.columns
+            and bool(sheet.edge_df.at[edge01, "is_periodic"])
+        ):
+            ret = _periodic_t1_transition(
+                sheet, edge01,
+                remove_tri_faces=remove_tri_faces,
+                multiplier=multiplier,
+            )
+        else:
+            ret = _bulk_t1_transition(
+                sheet, edge01,
+                remove_tri_faces=remove_tri_faces,
+                multiplier=multiplier,
+            )
+    except Exception:
+        _restore()
+        raise
+    # A negative return code means the T1 declined partway (e.g. the collapse
+    # failed); restore so no partial change is left behind either.
+    if ret is not None and ret < 0:
+        _restore()
+    return ret
 
 
 def _bulk_t1_transition(sheet, edge01, *, remove_tri_faces=True, multiplier=1.5):
@@ -1057,7 +1251,7 @@ def index_preserving_base_split_vert(sheet, vert, face, to_rewire, epsilon, rece
     This will leave opened faces and cells
 
     """
-    logger.debug("splitting vertex %d", vert)
+    log_topo_trace(logger, sheet, "splitting vertex %d", vert)
 
     # Add a vertex
     this_vert = sheet.vert_df.loc[vert:vert].copy()  # avoid type munching

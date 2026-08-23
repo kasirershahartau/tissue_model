@@ -137,7 +137,8 @@ def _propose_location(gp, best_f_standardized, d, rng,
 
 
 def minimize(objective, bounds, n_calls=40, n_initial_points=10,
-             random_state=0, xi=0.01, verbose=True, x0=None):
+             random_state=0, xi=0.01, verbose=True, x0=None,
+             return_surrogate=False):
     """Bayesian-optimization minimizer.
 
     Parameters
@@ -158,10 +159,19 @@ def minimize(objective, bounds, n_calls=40, n_initial_points=10,
         An extra point (e.g. a hand-tuned guess) evaluated first, on top of
         the initial design.
 
+    return_surrogate : bool, default False
+        When True, fit a FINAL Gaussian process on ALL evaluated points and add
+        two extra keys to the result: ``gp`` (the fitted :class:`_GaussianProcess`,
+        living on the unit cube with standardized targets) and ``surrogate`` — a
+        convenience callable ``points_in_original_units -> (mean, std)`` giving
+        the estimated objective landscape (posterior mean and uncertainty)
+        anywhere in the box. Both are ``None`` if the final GP fit fails.
+
     Returns
     -------
     dict with keys ``x`` (best params), ``fun`` (best value), ``X`` (all
-    evaluated points, shape (n_calls, d)) and ``y`` (all values).
+    evaluated points, shape (n_calls, d)) and ``y`` (all values); plus ``gp`` /
+    ``surrogate`` when ``return_surrogate`` is set.
     """
     bounds = np.asarray(bounds, float)
     d = bounds.shape[0]
@@ -207,4 +217,24 @@ def minimize(objective, bounds, n_calls=40, n_initial_points=10,
     y = np.array(y)
     X = from_unit(np.array(X_unit))
     best_idx = int(np.argmin(y))
-    return {"x": X[best_idx], "fun": float(y[best_idx]), "X": X, "y": y}
+    result = {"x": X[best_idx], "fun": float(y[best_idx]), "X": X, "y": y}
+
+    if return_surrogate:
+        # Fit a FINAL GP on ALL evaluations so callers can query the estimated
+        # objective landscape (posterior mean + std) anywhere in the box. The GP
+        # lives on the unit cube with standardized targets; ``surrogate`` wraps
+        # the input scaling so callers pass ORIGINAL-unit parameter points and
+        # get objective-unit predictions back.
+        gp_final, surrogate = None, None
+        try:
+            gp_final = _GaussianProcess(np.array(X_unit), y).fit(rng=rng)
+
+            def surrogate(points, _gp=gp_final):
+                return _gp.predict(to_unit(np.asarray(points, float)),
+                                   standardized=False)
+        except Exception:
+            gp_final, surrogate = None, None
+        result["gp"] = gp_final
+        result["surrogate"] = surrogate
+
+    return result

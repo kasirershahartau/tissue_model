@@ -8,9 +8,8 @@ A practical, step-by-step guide for running `create_random_arrays`,
 
 ## 0. Which setup? (decision in one line)
 
-- **Single large Spot VM** — recommended for everything. Simplest, works for all
-  four methods, uses the existing `ProcessPoolExecutor` parallelism across the
-  VM's cores. **Start here.**
+- **Single Spot VM** — recommended for everything. Simplest, works for all four
+  methods, uses the existing `ProcessPoolExecutor` parallelism. **Start here.**
 - **Azure Batch (many Spot nodes)** — only worth it when you need to generate
   *hundreds* of arrays (`create_random_arrays` / `initialize_differentiated_arrays`),
   which are pure fan-out. The adaptive fitters (`find_mechanical_parameters`,
@@ -19,6 +18,42 @@ A practical, step-by-step guide for running `create_random_arrays`,
 The simulations are **single-threaded, CPU-bound, low-memory, GPU-free** → use a
 **compute-optimized Fsv2 VM** as a **Spot** instance (70–90 % cheaper; runs are
 independent and resumable, so eviction is safe).
+
+### ⚠️ Do not over-size the VM for `find-mech`
+
+`find_mechanical_parameters` is **not** embarrassingly parallel:
+
+```
+for each of n_calls candidate points:        <- STRICTLY SEQUENTIAL (Bayesian)
+    evaluate n_sheets sheets in parallel     <- only ~10 wide
+        each sheet runs base, then ablation  <- sequential pair
+```
+
+`bayesian_optimization.minimize` proposes one point at a time and needs its
+score before proposing the next, so **concurrency is capped at `n_sheets` (10),
+not at the vCPU count**. A 72-vCPU VM leaves 62 cores idle and finishes *no
+sooner* than a 16-vCPU one — while costing 4.5× more.
+
+Measured over the 5976 archived fit runs (`results/fit_*/debug.log`):
+
+| quantity | value |
+|---|---|
+| mean single simulation | ~0.4 h (median 0.31, p90 0.88) |
+| mean sheet (base + ablation) | 38.7 min |
+| **slowest of 10 sheets** (what an evaluation waits for) | **83.1 min** |
+| core utilisation | **~47 %** (straggler factor ~2.1) |
+
+For the current job (`n_calls=60`, `n_sheets=10`, ablation on):
+
+| | |
+|---|---|
+| total CPU work | **~390 core-hours** |
+| wall-clock on any VM with ≥10 usable cores | **~80 h (3.4 days)** |
+| compute cost | ~$55 PAYG / **~$11 Spot** |
+
+**So moving this fit to the cloud as-is buys ≈1× speedup** — only the per-core
+clock differs. See [§12](#12-how-much-speedup-should-i-expect) for what actually
+does make it faster.
 
 ---
 
@@ -32,15 +67,22 @@ run it on your own machine first:
 #     e.g. build a single random array and time it:
 conda run -n tyssue python azure_run.py random-arrays --indices 0 --workers 1
 
-# 1b. Plug that number in (say 0.5 h) to size each job:
-python azure_run.py estimate find-mech   --n-calls 40 --n-sheets 10 --ablation --hours-per-sim 0.5 --vm Standard_F32s_v2
-python azure_run.py estimate find-psigma --n-grid 11 --n-refine 2 --n-sheets 10 --hours-per-sim 0.5
-python azure_run.py estimate random-arrays --n 10 --hours-per-sim 0.5
+# 1b. Plug that number in (0.32 h is this project's measured mean) to size a job:
+python azure_run.py estimate find-mech --n-calls 60 --n-sheets 10 --ablation \
+    --hours-per-sim 0.32 --vm Standard_F16s_v2
+python azure_run.py estimate find-psigma --n-grid 11 --n-refine 2 --n-sheets 10 --hours-per-sim 0.32
+python azure_run.py estimate random-arrays --n 10 --hours-per-sim 0.32
 ```
 
-It prints the simulation count, idealized core-hours, single-VM wall-clock, and
-**PAYG vs Spot** dollar cost. A full fitting campaign is typically **tens of
-dollars on Spot**. Omit `--hours-per-sim` to get a scaling table instead.
+It prints the simulation count, total core-hours, single-VM wall-clock,
+**core utilisation**, and **PAYG vs Spot** cost. A full fitting campaign is
+**tens of dollars on Spot**. Omit `--hours-per-sim` for a scaling table.
+
+The estimator models each method's *real* parallel structure, including the
+sequential Bayesian loop and the straggler penalty — for `find-mech` it also
+warns when the chosen VM has more cores than the job can ever use, and prints a
+`--batch-k` what-if table. Compare `--vm Standard_F16s_v2` with
+`--vm Standard_F72s_v2`: identical wall-clock, 4.5× the cost.
 
 ---
 
@@ -60,10 +102,13 @@ dollars on Spot**. Omit `--hours-per-sim` to get a scaling table instead.
 ## 3. Provision a Spot VM
 
 ```bash
-RG=tissue-model-rg          # resource group
-LOC=westeurope              # or israelcentral
-VM=tissue-sim
-SIZE=Standard_F32s_v2       # 32 vCPU / 64 GB; use F72s_v2 for 72 vCPU
+RG=Simulations          # resource group
+LOC=israelcentral            # or israelcentral
+VM=SimulationsVM
+# 16 vCPU is ENOUGH for find-mech with n_sheets=10 (see §0 -- concurrency is
+# capped at n_sheets, so a bigger VM is pure cost). Go bigger only for the
+# fan-out generators, or to run E17.5 and P0 on one machine.
+SIZE=Standard_F16s_v2       # 16 vCPU / 32 GB
 
 az group create -n $RG -l $LOC
 
@@ -116,18 +161,39 @@ conda env create -f environment.yml          # creates the `tyssue` env
 Get the simulation code onto the VM (from your machine):
 
 ```bash
-# from your LOCAL machine, in the tissue_model folder:
+# from your LOCAL machine, in the tissue_model folder.
+# The VENDORED tyssue in ./tyssue/src MUST come along -- see 4d.
 scp -r .  azureuser@<IP>:~/tissue_model
 ```
 
-**Sanity check** the env on the VM (this is also the test that the
-LAPACK/`svd` backend works — see Troubleshooting):
+```bash
+# 4d. TWO MANDATORY ENV VARS. Add both to ~/.bashrc.
+cd ~/tissue_model
+
+# (i) The vendored tyssue. This project does NOT work with the stock PyPI
+#     tyssue -- it fails with "change of datatype in edge table". This has
+#     bitten us for real; it is not optional.
+export PYTHONPATH="$PWD/tyssue/src"
+
+# (ii) Results directory. The default is the WINDOWS path D:\Kasirer\results,
+#      which is meaningless on Linux, so every read/write would land somewhere
+#      wrong or fail.
+export TISSUE_RESULTS_DIR="$HOME/results"
+mkdir -p "$TISSUE_RESULTS_DIR"
+```
+
+**Sanity check** the env on the VM. This verifies the LAPACK/`svd` backend *and*
+that the vendored tyssue is the one being imported:
 
 ```bash
 conda activate tyssue
 cd ~/tissue_model
-python -c "import numpy as np, tyssue, scipy; print('svd', np.linalg.svd(np.random.rand(6,3))[1].shape, 'ok')"
+python -c "import numpy as np, tyssue, scipy; print('svd', np.linalg.svd(np.random.rand(6,3))[1].shape, 'ok'); print('tyssue from', tyssue.__file__)"
+# ^ 'tyssue from' MUST print a path under ~/tissue_model/tyssue/src/
 ```
+
+`azure_run.py find-mech` also checks both of these at startup and prints a loud
+warning if either is wrong.
 
 > **Always run inside the activated env** (`conda activate tyssue`, or
 > `conda run -n tyssue ...`). Launching a bare `python` can miss the env's
@@ -188,9 +254,24 @@ python azure_run.py init-diff --stage E17.5 --gammaSC 0.01 --gammaHC-ratio 10 --
 python azure_run.py init-diff --stage P0    --indices 0 1 2
 
 # Mechanical-parameter fit (Bayesian optimization), per stage ------------------
-python azure_run.py find-mech --stage E17.5 --n-calls 40 --n-sheets 10 \
-    --ablated-cells 12 13 14 15 --post-ablation-frame 4
-python azure_run.py find-mech --stage P0    --n-calls 40 --n-sheets 10
+# ALL defaults mirror run_model.__main__, so this reproduces the local fit:
+#   fitted:  gammaSC, alphaHC_ratio, hc_shape_index, sc_shape_index
+#   fixed:   gammaHC_ratio=1.0, bending=0.02 (replaces line tension),
+#            qst base/ablation = 0.03/0.02, type_by=delta_level
+# ALWAYS --dry-run first: it prints the fully resolved call and runs nothing.
+python azure_run.py find-mech --stage E17.5 --dry-run
+python azure_run.py find-mech --stage E17.5
+python azure_run.py find-mech --stage P0
+
+# Override anything you need, e.g. a cheaper smoke test:
+python azure_run.py find-mech --stage E17.5 --n-calls 4 --n-initial-points 3 --n-sheets 2
+
+# Revert to the HISTORICAL parameterisation (single shape index, fitted
+# gammaHC_ratio, line tension instead of bending). Passing --shape-index-bounds
+# automatically drops the per-type pair, keeping exactly 4 fitted parameters:
+python azure_run.py find-mech --stage E17.5 \
+    --shape-index-bounds 1.1 1.4 --gammaHC-ratio-bounds 1.0 1.4 \
+    --line-tension 0.05 --no-bending
 
 # Shared psigma fit (coarse-to-fine line search over BOTH stages) --------------
 python azure_run.py find-psigma \
@@ -230,9 +311,12 @@ arrays flows cleanly from generation through every fit.
 ## 8. Monitor a running job
 
 ```bash
-tmux attach -t sim                     # watch live console output
-tail -f ~/tissue_model/results/<run-name>/debug.log   # per-run debug log
-ls ~/tissue_model/results              # results appear per simulation
+tmux attach -t sim                                # watch live console output
+tail -f $TISSUE_RESULTS_DIR/<run-name>/debug.log  # per-run debug log
+ls $TISSUE_RESULTS_DIR                            # results appear per simulation
+
+# progress of a find-mech fit: one folder pair (base + _abl) per sheet per call
+ls -d $TISSUE_RESULTS_DIR/fit_* | wc -l
 ```
 
 ---
@@ -240,8 +324,8 @@ ls ~/tissue_model/results              # results appear per simulation
 ## 9. Retrieve results and STOP billing
 
 ```bash
-# from your LOCAL machine:
-azcopy copy "azureuser@<IP>:~/tissue_model/results" "." --recursive   # or scp -r
+# from your LOCAL machine ($TISSUE_RESULTS_DIR on the VM, ~/results by default):
+azcopy copy "azureuser@<IP>:~/results" "." --recursive   # or scp -r
 
 # then, on Azure (compute billing stops on deallocate; disk is kept):
 az vm deallocate -g $RG -n $VM
@@ -272,10 +356,105 @@ start-task. Keep the fitters (`find-mech`, `find-psigma`) on a single VM.
 
 | Symptom | Cause & fix |
 |---|---|
+| `ValueError: change of datatype in edge table` | The **stock PyPI tyssue** is being imported instead of the vendored one. `export PYTHONPATH=$PWD/tyssue/src` (Step 4d-i). This is the single most common setup failure. |
+| Results written to a strange path, or `FileNotFoundError` on `D:\Kasirer\results` | `TISSUE_RESULTS_DIR` not set on Linux — the default is a Windows path (Step 4d-ii). |
+| Fit dies with `not enough values to unpack (expected N, got M)` | **`run_model.py` was edited while the fit was running.** The parent keeps the old task-builder while newly spawned workers import the new unpack signature. Never edit the tree during a run — copy it and edit the copy. Completed run folders are reused, so restarting is cheap. |
+| Fit found the same best point as a previous run and did almost no work | Working as intended: run folders are content-hashed, so matching parameter points are reused. Change a parameter that is folded into the hash (or delete the folders) to force fresh runs. |
 | `numpy.linalg`/`statsmodels` hard-crash (e.g. `0xc06d007f` on Windows) | Running a bare `python` without env activation. **Always** `conda activate tyssue` / `conda run -n tyssue`. The Step-4 `svd` check verifies the backend. |
 | `FileNotFoundError` on `...Experimental Data` or `ImportError: statistical_analysis` | The Step-5 env vars aren't set on the VM. `export EXPERIMENTAL_DATA_DIR=...` and `export TISSUE_ANALYZER_PATH=...` (point them at the copied folders). Affects the analysis steps: morphology fit (7.2), `find-mech`, `find-psigma` — not the generators. |
 | Run finishes but no `movie.gif` / a gif error in the log | ImageMagick missing. `sudo apt-get install -y imagemagick` (Step 4a). The history is still saved regardless. |
 | VM disappears mid-run (Spot eviction) | Expected. Restart with `az vm start -g $RG -n $VM`; reruns reuse existing result folders, and `run(continue_existing_run=True, ...)` resumes a partial archive. |
 | `psigma` seems to have no effect | `psigma` only matters with stress-dependent differentiation. `find-psigma`'s worker already passes `stress_dependent=True`; if you call `run()` directly, set it too. |
 | SSH drops kill the job | Launch inside `tmux` (Step 6). |
-```
+
+---
+
+## 12. How much speedup should I expect?
+
+Short answer: **for one `find-mech` fit, moving to the cloud unchanged gives
+≈1×.** The bottleneck is not core count.
+
+### Where the ~80 h actually goes
+
+The job is only **~390 core-hours** of real CPU work. If it could be spread
+freely across cores it would finish in a few hours. It doesn't, because:
+
+1. **The Bayesian loop is sequential** — 60 evaluations, each needing the
+   previous score. Only the 10 sheets *within* an evaluation run concurrently.
+2. **Each evaluation waits for its slowest sheet** — mean sheet 38.7 min but
+   max-of-10 83.1 min, so **~47 % of the 10 cores sit idle**.
+
+Net: ~60 × 1.4 h ≈ **80 h**, on 10 effective cores, on *any* VM size. Your local
+16-core machine already saturates this, which is exactly why the local run takes
+~80–100 h.
+
+### What each option actually buys
+
+| Option | Speedup (one fit) | Effort |
+|---|---|---|
+| Same code on a bigger cloud VM | **~1×** (only per-core clock; Fsv2 ≈ a modern desktop) | none |
+| Run E17.5 **and** P0 on two VMs at once | 1× each, but **2× throughput** — both stages in ~80 h instead of ~160 h, and your workstation is free | none |
+| Launch the 25 random initial points concurrently | ~1.5–1.7× (42 % of the budget has *no* sequential dependency, so this costs nothing in sample efficiency) | small |
+| **Batch BO** (`--batch-k K`: K candidate points in flight) | **K=4 → ~3×** (~27 h, 40 vCPU); **K=6 → ~4.3×** (~19 h, 60 vCPU) | moderate — needs a batch-capable optimizer |
+| Both of the above | **~6×** → ~13 h | moderate |
+
+Speedups above are projected by bootstrapping the archived run-time
+distribution; run `azure_run.py estimate find-mech --batch-k K ...` to reproduce
+them. They flatten past K≈6 because the straggler penalty grows with batch size
+(waiting on the slowest of 60 is worse than the slowest of 10).
+
+### Recommendation
+
+- **Right now:** let the local fit finish, and put the *other* stage on one
+  16-vCPU Spot VM (~$11). That is the whole 2× with zero code risk.
+- **Before the next fitting campaign:** add batch proposals to
+  `bayesian_optimization.minimize`. That is the only change that turns money
+  into wall-clock here — and given that both previous fits found their best
+  point during the *random* initial phase, batching should cost little or
+  nothing in fit quality.
+- **Cost is never the constraint:** the entire fit is ~$11 on Spot. Do not
+  optimise for it; optimise for wall-clock and for not corrupting a run.
+
+Re-running after restart:
+source ~/miniconda/etc/profile.d/conda.sh
+conda activate tyssue
+---Launch both stages----
+tmux new -s e17
+~/tissue_model/run_mech_fit.sh E17.5
+Detach with Ctrl-b d, then:
+
+tmux new -s p0
+~/tissue_model/run_mech_fit.sh P0
+Monitor: tmux attach -t e17, tail -f ~/mech_fit_E17.5.log, or ls -d ~/results/fit_*pa0.466* | wc -l.
+
+-----When done — retrieve and stop billing-----
+scp azureuser@<IP>:"~/results/*_optimization_*" "D:\Kasirer\results\"
+az vm deallocate -g Simulations -n SimFit
+
+scp azureuser@<IP>:/home/azureuser/results/grid_fit_mechanics_v2_E17.5.json D:/Kasirer/results/
+
+-----P0 step-5 scans (v2 fit) — launch in tmux-----
+Upload (from the local tissue_model folder):
+scp -i SimulationsVM_key.pem p0_rgamma_scan.py p0_gamma_scan.py p0_from_e17_stiffness.py post_processing.py run_p0_scan.sh azureuser@<IP>:~/tissue_v2/
+ssh azureuser@<IP> chmod +x ~/tissue_v2/run_p0_scan.sh
+
+THE TREE MATTERS: the v2 work lives in ~/tissue_v2 (~/tissue_model and
+~/tissue_full are older checkouts and have no grid_fit_mechanics_v2.py).
+run_p0_scan.sh runs from ITS OWN directory, so invoke the copy in the tree
+you mean, and it checks its siblings are present before starting.
+
+run_p0_scan.sh sets conda + PYTHONPATH + the three env vars itself (a fresh tmux
+pane does NOT source ~/.bashrc) and pre-flights the workbook, the E17.5 grid
+JSON and every experimental term before starting.
+
+tmux new -s p0scan
+~/tissue_v2/run_p0_scan.sh rgamma --dry-run    # check, then Ctrl-c and:
+~/tissue_v2/run_p0_scan.sh rgamma              # 70 tasks
+Detach with Ctrl-b d. Reattach: tmux attach -t p0scan
+
+  rgamma  step 5c diagnostic: R_alpha pinned by the stress ratio, R_gamma swept
+  gamma   step 5b: R fixed, 10 gammaSC values (90 tasks)
+
+Monitor: tmux attach -t p0scan, or tail -f ~/p0_rgamma_scan.log
+Retrieve:
+scp azureuser@<IP>:/home/azureuser/results/p0_rgamma_scan.json D:/Kasirer/results/

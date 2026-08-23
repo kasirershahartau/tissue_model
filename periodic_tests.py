@@ -6,7 +6,7 @@ from tyssue import HistoryHdf5
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
-from post_processing import create_gif_safe
+from post_processing import create_gif_safe, RESULTS_DIR
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 
 
@@ -69,11 +69,21 @@ def _enable_debug_log(log_path):
         datefmt="%H:%M:%S",
     ))
 
+    # Set the level on every target logger so their DEBUG/INFO records are
+    # created, but attach the handler to the ROOT logger ONLY. Every record
+    # propagates up to root, so a single handler there captures each one
+    # exactly once. Attaching the SAME handler to several loggers in one
+    # propagation chain (e.g. "tyssue.solvers.viscous" -> "tyssue" -> root, all
+    # in _DEBUG_LOG_TARGETS) emitted each record once per handler on the chain
+    # — 3 duplicate lines for every solver warning.
     for logger_name in _DEBUG_LOG_TARGETS:
-        lg = logging.getLogger(logger_name)
-        lg.setLevel(logging.DEBUG)
-        if handler not in lg.handlers:
-            lg.addHandler(handler)
+        logging.getLogger(logger_name).setLevel(logging.DEBUG)
+    # Keep matplotlib's chatty DEBUG/INFO out of the file (root is at DEBUG and
+    # matplotlib propagates to it). WARNING+ from matplotlib still gets through.
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    root_logger = logging.getLogger("")
+    if handler not in root_logger.handlers:
+        root_logger.addHandler(handler)
 
     def _final_flush():
         try:
@@ -172,8 +182,14 @@ def run():
                ('HC', 'SC'): 0.05,
                ('SC', 'SC'): 0.05
                }
-    preferred_area = {'HC': 1/(4*np.pi),
-                      'SC': 1/(4*np.pi)}
+    # Preferred cell area = area of a circle whose radius is HALF the lattice
+    # unit (distx = disty = 1, so radius 0.5): pi * 0.5**2 = pi/4 ~ 0.785, which
+    # matches the actual mean cell area of the saved arrays (~0.76). Was a typo
+    # `1/(4*pi)` ~ 0.0796 (~10x too small) — that drove cells to shrink hard,
+    # jagged the periodic tiling, and triggered the sharp-corner collapse
+    # cascade (see [[sharp-corner-collapse-prevents-folds]]); fixed to match run_model.
+    preferred_area = {'HC': np.pi / 4,
+                      'SC': np.pi / 4}
     contractility = {'HC': 0.1,
                      'SC': 0.01}
 
@@ -213,7 +229,7 @@ def run():
         mechanosensitivity = 0
 
 
-    results_dir = os.path.join("results", name)
+    results_dir = os.path.join(RESULTS_DIR, name)
     if os.path.exists(results_dir):
         # Pass --force / -f to overwrite without prompting (handy for CI
         # and headless runs); otherwise ask.
@@ -228,7 +244,7 @@ def run():
 
 
     #  Saving model  parameters
-    params_file = os.path.join(os.path.join("results", name, name + "_parameters.txt"))
+    params_file = os.path.join(os.path.join(RESULTS_DIR, name, name + "_parameters.txt"))
     variables = locals().copy().items()
     with open(params_file, "w") as f:
         for var_name, var_value in variables:
@@ -247,8 +263,8 @@ def run():
     run_log = logging.getLogger("periodic_tests")
     run_log.info("Debug log started at %s", debug_log_path)
 
-    initial_sheet_name = os.path.join("results", initial_sheet_name, initial_sheet_name)
-    name = os.path.join("results", name, name)
+    initial_sheet_name = os.path.join(RESULTS_DIR, initial_sheet_name, initial_sheet_name)
+    name = os.path.join(RESULTS_DIR, name, name)
 
     try:
         # Load or initialize sheet

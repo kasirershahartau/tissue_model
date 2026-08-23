@@ -38,14 +38,21 @@ class PeriodicBoundarySheet(Sheet):
         Idempotent. Safe to call any time after vert_df is in (or near) the
         canonical box."""
         tol = 1e-9
+        vx = vert_df["x"]
+        vy = vert_df["y"]
+        idx_dtype = vx.index.dtype
         srce_lbl = edge_df["srce"].to_numpy()
         trgt_lbl = edge_df["trgt"].to_numpy()
-        vx_d = vert_df["x"].to_dict()
-        vy_d = vert_df["y"].to_dict()
-        sx = np.array([vx_d[i] for i in srce_lbl])
-        sy = np.array([vy_d[i] for i in srce_lbl])
-        tx = np.array([vx_d[i] for i in trgt_lbl])
-        ty = np.array([vy_d[i] for i in trgt_lbl])
+        # Align label dtype so reindex matches (see set_opposite_periodic).
+        if srce_lbl.dtype != idx_dtype:
+            srce_lbl = srce_lbl.astype(idx_dtype)
+        if trgt_lbl.dtype != idx_dtype:
+            trgt_lbl = trgt_lbl.astype(idx_dtype)
+        # Vectorized label-based gather instead of a per-edge Python loop.
+        sx = vx.reindex(srce_lbl).to_numpy()
+        sy = vy.reindex(srce_lbl).to_numpy()
+        tx = vx.reindex(trgt_lbl).to_numpy()
+        ty = vy.reindex(trgt_lbl).to_numpy()
         wraps_x = np.abs(tx - sx) > Lx / 2 - tol
         wraps_y = np.abs(ty - sy) > Ly / 2 - tol
         edge_df["at_x_boundary"] = wraps_x
@@ -70,6 +77,18 @@ class PeriodicBoundarySheet(Sheet):
         """
         PREC = 6  # rounding precision for key matching
 
+        # Early-out: this routine only fills in opposites for edges whose
+        # opposite is still unset (< 0). Once the sheet's opposites are all
+        # matched (the steady state during pure-motion steps), there is
+        # nothing to stitch and the rest of this function — notably the
+        # O(E) coordinate-key lookup dict — would be built for nothing.
+        # Skipping it then is bit-for-bit identical (the unstitched loop
+        # below would simply not execute). New unset opposites only appear
+        # after a topology change (e.g. a virtual vertex added on a
+        # boundary edge), and those calls fall through and do the work.
+        if not (edge_df["opposite"].to_numpy() < 0).any():
+            return
+
         # Wrap into [0, L). Series keep label index, so .loc lookups are safe
         # regardless of whether the dataframe was reset_index'd.
         vx_w = (vert_df["x"] % Lx)
@@ -81,31 +100,41 @@ class PeriodicBoundarySheet(Sheet):
         vx_w = vx_w.where(np.abs(vx_w) >= 1e-10, 0.0)
         vy_w = vy_w.where(np.abs(vy_w) >= 1e-10, 0.0)
 
-        vx_w_d = vx_w.to_dict()
-        vy_w_d = vy_w.to_dict()
+        # Per-edge wrapped endpoint coordinates, rounded to the matching
+        # precision. Built vectorially (one np.round over the whole edge
+        # table) rather than with a per-edge Python round() loop — same
+        # keys, far less overhead since this runs on every time step.
+        eids = edge_df.index.to_numpy()
+        srce_lbl = edge_df["srce"].to_numpy()
+        trgt_lbl = edge_df["trgt"].to_numpy()
+        # ``reindex`` matches labels by exact dtype — if srce/trgt drifted
+        # to float (a topology op can upcast the column) while the vertex
+        # index is int, the lookup would silently return all-NaN. Vertex
+        # labels are whole numbers, so align the dtypes first.
+        idx_dtype = vx_w.index.dtype
+        if srce_lbl.dtype != idx_dtype:
+            srce_lbl = srce_lbl.astype(idx_dtype)
+        if trgt_lbl.dtype != idx_dtype:
+            trgt_lbl = trgt_lbl.astype(idx_dtype)
+        sxr = np.round(vx_w.reindex(srce_lbl).to_numpy(), PREC).tolist()
+        syr = np.round(vy_w.reindex(srce_lbl).to_numpy(), PREC).tolist()
+        txr = np.round(vx_w.reindex(trgt_lbl).to_numpy(), PREC).tolist()
+        tyr = np.round(vy_w.reindex(trgt_lbl).to_numpy(), PREC).tolist()
 
         # Build lookup: (wx_srce, wy_srce, wx_trgt, wy_trgt) → edge_id
-        srces = edge_df["srce"].to_dict()
-        trgts = edge_df["trgt"].to_dict()
         lookup = {}
-        for eid in edge_df.index:
-            s = srces[eid]
-            t = trgts[eid]
-            key = (round(vx_w_d[s], PREC), round(vy_w_d[s], PREC),
-                   round(vx_w_d[t], PREC), round(vy_w_d[t], PREC))
-            lookup[key] = eid
+        for i in range(len(eids)):
+            lookup[(sxr[i], syr[i], txr[i], tyr[i])] = eids[i]
 
-        unstitched_ids = edge_df.index[edge_df["opposite"] < 0].tolist()
+        opp_arr = edge_df["opposite"].to_numpy()
         still_missing = []
 
-        for eid in unstitched_ids:
+        for i in np.where(opp_arr < 0)[0]:
+            eid = eids[i]
             if edge_df.at[eid, "opposite"] >= 0:
                 continue  # already stitched by its partner this pass
-            s = srces[eid]
-            t = trgts[eid]
             # Opposite direction: t_wrapped → s_wrapped
-            key = (round(vx_w_d[t], PREC), round(vy_w_d[t], PREC),
-                   round(vx_w_d[s], PREC), round(vy_w_d[s], PREC))
+            key = (txr[i], tyr[i], sxr[i], syr[i])
             if key in lookup:
                 opp = lookup[key]
                 edge_df.at[eid, "opposite"] = opp
@@ -121,11 +150,12 @@ class PeriodicBoundarySheet(Sheet):
                 "Float-point precision is borderline; consider lowering PREC.",
                 len(still_missing),
             )
+            pos_of_eid = {eids[i]: i for i in range(len(eids))}
             for eid in still_missing:
-                s, t = srces[eid], trgts[eid]
+                i = pos_of_eid[eid]
                 logger.debug(
                     "  e%s: wrap_src=(%.8f,%.8f) wrap_tgt=(%.8f,%.8f)",
-                    eid, vx_w_d[s], vy_w_d[s], vx_w_d[t], vy_w_d[t],
+                    eid, sxr[i], syr[i], txr[i], tyr[i],
                 )
 
     # NOTE: VirtualSheet.planar_periodic_sheet_2d is the only construction
@@ -445,12 +475,15 @@ class PeriodicPlanarGeometry(PlanarGeometry):
         sheet.vert_df["x"] = sheet.vert_df["x"] % Lx
         sheet.vert_df["y"] = sheet.vert_df["y"] % Ly
 
-        # Standard upcast → sx, sy from canonical srce position
-        data = sheet.vert_df[sheet.coords]
-        srce_pos = sheet.upcast_srce(data)
-        trgt_pos = sheet.upcast_trgt(data)
-        sheet.edge_df[["s" + c for c in sheet.coords]] = srce_pos.to_numpy()
-        sheet.edge_df[["t" + c for c in sheet.coords]] = trgt_pos.to_numpy()
+        # NOTE: the per-face unfold below recomputes sx/sy/tx/ty for EVERY
+        # edge and writes them all back (idx_arr spans the whole edge table),
+        # and nothing reads those columns in between. So the standard
+        # upcast_srce/upcast_trgt that used to populate them here was pure
+        # overhead — dropped. We only ensure the columns exist so the
+        # .loc write-back works on a freshly built sheet.
+        for _c in ("sx", "sy", "tx", "ty"):
+            if _c not in sheet.edge_df.columns:
+                sheet.edge_df[_c] = 0.0
 
         # 2) Per-face unfold (uses edge `order` if present, falls back to
         #    edge_df row order otherwise).
@@ -472,21 +505,42 @@ class PeriodicPlanarGeometry(PlanarGeometry):
 
         # Walk: for every contiguous run with the same face id, unwrap each
         # subsequent vertex to within ±L/2 of the previous.
-        if len(face_arr):
+        #
+        # Fast path: the inner per-edge walk only ever changes a coordinate
+        # when some consecutive srce pair within the face is separated by
+        # more than half a period — i.e. the cell straddles a periodic
+        # boundary. For every interior face the walk is a guaranteed no-op
+        # (if no RAW consecutive delta exceeds L/2, then by induction the
+        # live-recomputed delta never does either, since nothing gets
+        # shifted). So we precompute, vectorially, which positions have a
+        # large intra-face step and skip the Python walk entirely for runs
+        # that have none. This is bit-for-bit identical to walking every
+        # face — it just avoids the per-edge Python cost for the majority
+        # of (non-wrapping) faces.
+        n = len(face_arr)
+        if n:
+            same_face = np.zeros(n, dtype=bool)
+            same_face[1:] = face_arr[1:] == face_arr[:-1]
+            needs_walk = same_face.copy()
+            needs_walk[1:] &= (
+                (np.abs(xs_all[1:] - xs_all[:-1]) > Lx / 2)
+                | (np.abs(ys_all[1:] - ys_all[:-1]) > Ly / 2)
+            )
             start = 0
-            for i in range(1, len(face_arr) + 1):
-                if i == len(face_arr) or face_arr[i] != face_arr[start]:
-                    for j in range(start + 1, i):
-                        dx = xs_all[j] - xs_all[j - 1]
-                        if dx > Lx / 2:
-                            xs_all[j] -= Lx
-                        elif dx < -Lx / 2:
-                            xs_all[j] += Lx
-                        dy = ys_all[j] - ys_all[j - 1]
-                        if dy > Ly / 2:
-                            ys_all[j] -= Ly
-                        elif dy < -Ly / 2:
-                            ys_all[j] += Ly
+            for i in range(1, n + 1):
+                if i == n or face_arr[i] != face_arr[start]:
+                    if needs_walk[start:i].any():
+                        for j in range(start + 1, i):
+                            dx = xs_all[j] - xs_all[j - 1]
+                            if dx > Lx / 2:
+                                xs_all[j] -= Lx
+                            elif dx < -Lx / 2:
+                                xs_all[j] += Lx
+                            dy = ys_all[j] - ys_all[j - 1]
+                            if dy > Ly / 2:
+                                ys_all[j] -= Ly
+                            elif dy < -Ly / 2:
+                                ys_all[j] += Ly
                     start = i
 
         # tx_face_i = sx_face_(i+1) (cyclic) for each face's contiguous run.
@@ -523,12 +577,13 @@ class PeriodicPlanarGeometry(PlanarGeometry):
                     ty_all[i - 1] = ys_all[i - 1] + closure_dy
                     start = i
 
-        # Write back, preserving the original edge_df row order.
-        unfolded = pd.DataFrame(
-            {"sx": xs_all, "sy": ys_all, "tx": tx_all, "ty": ty_all},
-            index=idx_arr,
+        # Write back, preserving the original edge_df row order. Assign the
+        # stacked numpy array directly (positional alignment with idx_arr) —
+        # building an intermediate DataFrame just to call ``.to_numpy()`` on
+        # it was pure overhead.
+        sheet.edge_df.loc[idx_arr, ["sx", "sy", "tx", "ty"]] = np.column_stack(
+            (xs_all, ys_all, tx_all, ty_all)
         )
-        sheet.edge_df.loc[unfolded.index, ["sx", "sy", "tx", "ty"]] = unfolded.to_numpy()
 
         # 3) Recompute dx, dy from the unfolded positions
         sheet.edge_df["dx"] = sheet.edge_df["tx"] - sheet.edge_df["sx"]

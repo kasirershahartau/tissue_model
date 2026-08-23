@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Editors
+.idea/
+.vscode/
+
+# Credentials — never commit. SimulationsVM_key.pem is the Azure VM key and
+# belongs outside the repository altogether.
+*.pem
+*.key
+
+# Simulation output and analysis products. Results live under TISSUE_RESULTS_DIR
+# (D:\Kasirer\results by default), not in the tree; these patterns catch the
+# strays that land here. The tables are reproducible from the runs and are
+# submitted to the journal separately.
+*.hf5
+*.npy
+*.npz
+*.jsonl
+*.csv
+*.xlsx
+*.ods
+*.log
+*.out
+*.err
+*.png
+*.gif
+results/
+
+# Local run scaffolding
+*.bat
+*.sh
+environment.yml
+*.bak
+
+# The vendored tyssue is its own clone of github.com/damcb/tyssue, carrying our
+# upstream patches on its own branch. It must not be absorbed into this repo as
+# a gitlink or a copy — clone it alongside and point PYTHONPATH at tyssue/src.
+tyssue/
