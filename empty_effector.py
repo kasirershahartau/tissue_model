@@ -1,3 +1,9 @@
+"""An effector contributing no energy and no gradient.
+
+Useful as a placeholder when a model is assembled from a variable list of
+effectors: including this keeps the stack's shape fixed without changing the
+dynamics, which avoids branching on an empty list.
+"""
 from tyssue.dynamics.effectors import AbstractEffector, units
 import pandas as pd
 

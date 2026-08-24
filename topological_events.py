@@ -1,3 +1,28 @@
+"""Topology changes that PRESERVE existing indices, plus periodic variants.
+
+tyssue's topology operations renumber vertices, edges and faces as they go. That
+is fine for a single relaxation, but it makes a cell impossible to follow across
+frames — and following cells is the whole point when the question is which cell
+differentiated, or how one responded to its neighbour being removed. Every
+operation here therefore appends new elements and rewires in place, leaving the
+existing indices untouched.
+
+What that buys, and what it costs:
+
+* A cell keeps its identity for the lifetime of a run, so a history archive can
+  be read as trajectories rather than as unrelated frames.
+* Face labels are NOT compacted on removal, so the index set becomes sparse. Code
+  that assumes ``range(n_faces)`` will be wrong.
+
+Each operation is also ATOMIC: it snapshots the affected tables and restores them
+if any stage fails, so a partial rearrangement never survives. A half-applied T1
+leaves duplicate (source, target) pairs across two faces, which then surfaces far
+away as a confusing "duplicated edge" warning.
+
+Periodic sheets take separate paths (``_periodic_*``) because a neighbourhood can
+wrap the box: distances use the minimum image, and a T1 near the seam must
+consolidate the vertex labels of both images before rewiring.
+"""
 import numpy as np
 import pandas as pd
 from tyssue.topology.base_topology import drop_two_sided_faces, collapse_edge

@@ -19,8 +19,15 @@ from tyssue.draw.plt_draw import sheet_view
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
 
+# ImageMagick's ``convert`` silently fails to write when the output path grows
+# long, and Windows' classic MAX_PATH is 260; this leaves a margin below it.
 _MAX_GIF_PATH_LEN = 200
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\Kasirer\results")
+
+# Where run folders live: one sub-directory per run, each holding history.hf5 and
+# its parameters. Simulation archives reach several GB, so this usually points at
+# a data drive rather than the working copy.
+RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR",
+                             os.path.join(os.getcwd(), "results"))
 
 
 def load_history_file(load_name):

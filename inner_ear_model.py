@@ -1,8 +1,33 @@
-###### Creating varius types of models ##########
-# This file is a derivative of tyssue project with few chages:
-# 1. Adding virtual vertices to allow for round apical morphology
-# 2. Adding differential features by cell types
-# 3. Adding external forces
+"""A two-cell-type vertex model with differentiation, and the effectors it needs.
+
+Extends a tyssue vertex model in three ways:
+
+1. **Virtual vertices**, so cell borders can curve (see ``virtual_sheet``).
+2. **Per-type mechanics** — tension, contractility, area elasticity, preferred
+   area and repulsion are looked up per cell type, so primary and secondary cells
+   can differ mechanically, and a cell's parameters follow it when it
+   differentiates.
+3. **Differentiation**, by lateral inhibition, optionally gated by mechanical
+   stress (see ``lateral_inhibition_model``).
+
+The class assembles the effector stack, drives the solver, and exposes the
+measurements the coupling needs — per-cell stress, neighbour relations, contact
+lengths — plus archive and drawing helpers.
+
+Two effectors are defined here rather than taken from tyssue:
+
+* :class:`ContractilityPerimeterElasticity` — perimeter elasticity about a
+  preferred perimeter. With shape index 0 the preferred perimeter is 0 and this
+  reduces exactly to face contractility, Gamma/2 * P^2.
+* :class:`BoundaryBending` — penalises CURVATURE at virtual vertices rather than
+  length. Line tension is the obvious way to smooth a bond, but it also shortens
+  it, so it fights any elongation the geometry calls for; bending smooths without
+  that conflict.
+
+Vocabulary: cell types are stored as ``'HC'`` and ``'SC'`` and the signal columns
+as ``atoh_level`` / ``delta_level``, named for the biological system this was
+written for; read them as primary / secondary and signal.
+"""
 import os.path
 import sys
 import tyssue

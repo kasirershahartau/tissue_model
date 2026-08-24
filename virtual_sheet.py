@@ -1,3 +1,29 @@
+"""A Sheet whose bonds carry extra vertices, so cell borders can curve.
+
+A standard vertex model draws each cell border as a straight segment between two
+junction vertices, which forces every cell to be a polygon. Real apical surfaces
+are not: borders bow according to the pressure difference across them. This
+module inserts VIRTUAL vertices along a bond — vertices belonging to exactly two
+cells and no junction — so a border becomes a polyline that can bend.
+
+Virtual vertices are maintained, not placed once: an edge longer than
+``maximal_bond_length`` is split and one shorter than ``minimal_bond_length`` is
+collapsed, every step, so resolution follows the geometry as the tissue moves.
+
+Two consequences are easy to trip over:
+
+* **The count is large and mostly virtual.** Around 90% of vertices are virtual
+  in a typical sheet. Curvature is only visible while something sustains it — a
+  line tension, or a pressure difference between neighbours. With neither, bonds
+  relax to collinear within a couple of time units and cells look polygonal again
+  even though the vertices are still there.
+* **Topology must be index-preserving.** Cells are tracked across frames by
+  index, so the T1 transitions and vertex insertions here come from
+  ``topological_events`` rather than tyssue's, which renumber.
+
+Set ``periodic=True`` to build on :class:`periodic_sheet.PeriodicBoundarySheet`,
+which removes the boundary entirely.
+"""
 from scipy.spatial import Voronoi
 from tyssue import Sheet, config
 from tyssue.generation import from_2d_voronoi, hexa_grid2d

@@ -1,3 +1,31 @@
+"""Two-dimensional periodic boundary conditions for a tyssue Sheet.
+
+A tissue simulated in a finite box has an edge, and cells on that edge behave
+differently from interior ones — fewer neighbours, no opposing force, free to
+drift. Wrapping the box removes the boundary entirely: the sheet becomes a torus,
+every cell has a complete neighbourhood, and there is no population to exclude
+from a measurement.
+
+The representation keeps vertex coordinates inside the box and stores each edge's
+displacement (``dx``, ``dy``) as the MINIMUM IMAGE — the shortest of the nine
+candidate offsets between the two vertices. An edge whose endpoints sit on
+opposite sides of the box is therefore short, as it should be, and is flagged
+``is_periodic``.
+
+Two rules follow, and breaking either produces geometry that looks plausible and
+is wrong:
+
+* **Never take a difference of raw coordinates.** Use the stored displacements,
+  or the minimum-image helpers. A cell straddling the seam has vertices at both
+  ends of the box, so a naive subtraction gives a distance nearly the width of
+  the box.
+* **Polygon assembly follows the ``order`` column, not coordinates.** Sorting a
+  face's vertices by position cannot work when the face wraps; the edge order is
+  the only thing that survives the seam.
+
+Geometry updates go through :class:`PeriodicPlanarGeometry`, which applies the
+same rules when it recomputes areas, perimeters and centroids.
+"""
 import logging
 import numpy as np
 import pandas as pd

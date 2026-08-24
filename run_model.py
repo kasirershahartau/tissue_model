@@ -1,3 +1,28 @@
+"""Setting up, running and resuming simulations, and the run folder they live in.
+
+:func:`run` is the entry point: it builds a sheet (fresh, from a saved array, or
+continued from a frame of an earlier run), assembles the model, integrates, and
+writes a run folder containing ``history.hf5``, the parameters, a debug log and
+preview images.
+
+The parts that are not obvious:
+
+* **A run folder is named by its parameters**, hashed when the name would grow
+  too long for the filesystem, so the same parameters resolve to the same folder
+  and a repeated request can reuse the finished result instead of recomputing.
+* **Resuming is not the same as restarting.** ``continue_existing_run`` reads the
+  archive's last frame and carries the evolved state forward — including the
+  differentiation levels, which must NOT be re-seeded, or the pattern is silently
+  replaced by a fresh random one mid-run.
+* **Failure is reported, not absorbed.** A run whose solver dies re-raises rather
+  than returning a folder, so a caller scoring the output cannot mistake a
+  corrupt or truncated archive for a result.
+* **Long runs are bounded** by wall-clock and by progress rate, so a simulation
+  that stops advancing is stopped rather than occupying a worker indefinitely.
+
+Ablation is requested with ``ablated_cells``: those faces are removed once, at
+the start, and the tissue relaxes around the hole.
+"""
 import numpy as np
 import atexit
 import hashlib

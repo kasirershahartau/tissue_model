@@ -19,7 +19,9 @@ from tyssue import History, HistoryHdf5
 from virtual_sheet import VirtualSheet
 from history_io import get_time_points
 
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\Kasirer\results")
+# imported, not redefined: two copies of a configurable path drift apart the
+# first time one default is changed
+from history_io import RESULTS_DIR
 
 
 def find_non_boundary_cells(time_point_data):

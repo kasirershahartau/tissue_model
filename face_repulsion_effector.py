@@ -1,3 +1,14 @@
+"""A repulsive force between face centroids.
+
+Cells in a vertex model interact only through shared junctions, so two cells that
+are not neighbours feel nothing and can be driven into each other by other terms.
+This effector adds a short-range, steeply decaying repulsion between face
+centroids that resists that overlap.
+
+The force falls off as an inverse power (``repulsion_exp``) beyond
+``repulsion_distance``, and is applied per cell type, so it can act on one
+population and not another.
+"""
 from tyssue.dynamics.effectors import AbstractEffector, units, to_nd
 from tyssue.dynamics.planar_gradients import area_grad as area_grad_2d
 import numpy as np

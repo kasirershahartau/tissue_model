@@ -1,3 +1,12 @@
+"""Hand-run scenarios for the periodic sheet, kept separate from the test suite.
+
+These build a periodic tissue and drive it through situations that are awkward to
+assert on but easy to judge by eye — a cell crossing the seam, a T1 at the box
+edge, a wrapped division. They print and draw rather than assert.
+
+The automated coverage is in ``test_periodic.py``; this file is for looking at
+what the geometry actually does when something there fails.
+"""
 import atexit
 import logging
 import os, shutil, sys

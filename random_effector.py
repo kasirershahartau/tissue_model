@@ -1,3 +1,10 @@
+"""An effector applying an uncorrelated random force to every vertex.
+
+Adds noise to the dynamics — enough to dislodge a tissue sitting in a shallow
+local minimum, or to test that a result does not depend on a perfectly symmetric
+initial condition. It has no energy to speak of: only the gradient is meaningful,
+so it must not be used where the energy is minimised rather than integrated.
+"""
 from tyssue.dynamics.effectors import AbstractEffector, units
 import numpy as np
 import pandas as pd

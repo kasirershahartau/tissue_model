@@ -1,3 +1,25 @@
+"""Time integration, and the safety nets that stop a run producing nonsense.
+
+:class:`IVPSolver` advances the tissue viscously and, between steps, lets the
+topology handler act — splitting long bonds, collapsing short ones, resolving T1
+transitions. Because topology changes discontinuously, the step is adaptive: a
+step that produces invalid geometry is rejected and retried at a smaller ``dt``.
+
+Two failure modes matter enough to be checked explicitly, and they are not the
+same one:
+
+* **Inverted cells** — a face whose signed area has gone negative. Cheap to
+  detect and unambiguous.
+* **Folded cells** — a face whose perimeter crosses itself while its signed area
+  stays POSITIVE, because the two lobes partly cancel. The area test cannot see
+  this, yet it is exactly the "cells growing through each other" configuration.
+  :func:`count_folded_faces` catches it with a turning-number test, which is
+  sound for any simple polygon, convex or not.
+
+A run that cannot take a valid step even at the smallest ``dt`` raises rather
+than continuing, so a caller scoring the result never reads a corrupt sheet as
+data.
+"""
 import time
 import numpy as np
 from tyssue.solvers.viscous import EulerSolver, log

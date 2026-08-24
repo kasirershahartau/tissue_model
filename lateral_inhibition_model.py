@@ -1,3 +1,29 @@
+"""Lateral-inhibition differentiation coupled to the tissue's mechanics.
+
+Neighbouring cells compete: a cell producing more of the differentiation signal
+(``delta``) suppresses production in the cells it touches (via ``notch`` and a
+repressor). Small initial differences amplify until a salt-and-pepper pattern of
+primary cells (high signal) scattered through secondary cells (low signal)
+emerges. A cell is called primary once its signal passes a threshold.
+
+Coupling is by CONTACT LENGTH, not neighbour count: a cell that shares a long
+border with a neighbour inhibits it more than one touching at a corner. Contact
+lengths are normalised by ``length_normalization_factor`` (L0), the mean cell
+perimeter of the first frame, so the strength of inhibition does not change
+merely because the tissue was built at a different scale.
+
+MECHANOSENSITIVITY. Signal production can additionally be gated by the cell's own
+mechanical stress, through a Hill function of the stress computed from
+``stress_effectors``. ``mechanosensitivity`` is the gate's half-max: at that
+stress the gate is half open, below it production is suppressed, above it
+permitted. Setting it to zero disables the coupling and recovers pure lateral
+inhibition. This is what lets a mechanical perturbation — an ablation, say —
+change where cells differentiate, rather than only how the tissue relaxes.
+
+Note the vocabulary: the stored columns are named for the biological system this
+was written for (``atoh_level``, ``delta_level``, cell types ``'HC'``/``'SC'``),
+and read as signal / primary / secondary in general use.
+"""
 import numpy as np
 from scipy.integrate import solve_ivp
 
