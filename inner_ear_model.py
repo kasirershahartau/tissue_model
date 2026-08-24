@@ -403,11 +403,11 @@ class InnerEarModel:
         # L0 (mean cell perimeter) is still computed and passed to the
         # lateral-inhibition model below, where the LI equations KEEP their L0
         # normalization (face stress / L0, and the L0/perimeter contact terms).
-        # But MECHANICAL parameters are now used AS GIVEN — NOT length-normalized.
-        # The old ``preferred_area *= L0**2`` / ``repulsion_distance *= L0``
-        # scalings inflated the preferred area by ~L0^2 (~12x here), leaving the
-        # whole tissue compressed (it would expand on a cut, opposite to the
-        # experiment's ~10% shrinkage).
+        # But MECHANICAL parameters are used AS GIVEN — NOT length-normalized.
+        # Scaling them by L0 as well (``preferred_area *= L0**2``,
+        # ``repulsion_distance *= L0``) inflates the preferred area by ~L0^2 and
+        # leaves the tissue compressed, so it EXPANDS when cut instead of
+        # relaxing inward.
         length_normalization_factor = self.get_average_face_perimeter()
         if preferred_area_override is not None:
             # Optional: set the effective preferred area DIRECTLY (e.g. a fraction

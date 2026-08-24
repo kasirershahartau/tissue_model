@@ -557,11 +557,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     if bending is not None:
         effectors = effectors + [BoundaryBending]
     # Preferred cell area = area of a circle whose radius is HALF the lattice
-    # unit (distx = disty = 1, so radius 0.5): pi * 0.5**2 = pi/4 ~ 0.785, which
-    # matches the actual mean cell area of the saved arrays (~0.76). NOTE: this
-    # was previously a typo `1/(4*pi)` ~ 0.0796 — ~10x too small, which drove
-    # every cell to shrink hard, made the periodic tiling jagged, and triggered
-    # the sharp-corner collapse cascade (see [[sharp-corner-collapse-prevents-folds]]).
+    # unit (distx = disty = 1, so radius 0.5): pi * 0.5**2 = pi/4 ~ 0.785, close
+    # to the mean cell area of a generated array (~0.76). Do not "simplify" this
+    # to 1/(4*pi): that is ~10x too small, and every cell then shrinks hard
+    # enough to make the tiling jagged and set off the sharp-corner collapse.
     preferred_area = {'HC': np.pi / 4,
                       'SC': np.pi / 4}
     contractility = {'HC': gammaSC * gammaHC_ratio,
@@ -1272,10 +1271,12 @@ def _li_levels_kwargs_for_initial_sheet(initial_sheet_name):
 
 
 def _load_saved_threshold(initial_sheet_name, results_dir=None):
-    """Read the per-array HC/SC classification threshold written next to a
-    model's history archive at ``<RESULTS_DIR>/<initial_sheet_name>/threshold.npy``
-    (see :func:`post_processing.save_li_levels_from_best_pval_jsonl`, which
-    fills it from the JSONL ``D_threshold_mean``). Returns the scalar float;
+    """Read the per-array cell-type classification threshold written next to a
+    model's history archive at ``<RESULTS_DIR>/<initial_sheet_name>/threshold.npy``.
+
+    The threshold is a property of the array, not of a run: it is chosen once
+    when the array's differentiation levels are seeded, and every run starting
+    from that array classifies cells the same way. Returns the scalar float;
     raises ``FileNotFoundError`` if the file is absent.
 
     ``results_dir`` defaults to the module-level :data:`RESULTS_DIR`, resolved at
@@ -1286,9 +1287,9 @@ def _load_saved_threshold(initial_sheet_name, results_dir=None):
     path = os.path.join(results_dir, initial_sheet_name, "threshold.npy")
     if not os.path.isfile(path):
         raise FileNotFoundError(
-            "No saved threshold for initial sheet %r at %s. Generate it with "
-            "post_processing.save_li_levels_from_best_pval_jsonl, or call "
-            "find_mechanical_parameters with use_saved_threshold=False."
+            "No saved threshold for initial sheet %r at %s. Write one alongside "
+            "the array's differentiation levels, or pass the threshold "
+            "explicitly instead of asking for the saved one."
             % (initial_sheet_name, path))
     return float(np.load(path))
 

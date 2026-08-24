@@ -66,10 +66,10 @@ class LateralInhibitionModel:
         self.stress_shift = stress_shift
         # Hill exponent for the MECHANOSENSITIVITY gate only. None -> self.m (3),
         # an exact no-op. It is separate from self.m because that exponent is also
-        # used by the repressor and Atoh1 Hills, so raising it globally would
-        # change the whole LI model. A larger value sharpens the stress switch,
-        # which is what lets one psigma leave E17.5 untouched while gating P0
-        # (their isolated-SC stresses differ by only ~0.003).
+        # used by the repressor and signal Hills, so raising it globally would
+        # change the whole lateral-inhibition model. A larger value sharpens the
+        # stress switch, which is what allows one threshold to separate two
+        # populations whose stresses differ only slightly.
         self.stress_hill_exponent = stress_hill_exponent
 
     def get_maximal_delta_level(self):
@@ -141,9 +141,9 @@ class LateralInhibitionModel:
             # enough that solve_ivp never returns - a HANG, not a crash, which is
             # exactly how it presented. A dying cell is not signalling anyway, so
             # drop it from the coupling and give it a harmless unit perimeter.
-            # No-op whenever nothing is being ablated or delaminated, which is why
-            # this never surfaced: the mechanical fit's ablation runs all pass
-            # no_differentiation=True, so this ODE never ran beside a dying cell.
+            # A no-op whenever nothing is being ablated or delaminated, so it only
+            # matters when differentiation is active at the same time as a cell is
+            # dying.
             dying = (sheet.face_df["type"].to_numpy() == -1)
             if dying.any():
                 contact_matrix = contact_matrix.copy()

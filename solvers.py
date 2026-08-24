@@ -471,11 +471,11 @@ class IVPSolver(EulerSolver):
                 # tissue develops (divisions / rearrangements via the topology
                 # manager below), exactly as before this safety net existed — so
                 # by default we TOLERATE them at the floor and carry on. A
-                # mechanics-only parameter fit, where a fold means cells
+                # mechanics-only parameter search, where a fold means cells
                 # over-packed past the available area and nothing will resolve
                 # it, can opt into the strict behaviour
                 # (tolerate_unavoidable_folds=False) so dt collapse raises and
-                # the fit worker scores those parameters worst-case.
+                # the caller can score those parameters as a failure.
                 n_folded = count_folded_faces(self.eptm)
                 new_folds = n_folded - prev_folded
                 if new_folds > 0:

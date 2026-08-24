@@ -2428,7 +2428,7 @@ class TestOrderAllEdgesGroupedEquivalence:
 
 
 class TestDropCorruptedSnapshots:
-    """``post_processing.drop_corrupted_snapshots`` removes snapshots
+    """``history_io.drop_corrupted_snapshots`` removes snapshots
     whose face table carries a non-positive area — the fingerprint of
     a failed non-periodic resume that re-recorded unwrapped (negative
     area) geometry over a good snapshot."""
@@ -3048,7 +3048,7 @@ _EXAMPLE_ARTEFACT_DIRS = _find_example_artefact_dirs()
 
 class TestSavedTimePointArtefactsConsistent:
     """The three artefacts written by
-    ``post_processing.save_data_of_a_given_time_point``:
+    ``history_io.save_data_of_a_given_time_point``:
 
     * ``<name>.hf5`` — a single-snapshot ``HistoryHdf5`` archive
       built from ``extract_time_point_to_new_history``;
@@ -4940,23 +4940,6 @@ class TestShortRunFolderName:
 
 
 
-class TestSaveLILevelsFromJsonl:
-    """``post_processing.save_li_levels_from_best_pval_jsonl`` extracts the
-    per-cell N_final/D_final/R_final lists (entry i -> cell with unique_id i)
-    from a ``*_best_pval_per_array.jsonl`` file and writes them as
-    notch/delta/repressor ``_levels.npy`` in each matching model folder."""
-
-    @staticmethod
-    def _make_model_folder(results_dir, n_cells, array_index=1, dev_stage="E17"):
-        # A cells_info.pkl indexed by unique_id 0..n-1 is enough for the
-        # length check (no need to fabricate a full history archive).
-        folder = results_dir / ("random_periodic_array%d_for_%s"
-                                % (array_index, dev_stage))
-        folder.mkdir(parents=True)
-        ci = pd.DataFrame({"x": np.arange(n_cells)},
-                          index=pd.Index(range(n_cells), name="unique_id"))
-        ci.to_pickle(folder / "cells_info.pkl")
-        return folder
 
 
 
@@ -5062,24 +5045,6 @@ class TestAblationAreaChangeUnionFix:
 
 
 
-class TestComparePooledMechanics:
-    """``compare_pooled_model_mechanics_to_experiments`` scores each term by the
-    standardized mean discrepancy ``z = (mean_model - mean_exp) / SEM_exp``, where
-    ``SEM_exp`` is the standard error of the experimental biological-repeat means.
-    ``z`` is nan when a term can't be scored (no model data, <2 repeats, zero SEM)."""
-
-    @staticmethod
-    def _stub_exp(monkeypatch, repeat_means, n_per=50):
-        # experimental repeats whose per-repeat means are `repeat_means`.
-        import history_io as pp
-        monkeypatch.setattr(pp, "load_experimental_results",
-                            lambda stage, t: [np.full(n_per, m) for m in repeat_means])
-
-    @staticmethod
-    def _mt(**terms):
-        base = {t: [] for t in ("roundness_ratio", "ablation_ratio", "shrinkage")}
-        base.update(terms)
-        return base
 
 
 

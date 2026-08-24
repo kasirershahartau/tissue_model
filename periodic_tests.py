@@ -15,7 +15,7 @@ from tyssue import HistoryHdf5
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
-from post_processing import create_gif_safe, RESULTS_DIR
+from history_io import create_gif_safe, RESULTS_DIR
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 
 
