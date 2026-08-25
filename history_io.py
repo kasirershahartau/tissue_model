@@ -72,6 +72,24 @@ def _shorten_gif_output(output, max_path_len=_MAX_GIF_PATH_LEN):
         short_base = stem[:keep] + "_" + digest + ext
     return os.path.join(directory, short_base)
 
+def annotate_time(ax, t, fmt="t = %.2f"):
+    """Write the frame's simulation time in the bottom-right of the axes.
+
+    Placed in AXES coordinates rather than data coordinates so it lands in the
+    same corner whatever the tissue's extent, and so it stays put across frames
+    as the tissue moves — a label positioned in data coordinates would drift and
+    could end up over the cells.
+
+    It sits inside the margin that create_gif_safe leaves around the tissue, so
+    it falls on background rather than on a cell. With ``margin`` set to a
+    negative value there is no such gap and the label may overlap the tissue.
+    """
+    if not isinstance(ax, plt.Axes):
+        return
+    ax.text(0.98, 0.02, fmt % t, transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=11, color="0.25", zorder=10)
+
+
 def create_gif_safe(history, output, num_frames=None, interval=None,
                     draw_func=None, margin=5, duration=100, **draw_kwds):
     """Drop-in replacement for :func:`tyssue.draw.plt_draw.create_gif` that
@@ -122,7 +140,7 @@ def create_gif_safe(history, output, num_frames=None, interval=None,
         start, stop = (None, None) if interval is None else (interval[0], interval[1])
 
         frames = []
-        for i, (_t, sheet) in enumerate(history.browse(start, stop, num_frames)):
+        for i, (t, sheet) in enumerate(history.browse(start, stop, num_frames)):
             try:
                 fig, ax = draw_func(sheet, **draw_kwds)
             except Exception as exc:            # one bad frame must not kill the gif
@@ -130,6 +148,7 @@ def create_gif_safe(history, output, num_frames=None, interval=None,
                 continue
             if isinstance(ax, plt.Axes) and margin >= 0:
                 ax.set(xlim=xlim, ylim=ylim)
+            annotate_time(ax, t)
             path = os.path.join(graph_dir, "movie_%04d.png" % i)
             fig.savefig(path)
             plt.close(fig)
@@ -162,8 +181,10 @@ def redraw(load_name, save_name, movie=True, maximal_number_of_frames_to_save=10
     static_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
                                          arrange_sheet=False, color_by=color_by, maximal_level=maximal_level)
     fig1, ax1 = static_draw_func(initial_sheet)
+    annotate_time(ax1, 0.0)
     plt.savefig("%s_initial.png" % save_path)
-    fig2, ax2 =static_draw_func(final_sheet)
+    fig2, ax2 = static_draw_func(final_sheet)
+    annotate_time(ax2, last_time_point)
     plt.savefig("%s_finale.png" % save_path)
     if movie:
         gif_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
