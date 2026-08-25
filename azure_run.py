@@ -374,7 +374,7 @@ def _bounds(v):
 def _cmd_find_mech(args):
     _ensure_repo_cwd()
     _check_environment()
-    from run_model import find_mechanical_parameters
+    from v1_bayesian_fit import find_mechanical_parameters
     initial_sheets = args.initial_sheets
     if initial_sheets is None and args.indices is None:
         # mirror run_model.__main__: random_periodic_array{i}_for_{E17|P0}
