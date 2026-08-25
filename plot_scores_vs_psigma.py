@@ -55,7 +55,9 @@ def read_runs_csv():
 
 def main():
     df = read_runs_csv()
-    ok = df[df["error"].fillna("") == ""]
+    # incomplete runs are dropped when the table is written, so the column
+    # may be absent from the saved file
+    ok = df[df["error"].fillna("") == ""] if "error" in df.columns else df
     print("%d run(s), %d psigma value(s), stages %s"
           % (len(ok), ok["psigma"].nunique(), sorted(ok["stage"].dropna().unique())))
 

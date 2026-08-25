@@ -51,7 +51,9 @@ FULL_POINTS = (0.0, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18)
 
 def build(repeats):
     runs = pd.read_pickle(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
-    runs = runs[runs["error"].fillna("") == ""]
+    # incomplete runs are dropped when the table is written, so the column
+    # may be absent from the saved file
+    runs = runs[runs["error"].fillna("") == ""] if "error" in runs.columns else runs
     runs = runs[runs["repeat"] <= repeats]
     have = (runs.groupby(["stage", "psigma"])["repeat"].nunique()
             .groupby("psigma").min())

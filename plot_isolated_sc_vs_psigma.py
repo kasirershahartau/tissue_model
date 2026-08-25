@@ -40,7 +40,9 @@ OUT_CSV = "isolated_sc_vs_psigma.csv"
 
 def main():
     df = read_runs_csv()
-    ok = df[df["error"].fillna("") == ""]
+    # incomplete runs are dropped when the table is written, so the column
+    # may be absent from the saved file
+    ok = df[df["error"].fillna("") == ""] if "error" in df.columns else df
     ok = ok.assign(iso_t0=100.0 * ok["n_SC_no_HC_neighbour_t0"] / ok["n_SC_t0"],
                    iso_t0_cells=100.0 * ok["n_SC_no_HC_neighbour_t0"] / ok["n_cells_t0"])
     print("%d run(s), %d psigma value(s)" % (len(ok), ok["psigma"].nunique()))
