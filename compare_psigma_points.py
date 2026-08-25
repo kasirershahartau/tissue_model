@@ -43,7 +43,10 @@ def main():
     a = ap.parse_args()
 
     runs = pd.read_pickle(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
-    runs = runs[runs["error"].fillna("") == ""]
+    # incomplete runs are dropped when the table is written, so the column is
+    # absent from the saved file
+    if "error" in runs.columns:
+        runs = runs[runs["error"].fillna("") == ""]
     if a.psigma is not None:
         want = {round(float(p), 6) for p in a.psigma}
         runs = runs[runs["psigma"].round(6).isin(want)]

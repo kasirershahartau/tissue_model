@@ -388,7 +388,10 @@ def _mean_sem(v):
 
 def psigma_table(df, drop_collapsed=False):
     rows = []
-    ok = df[df["error"].fillna("") == ""]
+    # The saved runs table has no ``error`` column: incomplete runs are dropped
+    # as rows before saving, so there is nothing left to filter. The in-memory
+    # frame built during a pass still has it.
+    ok = df[df["error"].fillna("") == ""] if "error" in df.columns else df
     if drop_collapsed:
         ok = ok[~ok["collapsed"].astype(bool)]
     for (stage, ps), g in ok.groupby(["stage", "psigma"]):
@@ -446,6 +449,51 @@ def psigma_table(df, drop_collapsed=False):
             row["%s_chi2" % lab] = chi2
         rows.append(row)
     return pd.DataFrame(rows).sort_values(["stage", "psigma"]).reset_index(drop=True)
+
+
+def _prune_for_output(df, pdf):
+    """Trim the SAVED tables to the columns worth reading.
+
+    Applied at save time only: psigma_table() keeps returning everything, because
+    the figures compute their own table from the runs and rely on the
+    ``*_undefined_terms`` flags to tell a dead parameter point from a good fit.
+    The CSV cache also keeps every column, so nothing is lost — this shapes the
+    deliverable, not the data.
+
+    Incomplete runs are dropped as ROWS, not just flagged. They are empty run
+    folders left by a crashed batch, and with them gone the ``error`` column has
+    nothing left to say.
+    """
+    n_before = len(df)
+    if "error" in df.columns:
+        df = df[df["error"].fillna("") == ""].copy()
+    dropped = n_before - len(df)
+
+    # The 0/1 buckets and the "exactly" columns are the same numbers under two
+    # names; keep the plain form. Counts above 3 are zero across all 30556
+    # events, so those columns carry nothing.
+    ren = {}
+    for k in (2, 3):
+        for pre in ("n", "pct"):
+            src = "%s_events_exactly_%d_HC_neighbours" % (pre, k)
+            if src in df.columns:
+                ren[src] = "%s_events_%d_HC_neighbours" % (pre, k)
+    df = df.rename(columns=ren)
+
+    drop = ["K_stress_shift", "hill_exponent", "gammaHC_ratio", "alphaHC_ratio",
+            "hc_shape_index", "sc_shape_index", "bending", "atoh_threshold",
+            "error", "n_events_recorded"]
+    for pre in ("n", "pct"):
+        drop += ["%s_events_2plus_HC_neighbours" % pre,
+                 "%s_events_more_than_%d_HC_neighbours" % (pre, MAX_NB)]
+        drop += ["%s_events_exactly_%d_HC_neighbours" % (pre, k)
+                 for k in (0, 1) + tuple(range(4, MAX_NB + 1))]
+    df = df.drop(columns=[c for c in drop if c in df.columns])
+
+    pdf = pdf.drop(columns=[c for c in pdf.columns if c.endswith("_undefined_terms")])
+    print("\n  pruned for output: %d incomplete run(s) dropped, "
+          "runs -> %d cols, psigma -> %d cols" % (dropped, df.shape[1], pdf.shape[1]))
+    return df, pdf
 
 
 def main():
@@ -588,6 +636,8 @@ def main():
         edf = edf[edf["model_name"].isin(all_names)].drop_duplicates(
             ["model_name", "cell_id", "t_differentiated"], keep="last")
         edf.to_pickle(os.path.join(RESULTS_DIR, "fullmodel_events.pkl"))
+
+    df, pdf = _prune_for_output(df, pdf)
 
     df.to_pickle(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
     pdf.to_pickle(os.path.join(RESULTS_DIR, "fullmodel_psigma.pkl"))
