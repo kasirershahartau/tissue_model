@@ -4,7 +4,9 @@
     python build_ablation_table.py --json ablate_psigma_repeats_v2.json
 
 Writes to <results>/:
-    ablation_tables.xlsx     sheets: overall, runs, events
+    ablation_tables.xlsx     sheets: overall, runs, events, plus any
+                             distance_vs_experiment* sheet already in the
+                             workbook (see ABLATION_SHEETS)
     ablation_overall.pkl     one row per (stage, psigma)
     ablation_runs.pkl        one row per ablation
     ablation_events.pkl      one row per differentiating cell
@@ -45,6 +47,14 @@ from post_processing import (RESULTS_DIR, get_non_boundary_cell_ids_from_type,
                              calc_contact_with_neighbors_from_type)
 from run_model import load_sheet_from_file
 from ablate_single_hc import TYPE_BY, THRESHOLD, BOX
+from build_experimental_tables import carried_over_sheets, to_output_names
+
+# added by compare_ablation_distance_to_experiment.py: (pickle, sheet)
+ABLATION_SHEETS = [("ablation_distance_vs_experiment", "distance_vs_experiment"),
+                   ("ablation_distance_vs_experiment_runs",
+                    "distance_vs_experiment_runs"),
+                   ("ablation_distance_vs_experiment_exp",
+                    "distance_vs_experiment_exp")]
 
 IN_JSON = "ablate_from_strict.json"
 CUTOFFS = (1.5, 2.5, 4.0, 6.0)
@@ -102,7 +112,10 @@ def build(records, with_context=True):
         base = dict(stage=rec.get("stage"), psigma=rec.get("psigma"),
                     initial_array=rec.get("array"), repeat=rec.get("repeat"),
                     run_folder=rec.get("folder"),
-                    source_run=rec.get("source"), t_strict=rec.get("t_strict"),
+                    source_run=rec.get("source"),
+                    # a time on the SOURCE run's clock: where the fork was taken.
+                    # NOT comparable with t_differentiated, which is the fork's own.
+                    t_strict_in_source=rec.get("t_strict"),
                     ablated_label=rec.get("ablated_label"), seed=rec.get("seed"),
                     error=rec.get("error") or "")
         if rec.get("error"):
@@ -125,8 +138,12 @@ def build(records, with_context=True):
                 distance=float(e["distance"]),
                 distance_rel_half_box=(float(e["distance"]) / half
                                        if np.isfinite(half) and half else np.nan),
+                # The fork restarts its clock at 0 and the ablation happens at
+                # its t = 0, so this IS the time since the ablation. It used to
+                # subtract t_strict, which belongs to the SOURCE run's clock —
+                # mixing the two made almost every value negative.
                 t_differentiated=float(e["t_differentiated"]),
-                dt_since_ablation=float(e["t_differentiated"]) - float(rec["t_strict"]),
+                dt_since_ablation=float(e["t_differentiated"]),
                 touched_ablated_cell=cid in touching,
                 n_HC_neighbours_pre=ctx.get("n_HC_neighbours_pre", np.nan),
                 area_pre=ctx.get("area_pre", np.nan),
@@ -215,12 +232,58 @@ def build(records, with_context=True):
             row["pct_events_touching_ablated"] = (
                 100.0 * float(ge["touched_ablated_cell"].astype(bool).mean())
                 if len(ge) else np.nan)
-        m, s = _mean_sem(g["t_strict"])
-        row.update(t_strict_mean=m, t_strict_sem=s)
+        m, s = _mean_sem(g["t_strict_in_source"])
+        row.update(t_strict_in_source_mean=m, t_strict_in_source_sem=s)
         over_rows.append(row)
     overall = pd.DataFrame(over_rows)
     if len(overall):
         overall = overall.sort_values(["stage", "psigma"]).reset_index(drop=True)
+    return overall, runs, events
+
+
+def _prune_for_output(overall, runs, events):
+    """Trim the saved tables: failed ablations out, dead and duplicate columns out.
+
+    An ablation whose run died carries no events and no measurements, so it is
+    dropped as a ROW rather than flagged — and the error column then has nothing
+    to say. The record of what failed stays in ablate_from_strict.json.
+
+    ``t_differentiated`` and ``dt_since_ablation`` are now the same number (the
+    fork's clock starts at the ablation), so only the named one is kept.
+
+    The per-count HC-neighbour columns beyond 2 are zero for every event, and the
+    2plus bucket is redundant once the exact counts are there.
+    """
+    n_before = len(runs)
+    if "error" in runs.columns:
+        runs = runs[runs["error"].fillna("").astype(str) == ""].copy()
+    dropped = n_before - len(runs)
+    kept = set(runs["run_folder"])
+    events = events[events["run_folder"].isin(kept)].copy()
+
+    # box geometry is a property of the setup, identical on every row
+    dead = ["error", "Lx", "Ly", "t_differentiated"]
+    runs = runs.drop(columns=[c for c in dead if c in runs.columns])
+    events = events.drop(columns=[c for c in dead if c in events.columns])
+
+    ren = {}
+    for k in (2, 3):
+        for pre in ("n", "pct"):
+            src = "%s_events_exactly_%d_HC_neighbours_pre" % (pre, k)
+            if src in overall.columns:
+                ren[src] = "%s_events_%d_HC_neighbours_pre" % (pre, k)
+    overall = overall.rename(columns=ren)
+    drop_o = []
+    for pre in ("n", "pct"):
+        drop_o += ["%s_events_2plus_HC_neighbours_pre" % pre,
+                   "%s_events_more_than_%d_HC_neighbours_pre" % (pre, MAX_NB)]
+        drop_o += ["%s_events_exactly_%d_HC_neighbours_pre" % (pre, k)
+                   for k in (0, 1) + tuple(range(4, MAX_NB + 1))]
+    overall = overall.drop(columns=[c for c in drop_o if c in overall.columns])
+
+    print("\n  pruned: %d failed ablation(s) dropped; overall -> %d cols, "
+          "runs -> %d cols, events -> %d cols"
+          % (dropped, overall.shape[1], runs.shape[1], events.shape[1]))
     return overall, runs, events
 
 
@@ -243,6 +306,11 @@ def main():
 
     overall, runs, events = build(records, with_context=a.context)
 
+    overall, runs, events = _prune_for_output(overall, runs, events)
+    # published under the manuscript's name for the parameter
+    overall, runs, events = (to_output_names(f)
+                             for f in (overall, runs, events))
+
     for name, frame in (("overall", overall), ("runs", runs), ("events", events)):
         frame.to_pickle(os.path.join(RESULTS_DIR, "%s_%s.pkl" % (a.prefix, name)))
     xlsx = os.path.join(RESULTS_DIR, "%s_tables.xlsx" % a.prefix)
@@ -251,6 +319,13 @@ def main():
             overall.to_excel(writer, sheet_name="overall", index=False)
             runs.to_excel(writer, sheet_name="runs", index=False)
             events.to_excel(writer, sheet_name="events", index=False)
+            # The comparison against the experiment is computed elsewhere, by
+            # compare_ablation_distance_to_experiment.py, and adds its sheets to
+            # this workbook. Rewriting the workbook would drop them, so they are
+            # carried over from the pickles it left behind.
+            for name, frame in carried_over_sheets(ABLATION_SHEETS):
+                frame.to_excel(writer, sheet_name=name, index=False)
+                print("  carried over sheet %s (%d rows)" % (name, len(frame)))
     except Exception as exc:                            # noqa: BLE001
         print("  xlsx failed (%s: %s); the pickles are written"
               % (type(exc).__name__, exc))

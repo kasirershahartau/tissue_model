@@ -52,6 +52,8 @@ from post_processing import (RESULTS_DIR, experimental_results_folder,
                              _best_matching_frame_by_neighbor_pairs,
                              _exp_neighbor_pair_percentages, _nsigma_and_chi2,
                              calc_HC_neighbors_at_differentiation)
+from build_experimental_tables import (carried_over_sheets, FULLMODEL_SHEETS,
+                                       to_output_names)
 from build_run_table import read_parameters, _num, stage_of, array_of
 from run_model import _reached_steady_state
 from run_psigma_repeats import REPEAT_PREFIX
@@ -638,6 +640,9 @@ def main():
         edf.to_pickle(os.path.join(RESULTS_DIR, "fullmodel_events.pkl"))
 
     df, pdf = _prune_for_output(df, pdf)
+    # published under the manuscript's name for the parameter; readers map it
+    # back with build_experimental_tables.read_table
+    df, pdf, edf = (to_output_names(f) for f in (df, pdf, edf))
 
     df.to_pickle(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
     pdf.to_pickle(os.path.join(RESULTS_DIR, "fullmodel_psigma.pkl"))
@@ -645,11 +650,17 @@ def main():
     try:
         with pd.ExcelWriter(xlsx) as writer:
             df.to_excel(writer, sheet_name="runs", index=False)
-            pdf.to_excel(writer, sheet_name="psigma", index=False)
+            pdf.to_excel(writer, sheet_name="pT", index=False)
             if len(edf):
                 # one row per differentiation event; ~30k rows, well inside
                 # Excel's sheet limit
                 edf.to_excel(writer, sheet_name="events", index=False)
+            # the experimental targets the scores compare against, written by
+            # build_experimental_tables.py; carried over so rewriting this
+            # workbook does not drop them
+            for name, frame in carried_over_sheets(FULLMODEL_SHEETS):
+                frame.to_excel(writer, sheet_name=name, index=False)
+                print("  carried over sheet %s (%d rows)" % (name, len(frame)))
     except Exception as exc:                            # noqa: BLE001
         print("  xlsx failed (%s: %s); the pickles and the CSV are written"
               % (type(exc).__name__, exc))

@@ -43,6 +43,7 @@ from post_processing import (RESULTS_DIR, load_history_file, get_time_points,
                              relaxed_cut_scale, _hc_over_mean_sc,
                              load_experimental_results, _finite_arrays,
                              _MECHANICS_EXPERIMENTAL_TYPE)
+from build_experimental_tables import carried_over_sheets, MECHANICS_SHEETS
 from build_run_table import read_parameters as read_params
 from run_model import _reached_steady_state
 
@@ -94,6 +95,27 @@ def mean(x):
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     return float(x.mean()) if x.size else float("nan")
+
+
+def ablation_measured(hc_area_change, sc_area_change):
+    """Did the ablation actually move anything?
+
+    In some archives the post-ablation frame IS the pre-ablation frame, so every
+    cell's area is unchanged: each area-change ratio is exactly 1, and the
+    HC-over-mean-SC ratio comes out as a meaningless 1.0 with zero spread. That
+    is not a measurement of anything, and averaging it in pulls a parameter
+    point's ablation ratio towards 1.
+
+    The mechanical fit already skipped those sheets for the ablation term while
+    keeping their perfectly good roundness (see mechanics_eval), which is why
+    dropping them reproduces the stored per-term chi^2 exactly. This is the same
+    test, in one place, for the builder and for patch_mechanics_ablation.py.
+    """
+    for v in (hc_area_change, sc_area_change):
+        if v is None or not len(np.asarray(v, float)):
+            return False
+    return not (np.allclose(np.asarray(hc_area_change, float), 1.0)
+                and np.allclose(np.asarray(sc_area_change, float), 1.0))
 
 
 def ablation_partners():
@@ -187,8 +209,17 @@ def per_cell_ablation(abl_folder, ablated_cells, th):
     final.arrange_sheet_from_history()
     a0 = initial.get_face_area()
     a1 = final.get_face_area()
-    alive = set(final.face_df["id"].to_numpy().tolist())
     id_of = initial.face_df["id"]
+    # id -> face_df label, per frame, restricted to faces that still HAVE an area.
+    # An ablated face keeps its row in face_df but loses its edges, so it drops
+    # out of get_face_area() while still appearing in face_df and in any "alive"
+    # set derived from it. Keying off the area index is what makes a removed cell
+    # actually absent here.
+    ini_label_of_id = {int(i): lab for lab, i in initial.face_df["id"].items()
+                       if lab in a0.index}
+    fin_label_of_id = {int(i): lab for lab, i in final.face_df["id"].items()
+                       if lab in a1.index}
+    alive = set(fin_label_of_id)
     rows, seen = [], {}
     for ablated in ablated_cells:
         try:
@@ -205,19 +236,23 @@ def per_cell_ablation(abl_folder, ablated_cells, th):
             continue
         ids = initial.face_df.loc[neigh, "id"].to_numpy()
         for ctype in ("HC", "SC"):
-            _i, labels = get_non_boundary_cell_ids_from_type(
+            # NOTE the second return value is persistent IDs, not face_df labels.
+            # They coincide in a freshly built sheet, which is why treating them
+            # as labels worked until a run had faces REMOVED — an ablation run
+            # always does, so every lookup below goes through the id->label maps.
+            _i, cell_ids = get_non_boundary_cell_ids_from_type(
                 initial, cell_type=ctype, type_by=TYPE_BY, threshold=th,
                 only_for_these_cells=ids)
-            for lab in labels:
-                cid = int(id_of.loc[lab])
+            for cid in cell_ids:
+                cid = int(cid)
                 if cid not in alive:
                     continue
-                fin = final.face_df.index[final.face_df["id"] == cid]
-                if not len(fin):
+                ini_lab, fin_lab = ini_label_of_id.get(cid), fin_label_of_id.get(cid)
+                if ini_lab is None or fin_lab is None:
                     continue
-                before, after = float(a0.loc[lab]), float(a1.loc[fin[0]])
+                before, after = float(a0.loc[ini_lab]), float(a1.loc[fin_lab])
                 rows.append(dict(ablated_cell=int(ablated), face_id=cid,
-                                 face_index=int(lab), cell_type=ctype,
+                                 face_index=int(ini_lab), cell_type=ctype,
                                  area_before=before, area_after=after,
                                  area_ratio=after / before if before else float("nan"),
                                  n_ablated_neighbours=seen.get(cid, 1)))
@@ -262,7 +297,14 @@ def one_run(args):
             hc_a, sc_a = calc_area_change_after_ablation(
                 load_history_file(abl_folder), abl_folder, ablated_cells=list(cells),
                 end_time=-1, type_by=TYPE_BY, threshold=th)
-            a_ratio = _hc_over_mean_sc(hc_a, sc_a)
+            if not ablation_measured(hc_a, sc_a):
+                # The archive's post-ablation frame is the pre-ablation one, so
+                # every area is unchanged and the ratio would be a meaningless
+                # exactly-1.0. Record nothing rather than that; see
+                # ablation_measured.
+                hc_a = sc_a = None
+            else:
+                a_ratio = _hc_over_mean_sc(hc_a, sc_a)
 
         row = dict(
             run_folder=folder, ablation_folder=abl_folder or "", stage=stage,
@@ -282,6 +324,7 @@ def one_run(args):
             sc_roundness_mean=mean(sc_r), sc_roundness_sem=sem(sc_r),
             roundness_ratio_mean=mean(ratio) if ratio is not None else np.nan,
             roundness_ratio_sem=sem(ratio) if ratio is not None else np.nan,
+            ablation_measured=bool(abl_folder) and a_ratio is not None,
             n_HC_near_ablation=len(hc_a) if hc_a is not None else 0,
             n_SC_near_ablation=len(sc_a) if sc_a is not None else 0,
             hc_area_change_mean=mean(hc_a) if hc_a is not None else np.nan,
@@ -353,10 +396,32 @@ def main():
             if os.path.isfile(f):
                 os.remove(f)
 
+    _cols = {}
+
     def append(path, records):
-        if records:
-            pd.DataFrame(records).to_csv(path, mode="a", index=False,
-                                         header=not os.path.isfile(path))
+        """Append rows, ALIGNED to the columns the file already has.
+
+        A run that fails returns a two-key row while a good one returns ~40.
+        Appending it as-is writes two fields into a wide CSV, and read_csv then
+        maps them POSITIONALLY onto the first columns — which is how an exception
+        message ended up in ``ablation_folder``, the second column. Reindexing
+        first leaves the missing fields empty instead."""
+        if not records:
+            return
+        frame = pd.DataFrame(records)
+        if path not in _cols:
+            if os.path.isfile(path):
+                try:
+                    _cols[path] = list(pd.read_csv(path, nrows=0).columns)
+                except Exception:                       # noqa: BLE001
+                    _cols[path] = list(frame.columns)
+            else:
+                _cols[path] = list(frame.columns)
+        extra = [c for c in frame.columns if c not in _cols[path]]
+        if extra:                       # a later row introduced a new field
+            _cols[path] = _cols[path] + extra
+        frame.reindex(columns=_cols[path]).to_csv(
+            path, mode="a", index=False, header=not os.path.isfile(path))
 
     rows = []
     if todo:
@@ -398,6 +463,27 @@ def main():
         prows.append(row)
     pdf = pd.DataFrame(prows)
 
+    # Runs that produced nothing are dropped as ROWS, not flagged. 25 of them hold
+    # only debug.log and parameters.txt — no history.hf5, so the simulation never
+    # produced output — and 4 more have a history that cannot be read. None carry
+    # a single measurement, so they are absent from the per-cell sheets already
+    # and contribute nothing to any score. With them gone the error column has
+    # nothing left to say and goes too.
+    n_before = len(df)
+    if "error" in df.columns:
+        df = df[df["error"].fillna("").astype(str) == ""].copy()
+        df = df.drop(columns=["error"])
+    if n_before != len(df):
+        print("  dropped %d run(s) with no usable output" % (n_before - len(df)))
+
+    # Columns dropped from the SAVED runs sheet only; the CSV cache keeps them.
+    # gammaHC_ratio is gammaHC/gammaSC and both are already columns;
+    # A0_over_quarter_pi is A0 rescaled; the rest are fixed across the v2 fit
+    # (shape index 0, no bending, one atoh threshold) and so carry no contrast.
+    df = df.drop(columns=[c for c in ("gammaHC_ratio", "A0_over_quarter_pi",
+                                      "atoh_threshold", "shape_index", "bending")
+                          if c in df.columns])
+
     sheets = {"runs": df, "points": pdf}
     for key, path in side.items():
         sheets[key] = pd.read_csv(path) if os.path.isfile(path) else pd.DataFrame()
@@ -417,6 +503,12 @@ def main():
                           " (the pickle keeps all of them)" % (name, len(f)))
                     f = f.iloc[:1000000]
                 f.to_excel(writer, sheet_name=name[:31], index=False)
+            # the experimental targets the fit was scored against, written by
+            # build_experimental_tables.py; carried over so rewriting this
+            # workbook does not drop them
+            for name, frame in carried_over_sheets(MECHANICS_SHEETS):
+                frame.to_excel(writer, sheet_name=name, index=False)
+                print("  carried over sheet %s (%d rows)" % (name, len(frame)))
     except Exception as exc:                            # noqa: BLE001
         print("  xlsx failed (%s: %s); pickles and CSVs are written"
               % (type(exc).__name__, exc))
