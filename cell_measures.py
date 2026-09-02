@@ -33,8 +33,8 @@ def find_non_boundary_cells(time_point_data):
     return non_boundary_cells
 
 def find_maximal_level_final_frame(load_name,  type_by='atoh_level'):
-    load_path = os.path.join(RESULTS_DIR, load_name, load_name)
-    history = HistoryHdf5.from_archive("%s.hf5" % load_path, eptm_class=VirtualSheet)
+    load_path = os.path.join(RESULTS_DIR, load_name, "history.hf5")
+    history = HistoryHdf5.from_archive(load_path, eptm_class=VirtualSheet)
     last_time_point = np.max(history.time_stamps)
     final_sheet = history.retrieve(last_time_point)
     final_sheet.arrange_sheet_from_history()
