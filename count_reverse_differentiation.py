@@ -64,8 +64,14 @@ def mirrored_reverse(history, stamps, frames, threshold, type_by=TYPE_BY):
     """HC -> SC events by the forward rule, run backwards.
 
     Mirror of differentiation_events: the final frame's non-boundary SCs, each
-    walked back through its uninterrupted SC run; a cell already SC at t0 never
-    crossed inside the window and is skipped.
+    walked back through its uninterrupted SC run; a cell already SC at t0 did
+    not revert inside the window and is skipped.
+
+    Both directions test the FIRST FRAME rather than asking whether the walk
+    reached it, which is what rejects a transient — a cell that left its
+    starting state and returned to it. The model produces none of those at
+    pT 0 or 0.162, in either direction, so the guard changes no count here; it
+    stops the rule depending on that being true.
     """
     if stamps.size == 0:
         return []
@@ -81,11 +87,16 @@ def mirrored_reverse(history, stamps, frames, threshold, type_by=TYPE_BY):
     out = []
     last = stamps.size - 1
     for cid in final_sc_ids:
+        # Mirror of the forward guard: a cell already below threshold when the
+        # window opened did not revert inside it. Read off the first frame
+        # rather than inferred from the walk reaching it, so a cell that was an
+        # SC at t0, rose above threshold and fell back is rejected too — the
+        # walk stops at the recrossing and would otherwise call that a reversal.
+        if is_sc(frames[0].get(cid)):
+            continue
         f = last
         while f > 0 and is_sc(frames[f - 1].get(cid)):
             f -= 1
-        if f == 0:                       # already a SC at t0
-            continue
         out.append((int(cid), float(stamps[f])))
     return out
 

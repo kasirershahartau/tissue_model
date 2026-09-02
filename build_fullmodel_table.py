@@ -193,10 +193,18 @@ def differentiation_events(history, t0, threshold, type_by=TYPE_BY):
     The detection deliberately mirrors calc_HC_neighbors_at_differentiation: take
     every non-boundary HC of the FINAL frame, walk back through the uninterrupted
     run of HC frames, and call the first of them the differentiation frame; a cell
-    that was already a HC at t0 has no crossing in the window and is skipped. The
-    HC-neighbour counts here therefore reproduce that function's output exactly,
-    which is asserted in the tests below — if the two ever diverge, score 2 and
-    this sheet would be describing different sets of cells.
+    that was already a HC at t0 is skipped, since it did not differentiate inside
+    the window. The HC-neighbour counts here therefore reproduce that function's
+    output exactly, which is asserted in the tests below — if the two ever
+    diverge, score 2 and this sheet would be describing different sets of cells.
+
+    "Already a HC at t0" is read off the FIRST FRAME, not inferred from the walk
+    reaching it. The two differ for a cell that was a HC at t0, dipped below the
+    threshold and recovered: the walk stops at the recrossing, so the old test
+    let that recovery through as a differentiation. Measured over every run at
+    pT 0 and 0.162 the model produces none — cells cross the threshold at most
+    once — so this changes no published count; it is the rule being right rather
+    than lucky.
 
     Two passes: the first caches only delta per frame (cheap) to locate the
     crossings, the second visits just the frames that actually host an event and
@@ -224,11 +232,17 @@ def differentiation_events(history, t0, threshold, type_by=TYPE_BY):
     by_frame = {}
     last = stamps.size - 1
     for cid in final_hc_ids:
+        # A cell that was ALREADY a HC when the window opened did not
+        # differentiate in it, whatever happened in between. Testing the first
+        # frame directly also rejects the transient — HC at t0, below threshold
+        # for a while, HC again at the end — which the old test could not see:
+        # the walk stops at the RECROSSING, never reaching frame 0, so a
+        # recovery was recorded as a differentiation.
+        if is_hc(value_by_id[0].get(cid)):
+            continue
         f = last
         while f > 0 and is_hc(value_by_id[f - 1].get(cid)):
             f -= 1
-        if f == 0:                       # already a HC at t0, never crossed here
-            continue
         by_frame.setdefault(f, []).append(cid)
 
     rows = []
