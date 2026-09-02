@@ -25,12 +25,37 @@ from history_io import RESULTS_DIR
 
 
 def find_non_boundary_cells(time_point_data):
-    boundary_cells = np.unique(time_point_data.edge_df.loc[time_point_data.edge_df.opposite < 0, "face"])
-    neighbors_of_boundary_cells = np.unique(time_point_data.edge_df.face[time_point_data.edge_df.opposite.isin(boundary_cells)])
+    """Faces with a complete neighbourhood: neither on an open boundary nor next to one.
+
+    A face is ON the boundary when one of its edges has no opposite. A face is
+    NEXT TO the boundary when it shares an edge with such a face — that is, when
+    the opposite of one of its own edges belongs to a boundary face.
+
+    ``opposite`` holds an EDGE label, so reaching the neighbouring FACE means
+    resolving it through ``edge_df`` first. Testing ``opposite`` against face
+    labels compares two unrelated index spaces and excludes an arbitrary set of
+    faces; it went unnoticed because on a periodic sheet no edge is unpaired, so
+    ``boundary_cells`` is empty and the whole selection is a no-op.
+    """
+    edge_df = time_point_data.edge_df
+    face_idx = np.asarray(time_point_data.face_df.index)
+    opposite = edge_df["opposite"].to_numpy()
+    boundary_cells = np.unique(edge_df.loc[opposite < 0, "face"].to_numpy())
+    if boundary_cells.size == 0:            # periodic sheet: nothing to exclude
+        return face_idx
+
+    # face on the far side of each edge, -1 where the edge has no opposite
+    edge_faces = edge_df["face"].to_numpy()
+    opp_face = np.full(opposite.shape, -1, dtype=edge_faces.dtype)
+    paired = opposite >= 0
+    pos = edge_df.index.get_indexer(opposite[paired])
+    known = pos >= 0                        # an opposite label off the index is skipped
+    opp_face[np.flatnonzero(paired)[known]] = edge_faces[pos[known]]
+
+    neighbors_of_boundary_cells = np.unique(
+        edge_faces[np.isin(opp_face, boundary_cells)])
     exclude_cells = np.union1d(boundary_cells, neighbors_of_boundary_cells)
-    face_idx = time_point_data.face_df.index
-    non_boundary_cells = np.setdiff1d(face_idx, exclude_cells)
-    return non_boundary_cells
+    return np.setdiff1d(face_idx, exclude_cells)
 
 def find_maximal_level_final_frame(load_name,  type_by='atoh_level'):
     load_path = os.path.join(RESULTS_DIR, load_name, "history.hf5")

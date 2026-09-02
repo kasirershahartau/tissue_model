@@ -606,7 +606,11 @@ class InnerEarModel:
         # positions (get_indexer) so it is correct even for a non-contiguous index.
         base_stress = edge_data["stress"].to_numpy().copy()
         opp = edge_data["opposite"].to_numpy()
-        has = opp > 0
+        # >= 0, not > 0: edge label 0 is a perfectly good opposite. Testing > 0
+        # left whichever edge is paired with edge 0 uncoupled while edge 0 itself
+        # was coupled, so the shared junction carried different stress on its two
+        # sides. -1 is the only "no opposite" sentinel.
+        has = opp >= 0
         new_stress = base_stress.copy()
         new_stress[has] = base_stress[has] + base_stress[edge_data.index.get_indexer(opp[has])]
         edge_data["stress"] = new_stress

@@ -15,6 +15,7 @@ import sys
 import os
 import numpy as np
 import pandas as pd
+from cell_measures import find_non_boundary_cells
 import pytest
 
 # Use a non-interactive backend; some Windows installs crash on the
@@ -5617,3 +5618,54 @@ class TestResumePreservesLIState:
                           name="fresh1", delta_levels=arr, notch_levels=arr,
                           repressor_levels=arr, t_end=6, dt=0.01)
         assert captured["delta_levels"] is arr
+
+
+class TestFindNonBoundaryCells:
+    """The boundary filter, on the sheets where it is not a no-op.
+
+    Every simulation here is periodic, so no edge is ever unpaired and the
+    filter selects everything. These tests use small hand-built frames — the
+    only place the non-periodic branch is exercised.
+    """
+
+    @staticmethod
+    def _sheet(edges, faces):
+        """edges: (label, face, opposite) triples; faces: face labels."""
+        class _Frame:
+            pass
+        f = _Frame()
+        f.edge_df = pd.DataFrame(
+            {"face": [e[1] for e in edges], "opposite": [e[2] for e in edges]},
+            index=[e[0] for e in edges])
+        f.face_df = pd.DataFrame(index=list(faces))
+        return f
+
+    def test_periodic_sheet_excludes_nothing(self):
+        # every edge paired: 0<->1, 2<->3
+        sheet = self._sheet([(0, 10, 1), (1, 11, 0), (2, 11, 3), (3, 12, 2)],
+                            [10, 11, 12])
+        assert list(find_non_boundary_cells(sheet)) == [10, 11, 12]
+
+    def test_boundary_face_and_its_neighbour_are_excluded(self):
+        # face 10 has an unpaired edge -> boundary; face 11 shares edge 1 with
+        # it -> neighbour of the boundary; face 12 touches only face 11.
+        sheet = self._sheet([(0, 10, -1), (1, 10, 2), (2, 11, 1),
+                             (3, 11, 4), (4, 12, 3)],
+                            [10, 11, 12])
+        assert list(find_non_boundary_cells(sheet)) == [12]
+
+    def test_edge_label_is_not_read_as_a_face_label(self):
+        """The bug this replaced: `opposite.isin(boundary_cells)`.
+
+        Face 0 is the boundary face. Edge 3 belongs to face 7 and its opposite
+        is edge 0 — an EDGE label that collides numerically with the boundary
+        FACE label 0. Face 7 does not touch face 0 (edge 0 belongs to face 0
+        only through its own edge 1), so it must survive; the old code excluded
+        it on the name collision alone.
+        """
+        sheet = self._sheet([(0, 5, 3), (1, 0, -1), (2, 0, 4),
+                             (3, 7, 0), (4, 6, 2)],
+                            [0, 5, 6, 7])
+        kept = list(find_non_boundary_cells(sheet))
+        assert 7 in kept, "face 7 excluded by an edge/face label collision"
+        assert 0 not in kept and 6 not in kept    # boundary face and its neighbour
