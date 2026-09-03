@@ -189,7 +189,11 @@ def calc_HC_neighbors_at_differentiation(history, initial_time_point=0,
     Tracing starts no earlier than ``initial_time_point`` (which need not
     be ``t=0``). Cells that were *already* HCs at ``initial_time_point``
     are excluded from the output — they did not differentiate within the
-    traced window so no differentiation time exists for them. A single
+    traced window so no differentiation time exists for them. That test is
+    made on the first frame itself, which also excludes a cell that was a HC
+    there, fell below the threshold and recovered: its last crossing lies
+    inside the window but it began and ended as a HC, so it differentiated
+    nothing. A single
     fixed ``threshold`` is used in every frame so that "crossing" means the
     same thing throughout (defaults to the mid-range of ``type_by`` over the
     final frame's non-boundary cells, matching the convention in
@@ -262,18 +266,21 @@ def calc_HC_neighbors_at_differentiation(history, initial_time_point=0,
     last_frame = time_points.size - 1
     result = []
     for cell_id in final_HC_ids:
+        # A cell already above the threshold in the FIRST frame of the window
+        # was a HC when the window opened and did not differentiate inside it.
+        # Read that off the first frame rather than inferring it from the walk
+        # below reaching frame 0: the walk only reaches 0 for a cell that never
+        # left, so a cell that was a HC at the start, dipped below the
+        # threshold and recovered would stop the walk at the RECROSSING and be
+        # counted as a differentiation it never underwent.
+        if is_HC(value_by_id[0].get(cell_id)):
+            continue
         # Step back through the uninterrupted run of HC frames ending at the
         # final frame; ``diff_frame`` ends on its first frame == the last
-        # below->above crossing (or ``initial_time_point`` if it was already
-        # a HC there).
+        # below->above crossing.
         diff_frame = last_frame
         while diff_frame > 0 and is_HC(value_by_id[diff_frame - 1].get(cell_id)):
             diff_frame -= 1
-        # diff_frame == 0 means the cell was a HC continuously from the
-        # initial frame onward, i.e. it was already differentiated at
-        # ``initial_time_point`` -> no crossing in the window, skip it.
-        if diff_frame == 0:
-            continue
         result.append(n_HC_neighbors_by_id[diff_frame].get(cell_id, np.nan))
     return np.array(result)
 
