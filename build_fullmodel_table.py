@@ -195,8 +195,11 @@ def differentiation_events(history, t0, threshold, type_by=TYPE_BY):
     run of HC frames, and call the first of them the differentiation frame; a cell
     that was already a HC at t0 is skipped, since it did not differentiate inside
     the window. The HC-neighbour counts here therefore reproduce that function's
-    output exactly, which is asserted in the tests below — if the two ever
-    diverge, score 2 and this sheet would be describing different sets of cells.
+    output exactly — and they must, because ``n_differentiation_events`` and
+    score 2 come from calc_HC_neighbors_at_differentiation while this sheet comes
+    from here, so a divergence would have the two describing different sets of
+    cells. They did diverge once, when the transient guard was added here and not
+    there; nothing caught it, because no test compares them. One should.
 
     "Already a HC at t0" is read off the FIRST FRAME, not inferred from the walk
     reaching it. The two differ for a cell that was a HC at t0, dipped below the
@@ -682,12 +685,13 @@ def main():
     print("\n  runs   %6d rows x %3d cols" % df.shape)
     print("  psigma %6d rows x %3d cols" % pdf.shape)
     if len(pdf):
+        # pdf has been through to_output_names by now, so the parameter is pT
         print("\n  %-6s %-7s %5s %8s %8s %8s %10s %9s"
-              % ("stage", "psigma", "runs", "score1", "score2", "s1+s2",
+              % ("stage", "pT", "runs", "score1", "score2", "s1+s2",
                  "iso%/cells", "iso%/SC"))
         for _i, r in pdf.iterrows():
             print("  %-6s %-7.3f %5d %8.3f %8.3f %8.3f %10.2f %9.2f"
-                  % (r["stage"], r["psigma"], r["n_runs"], r["score1"], r["score2"],
+                  % (r["stage"], r["pT"], r["n_runs"], r["score1"], r["score2"],
                      r["score1_plus_score2"], r["iso_SC_of_all_cells_mean"],
                      r["iso_SC_of_SC_mean"]))
     print("\nwrote %s" % xlsx)
