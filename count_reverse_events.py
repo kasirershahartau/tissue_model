@@ -8,9 +8,12 @@ Counts only reversals that STICK: a cell is a reverse event if it is a
 non-boundary SC in the final frame and was a HC earlier in the window. That is
 the forward rule of build_fullmodel_table.differentiation_events with the
 direction flipped, so the two counts are defined the same way and can be put in
-one row. Transient dips below threshold that recover are deliberately not
-counted (in the sample that motivated this there were none: every reversal seen
-was permanent).
+one row. A cell that was an SC when the window opened, differentiated and
+reverted before the end is NOT counted: it is back where it started, so on this
+definition nothing happened to it. That is not a rare case — applying the guard
+dropped 733 of 4947 reversals over the healthy runs, 15%, and more than half of
+them at E17.5, where the windows are long enough for a cell to do both. Any
+figure quoting these counts must say which rule produced them.
 
 WINDOW. From the run's own t0 — the frame the scoring matches to the experiment —
 to the last frame, the same window the forward events use. Note the t0 read back

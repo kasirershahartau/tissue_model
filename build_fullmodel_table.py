@@ -204,10 +204,13 @@ def differentiation_events(history, t0, threshold, type_by=TYPE_BY):
     "Already a HC at t0" is read off the FIRST FRAME, not inferred from the walk
     reaching it. The two differ for a cell that was a HC at t0, dipped below the
     threshold and recovered: the walk stops at the recrossing, so the old test
-    let that recovery through as a differentiation. Measured over every run at
-    pT 0 and 0.162 the model produces none — cells cross the threshold at most
-    once — so this changes no published count; it is the rule being right rather
-    than lucky.
+    let that recovery through as a differentiation. At pT 0 and 0.162 the model
+    produces none of them, over 3378 events, so both operating points are
+    unaffected. Elsewhere it matters: the rebuild dropped 1270 events across 77
+    runs and moved score 2 at 9 of the 44 points, almost all of it at P0 between
+    pT 0.170 and 0.200 and at E17.5 pT 0.250 — where the HC fraction is falling
+    through the run and cells oscillate across the threshold rather than
+    differentiate. About half the "events" at P0 pT 0.180 were recoveries.
 
     Two passes: the first caches only delta per frame (cheap) to locate the
     crossings, the second visits just the frames that actually host an event and

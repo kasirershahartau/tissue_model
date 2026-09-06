@@ -69,9 +69,15 @@ def mirrored_reverse(history, stamps, frames, threshold, type_by=TYPE_BY):
 
     Both directions test the FIRST FRAME rather than asking whether the walk
     reached it, which is what rejects a transient — a cell that left its
-    starting state and returned to it. The model produces none of those at
-    pT 0 or 0.162, in either direction, so the guard changes no count here; it
-    stops the rule depending on that being true.
+    starting state and returned to it.
+
+    The two directions are affected very differently. FORWARD, the model
+    produces no transients at all: measured over every run at pT 0 and 0.162,
+    3378 events, not one is a hair cell that dipped and recovered. REVERSE, the
+    guard is far from inert, because a cell that was an SC at t0, differentiated
+    and reverted is back where it began: it removed 37 of 66 reversals at E17.5
+    pT 0 and 37 of 82 at pT 0.162, though only 2 of 25 and 2 of 33 at P0, whose
+    windows are too short for a cell to do both.
     """
     if stamps.size == 0:
         return []
