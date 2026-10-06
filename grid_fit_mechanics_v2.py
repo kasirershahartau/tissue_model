@@ -1,4 +1,4 @@
-"""Step 4 — 5x5 GRID search of the v2 mechanical fit (E17.5), no BO.
+"""5x5 GRID search of the  mechanical fit (E17.5).
 
     python grid_fit_mechanics_v2.py --dry-run
     python grid_fit_mechanics_v2.py --workers 30          # 32-core Azure VM

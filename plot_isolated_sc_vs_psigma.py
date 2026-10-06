@@ -32,14 +32,14 @@ import matplotlib.pyplot as plt
 
 from post_processing import RESULTS_DIR
 from build_fullmodel_table import psigma_table, exp_isolated_sc
-from plot_scores_vs_psigma import read_runs_csv, COLOUR, ZOOM
+from plot_scores_vs_psigma import read_runs, COLOUR, ZOOM
 
 OUT_PNG = "isolated_sc_vs_psigma.png"
 OUT_CSV = "isolated_sc_vs_psigma.csv"
 
 
 def main():
-    df = read_runs_csv()
+    df = read_runs()
     # incomplete runs are dropped when the table is written, so the column
     # may be absent from the saved file
     ok = df[df["error"].fillna("") == ""] if "error" in df.columns else df
@@ -86,20 +86,20 @@ def main():
             bad = b[b["n_collapsed"] > 0]
             ax.plot(bad["psigma"], bad["%s_mean" % col], "o", mfc="none", mec="k",
                     ms=10, mew=1.2, zorder=4)
-        ax.set_xlabel("$p_\\sigma$")
+        ax.set_xlabel("$p_T$")
         ax.set_ylabel(ylab)
         ax.grid(alpha=0.25)
         if zoom:
             # the collapse plateau at ~100% squashes the range that matters
             ax.set_xlim(0.125, 0.212)
             ax.set_ylim(0, 22)
-            ax.set_title("zoom: $p_\\sigma$ 0.125 – 0.21, collapse plateau clipped",
+            ax.set_title("zoom: $p_T$ 0.125 – 0.21, collapse plateau clipped",
                          fontsize=9)
         else:
             ax.set_xlim(-0.012, 0.40)
             ax.legend(fontsize=8, loc="upper left")
-    axes[0][0].set_title("Isolated SCs vs $p_\\sigma$ — fraction of SCs", fontsize=11)
-    axes[0][1].set_title("Isolated SCs vs $p_\\sigma$ — fraction of all cells", fontsize=11)
+    axes[0][0].set_title("Isolated SCs vs $p_T$ — fraction of SCs", fontsize=11)
+    axes[0][1].set_title("Isolated SCs vs $p_T$ — fraction of all cells", fontsize=11)
     fig.suptitle("SCs with no HC neighbour: model against experiment "
                  "(black ring = the point contains a collapsed run)", fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, 0.94))

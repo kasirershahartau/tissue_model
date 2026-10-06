@@ -255,14 +255,14 @@ def main():
                 # and a group below it less than half. The gate reads the
                 # contractility stress, so the line belongs only on that panel.
                 ax.axhline(a.psigma, color="k", lw=1.3, ls="--", alpha=0.8,
-                           label="$p_\\sigma$ = %.3f (gate half-max)" % a.psigma)
+                           label="$p_T$ = %.3f (gate half-max)" % a.psigma)
             ax.set_xlabel("time")
             ax.set_ylabel("mean face stress (%s)" % eff)
             ax.set_title("%s — %s effectors" % (stage, eff), fontsize=11)
             ax.grid(alpha=0.25)
             if r == 0 and c == 0:
                 ax.legend(fontsize=8, loc="best")
-    fig.suptitle("Face stress from $t$ = %g at $p_\\sigma$ = %.3f — mean over arrays "
+    fig.suptitle("Face stress from $t$ = %g at $p_T$ = %.3f — mean over arrays "
                  "of (mean over %d repeats), error bars = SEM over %d arrays"
                  % (a.t_min, a.psigma, len(a.repeats),
                     int(summary["n_arrays"].max())), fontsize=11)

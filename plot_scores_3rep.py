@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
 from post_processing import RESULTS_DIR
+from build_experimental_tables import read_table
 from build_fullmodel_table import psigma_table
 
 COLOUR = {"E17.5": "tab:blue", "P0": "tab:red", "sum": "k"}
@@ -50,7 +51,9 @@ FULL_POINTS = (0.0, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18)
 
 
 def build(repeats):
-    runs = pd.read_pickle(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
+    # read_table, not read_pickle: the saved table publishes the gate half-max
+    # as pT, while every script here (psigma_table included) calls it psigma
+    runs = read_table(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
     # incomplete runs are dropped when the table is written, so the column
     # may be absent from the saved file
     runs = runs[runs["error"].fillna("") == ""] if "error" in runs.columns else runs
@@ -99,7 +102,7 @@ def draw(tab, xlim, path, repeats, title_extra=""):
         ax.axhline(cut, color="0.35", ls="--", lw=1.3,
                    label="$\\chi^2$ = %g" % cut)
         ax.set_yscale("log")
-        ax.set_xlabel("$p_\\sigma$")
+        ax.set_xlabel("$p_T$")
         ax.set_ylabel("%s  ($\\chi^2$, lower is better)"
                       % ("score 1 + score 2" if col == "total" else col))
         ax.set_title(title, fontsize=11)
@@ -116,7 +119,7 @@ def draw(tab, xlim, path, repeats, title_extra=""):
             ax.grid(alpha=0.18, which="minor", axis="x")
         ax.tick_params(axis="x", labelsize=8 if xlim else 9)
         ax.legend(fontsize=8, loc="best")
-    fig.suptitle("Full-model scores against $p_\\sigma$ — every point at %d repeats "
+    fig.suptitle("Full-model scores against $p_T$ — every point at %d repeats "
                  "x 10 arrays per stage%s" % (repeats, title_extra), fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(path, dpi=170, bbox_inches="tight")

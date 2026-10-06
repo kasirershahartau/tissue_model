@@ -64,6 +64,11 @@ MAX_POINTS = 400        # per violin; the full set is tens of thousands
 # standard dot fills the violin and hides its shape
 POINT_S = POINT_SIZE["model"] * 0.5
 Y_TICK_STEP = 0.1
+# The chosen gate value is marked with a hatch rather than a colour of its own,
+# since colour here already says which stage — the same convention as
+# plot_neighbor_pair_bars and plot_isolated_sc_violin.
+HATCH = "/"
+HATCH_PT = 0.162
 
 
 def gather(frame, results_dir=RESULTS_DIR):
@@ -92,6 +97,7 @@ def gather(frame, results_dir=RESULTS_DIR):
             m, s = _mean_sem(per_unit)
             face, edge = STYLE[(True, stage)]
             rows.append(dict(index=i, stage=stage, pT=pt, edge_class=kl,
+                             hatch=HATCH if np.isclose(pt, HATCH_PT) else None,
                              face=face, edge=edge, mean=m, sem=s,
                              per_unit=per_unit, per_run=per_pair,
                              n_pairs=len(per_pair), n_arrays=len(per_unit)))
@@ -131,6 +137,8 @@ def _draw(ax, rows, rng, mean_markersize, max_points, point_size=POINT_S):
                                  showmedians=False)["bodies"][0]
             body.set_facecolor(d["face"]); body.set_edgecolor(d["edge"])
             body.set_linewidth(1.6); body.set_alpha(1.0); body.set_zorder(2)
+            if d.get("hatch"):
+                body.set_hatch(d["hatch"])
         # a violin can hold tens of thousands of pairs; a sample keeps the cloud
         # readable and the SVG small
         show = v if len(v) <= max_points else rng.choice(v, max_points,
@@ -256,11 +264,21 @@ def main():
                              edgecolor=STYLE[(True, s)][1], linewidth=1.6)
                for s in ("E17.5", "P0")]
     names = [STYLE_LABEL[(True, s)] for s in ("E17.5", "P0")]
+    if any(d.get("hatch") for pt in PANELS for d in data[pt]):
+        # the swatch is small, so one stroke can fall outside it entirely:
+        # repeating the pattern guarantees the key is not drawn blank
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="white",
+                                     edgecolor="0.25", linewidth=1.6,
+                                     hatch=HATCH * 3))
+        names.append(r"$p_T$ = %g" % HATCH_PT)
     handles.append(plt.Line2D([], [], marker=".", linestyle="none",
                               color=POINT_COLOUR, alpha=0.5,
                               markersize=np.sqrt(a.point_size) * 1.8))
     names.append("one neighbour pair (sampled)")
-    fig.legend(handles, names, frameon=False, fontsize=9.5, ncol=3,
+    # one row in the single layout: that figure carries a row of pT labels just
+    # under its axis, and a legend that wraps onto two rows runs into them
+    fig.legend(handles, names, frameon=False, fontsize=9.5,
+               ncol=len(names) if a.layout == "single" else 3,
                loc="lower center", bbox_to_anchor=(0.5, 0.005))
 
     fig.suptitle("Mechanical stress on a cell-cell interface at %s\n"

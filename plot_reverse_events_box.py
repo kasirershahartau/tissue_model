@@ -13,7 +13,7 @@ WHERE THE NUMBERS COME FROM
                  window, counted once. Collapsed runs are excluded: there the
                  whole hair-cell population reverts at once, which is a
                  different phenomenon and swamps the column.
-    LI only      <li dir>/new/trajectory_groups.csv, normal_reverse_-
+    LI only      <li dir>/trajectory_groups.csv, normal_reverse_-
                  differentiating_n, one row per (array, repeat).
 
 A CAVEAT ON THE TWO SOURCES. They were produced by different code from different
@@ -41,7 +41,7 @@ from plot_neighbor_pairs import (LI_DIR, STYLE, STYLE_LABEL, POINT_SIZE,
                                  ERROR_CAPSIZE, ERROR_LINEWIDTH, VIOLIN_W,
                                  _mean_sem, _x, _tight_limits)
 
-LI_CSV = os.path.join(LI_DIR, "new", "trajectory_groups.csv")
+LI_CSV = os.path.join(LI_DIR, "trajectory_groups.csv")
 # whiskers at fixed percentiles rather than matplotlib's 1.5*IQR fence, so the
 # caption can state what they mean without it depending on each source's spread
 WHISKER_PERCENTILES = (10, 90)
