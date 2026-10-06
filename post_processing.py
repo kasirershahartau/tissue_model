@@ -1099,11 +1099,86 @@ def _sim_neighbor_pair_percentages(sheet, type_by, threshold, HC_above_threshold
     return _neighbor_pair_percentages(np.isin(all_idx, hc_idx), sub)
 
 
-def _exp_neighbor_pair_percentages(cells_info, contact_matrix):
-    """(HC:HC%, HC:SC%, SC:SC%) among the valid experimental cells of a frame."""
+def experimental_cell_mask(cells_info, contact_matrix):
+    """Which segmented cells may be counted: the ones with a TRUSTWORTHY
+    neighbourhood.
+
+    Three exclusions, and the last two are what a ``valid``-only mask misses:
+
+    * INVALID cells — the segmentation itself rejected them.
+    * EDGE cells — clipped by the field of view, so their neighbour count is
+      truncated and every pair statistic they enter is biased low. ``valid``
+      does NOT imply not-edge: 55-84% of edge cells are flagged valid.
+    * NEIGHBOURS OF INVALID cells — their own segmentation is fine, but part of
+      their neighbourhood is unknown, so their pair composition is unreliable.
+      This is the criterion that does most of the work, and it is tested against
+      the ``neighbors`` column rather than the contact matrix: see
+      _neighbors_adjacency for why the two differ and why it matters.
+
+    VERIFIED against the lateral-inhibition workbook, which was built by a
+    separate pipeline on byte-identical input files: this mask reproduces its
+    experimental targets to ~1e-7 at BOTH stages, SEMs included — E17.5
+    0.6205 +- 0.0724 and 41.6665 +- 0.7996, P0 0.7916 +- 0.1709 and
+    47.6071 +- 1.2416. The older valid-only mask gave 0.6814 and 41.9869 at
+    E17.5, and 0.8659 and 48.0398 at P0.
+
+    The mask keeps 82% of E17.5 cells and 70% of P0 cells. It has no analogue on
+    the model side: a periodic sheet has no invalid cells and no border, so all
+    three criteria are vacuous there.
+    """
     valid = cells_info.valid.values.astype(bool)
-    is_HC = (cells_info.type.values == 1)[valid]
-    A = np.asarray(contact_matrix)[np.ix_(valid, valid)]
+    edge = np.zeros(valid.shape, bool)
+    if "edge_cell" in cells_info:
+        edge = (pd.to_numeric(cells_info["edge_cell"], errors="coerce")
+                .fillna(0).to_numpy() != 0)
+    touches_invalid = _neighbors_adjacency(cells_info,
+                                           contact_matrix)[:, ~valid].any(axis=1)
+    return valid & ~edge & ~touches_invalid
+
+
+def _neighbors_adjacency(cells_info, contact_matrix):
+    """Adjacency from the ``neighbors`` column, falling back to the matrix.
+
+    THE TWO ARE NOT THE SAME, and which one is used where matters. ``neighbors``
+    is a strict SUPERSET of the contact matrix — 3 to 11 extra pairs per movie,
+    contacts the segmentation recorded but gave zero length, i.e. cells meeting
+    at a corner. Every contact-matrix pair is in ``neighbors``; none of the
+    extras is in the matrix.
+
+    The reference pipeline uses THIS adjacency to decide who touches an invalid
+    cell, and the CONTACT MATRIX to count pairs. Using the matrix for both
+    reproduces E17.5 exactly but misses P0 by 1e-3; using ``neighbors`` for both
+    misses E17.5 by 2e-4. Only the split reproduces both stages, to ~1e-7. A
+    corner contact is enough to make a neighbourhood untrustworthy but not
+    enough to be a pair.
+    """
+    if "neighbors" not in cells_info or "label" not in cells_info:
+        A = np.asarray(contact_matrix) > 0
+        np.fill_diagonal(A, False)
+        return A
+    n = len(cells_info)
+    pos = {int(l): i for i, l in enumerate(cells_info["label"].to_numpy())}
+    A = np.zeros((n, n), bool)
+    for i, s in enumerate(cells_info["neighbors"].to_numpy()):
+        if not isinstance(s, (set, list, tuple, np.ndarray)):
+            continue
+        for label in s:
+            j = pos.get(int(label))
+            if j is not None:
+                A[i, j] = A[j, i] = True
+    np.fill_diagonal(A, False)
+    return A
+
+
+def _exp_neighbor_pair_percentages(cells_info, contact_matrix):
+    """(HC:HC%, HC:SC%, SC:SC%) over the trustworthy cells of a frame.
+
+    The population is experimental_cell_mask, NOT merely the valid cells — see
+    there for why, and for the check that fixes the definition.
+    """
+    keep = experimental_cell_mask(cells_info, contact_matrix)
+    is_HC = (cells_info.type.values == 1)[keep]
+    A = np.asarray(contact_matrix)[np.ix_(keep, keep)]
     return _neighbor_pair_percentages(is_HC, A)
 
 
@@ -1933,10 +2008,8 @@ if __name__ == "__main__":
     # for name in ["periodic_fromrandom_periodic_array%d_for_E17_gammaSC-0.01_gammaHC_ratio-10.00_alphaHC_ratio-1.00_psigma-0.00"% i for i in range (1,10)]:
     #     redraw(name,"movie", movie=True,
     #            color_by="delta")
-    names = ["fullmodel_random_periodic_array%d_for_E17"%i for i in range(10)]
-    for name in names:
-        redraw(name,"movie", movie=True, maximal_number_of_frames_to_save=100,
-               color_by="atoh")
+    redraw("random_periodic_array0_for_E17","with_numbers", movie=False, maximal_number_of_frames_to_save=100,
+           color_by="atoh")
     # extract_fold_free_best_timepoints(corrupted_extracts=[("random_periodic_array6", "E17.5")])
     # compare_model_mechanics_to_experiments("fit_gSC1.63_gHC1.12_aHC2.00_ps0.00_eeca8ad8fd", "E17.5",
     #                                        type_by='delta_level', threshold=0.3350058877,
