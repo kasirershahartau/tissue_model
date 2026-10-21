@@ -801,32 +801,138 @@ def compare_to_experimental_results(history, model_name, experimental_stage, res
     return calc_pval([model_results], experimental_results, maximal_n=max_number_of_neighbors,
                                    continues=continues, plot=plot)
 
-def find_best_timepoint_according_to_n_neighbors(model_name):
+# The stage's own colour, matching plot_neighbor_pairs' STYLE table (the model
+# edge colour of each stage). Hard-coded rather than imported: that module
+# imports THIS one, so reaching back would be a circular import.
+_STAGE_COLOUR = {"E17.5": "green", "P0": "orangered"}
+# The chosen frame is marked in a colour that CONTRASTS with its curve, so the
+# marker does not read as part of it; these are the two stages' experiment
+# colours in plot_neighbor_pairs' STYLE table, against the model colours the
+# curves use. The dashed line dropped to each marker stays black.
+_SELECTED_COLOUR = {"E17.5": "blue", "P0": "red"}
+_POINT_MS = 3.2           # a dot per scored frame, over the line
+_SELECTED_MS = 9.0        # ... and a bigger one where the maximum is
+
+
+def _pval_trace_path(model_name):
+    """Where a run's p-value-against-time trace lives (no extension).
+
+    Inside the run's own folder when it exists, so the trace travels with the
+    archive it was computed from; beside it otherwise.
+    """
+    folder = os.path.join(RESULTS_DIR, model_name)
+    if os.path.isdir(folder):
+        return os.path.join(folder, "pval_vs_time")
+    return os.path.join(RESULTS_DIR, "%s_pval_vs_time" % model_name)
+
+
+def find_best_timepoint_according_to_n_neighbors(model_name, reuse=True,
+                                                 max_number_of_neighbors=9,
+                                                 type_by='atoh_level',
+                                                 out_stem=None,
+                                                 legend=False, grid=False):
+    """Score every frame of a run against both stages and pick the best one.
+
+    The comparison is the hierarchical p value of the whole neighbour-count
+    distribution (``compare_to_experimental_results`` with "number of
+    neighbors"), and the chosen frame is the one with the LARGEST p — the rule
+    the manuscript's initial arrays were selected by.
+
+    Writes three files next to the run: ``pval_vs_time.png``, ``.svg`` and
+    ``.npz``. The npz holds the trace itself, so a second call returns in
+    milliseconds instead of re-scoring every frame -- which for a 300-frame
+    archive is the whole cost of this function.
+
+    ``reuse`` reads that cache when it matches the archive; it is ignored, with
+    a printed reason, when the frame count or the last time stamp has moved
+    (a resumed run, say), since a stale trace would name a best frame that no
+    longer corresponds to the data.
+
+    ``legend`` and ``grid`` are OFF by default: the figure is meant to be
+    annotated by hand. Which curve is which, and where each best frame sits,
+    are printed to the console and returned, so nothing is lost by dropping
+    them; pass True for a self-contained version.
+    """
+    stem = out_stem or _pval_trace_path(model_name)
     history = load_history_file(model_name)
-    pval_E17 = []
-    pval_P0 = []
-    time = get_time_points(history)
-    for time_point in time:
-        try:
-            pval_E17.append(compare_to_experimental_results(history, model_name,"E17.5", results_type="number of neighbors",
-                                                            type_by='atoh_level', threshold=None,
-                                                            max_number_of_neighbors=9, plot=False,
-                                                            time_point=time_point))
-            pval_P0.append(compare_to_experimental_results(history, model_name, "P0", results_type="number of neighbors",
-                                                           type_by='atoh_level', threshold=None,
-                                                           max_number_of_neighbors=9, plot=False, time_point=time_point))
-            print("E17 pval:%f, P0 pval:%f" % (pval_E17[-1], pval_P0[-1]))
-        except ValueError:
-            break
-    best_E17_idx = np.argmax(pval_E17)
-    best_P0_idx = np.argmax(pval_P0)
-    fig, ax = plt.subplots()
-    print("Best fit for E17.5 is time=%f with pval=%f" % (time[best_E17_idx], pval_E17[best_E17_idx]))
-    print("Best fit for P0 is time=%f with pval=%f" % (time[best_P0_idx], pval_P0[best_P0_idx]))
-    ax.plot(time, pval_E17, label="E17.5")
-    ax.plot(time, pval_P0, label="P0")
-    ax.legend()
-    return fig, ax, time[best_E17_idx], time[best_P0_idx]
+    time_points = np.asarray(get_time_points(history), dtype=float)
+
+    time = pvals = None
+    cache = stem + ".npz"
+    if reuse and os.path.isfile(cache):
+        with np.load(cache) as z:
+            cached_t = z["time"]
+            cached = {s: z["pval_%s" % s] for s in _STAGE_COLOUR
+                      if "pval_%s" % s in z}
+        if len(cached) != len(_STAGE_COLOUR):
+            print("  cache %s has no trace for every stage; recomputing" % cache)
+        elif (cached_t.size != time_points.size
+              or not np.allclose(cached_t, time_points)):
+            print("  cache %s covers %d frame(s) up to t=%.4f, the archive now"
+                  " has %d up to t=%.4f; recomputing"
+                  % (cache, cached_t.size, cached_t[-1] if cached_t.size else np.nan,
+                     time_points.size, time_points[-1]))
+        else:
+            time, pvals = cached_t, cached
+            print("  reusing %s (%d frames)" % (cache, time.size))
+
+    if pvals is None:
+        scored, pvals = [], {s: [] for s in _STAGE_COLOUR}
+        for time_point in time_points:
+            try:
+                got = {s: compare_to_experimental_results(
+                           history, model_name, s,
+                           results_type="number of neighbors",
+                           type_by=type_by, threshold=None,
+                           max_number_of_neighbors=max_number_of_neighbors,
+                           plot=False, time_point=time_point)
+                       for s in _STAGE_COLOUR}
+            except ValueError:
+                break
+            # append only once BOTH stages scored, so the lists stay the same
+            # length as the time axis -- they used to be appended one stage at
+            # a time, and a failure between them left the plot unplottable
+            scored.append(float(time_point))
+            for s, p in got.items():
+                pvals[s].append(p)
+            print("E17 pval:%f, P0 pval:%f" % (got["E17.5"], got["P0"]))
+        time = np.asarray(scored, dtype=float)
+        pvals = {s: np.asarray(v, dtype=float) for s, v in pvals.items()}
+        if not time.size:
+            raise ValueError("no frame of %s could be scored" % model_name)
+        np.savez(cache, time=time, **{"pval_%s" % s: v for s, v in pvals.items()})
+        print("  wrote %s" % cache)
+
+    best = {s: int(np.argmax(v)) for s, v in pvals.items()}
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    for s in ("E17.5", "P0"):
+        colour = _STAGE_COLOUR[s]
+        ax.plot(time, pvals[s], "-o", lw=1.6, markersize=_POINT_MS,
+                color=colour, label=s, zorder=3)
+        k = best[s]
+        print("Best fit for %s is time=%f with pval=%f"
+              % (s, time[k], pvals[s][k]))
+        ax.axvline(time[k], color="k", ls="--", lw=1.1, alpha=0.75, zorder=1)
+        ax.plot(time[k], pvals[s][k], marker="o", markersize=_SELECTED_MS,
+                color=_SELECTED_COLOUR[s], markeredgecolor="white",
+                markeredgewidth=0.9, linestyle="none", zorder=6,
+                label="%s best: t = %.3f, p = %.3g"
+                      % (s, time[k], pvals[s][k]))
+    ax.set_xlabel("time")
+    ax.set_ylabel("p value against the experiment  (higher is better)")
+    if grid:
+        ax.grid(alpha=0.25)
+    if legend:
+        ax.legend(fontsize=9, loc="best")
+    fig.suptitle("Choosing the frame an initial array is taken from (%s)\n"
+                 "neighbour-count distribution, hierarchical two-sample test"
+                 % model_name, fontsize=11.5, y=0.985, va="top",
+                 linespacing=1.5)
+    fig.subplots_adjust(left=0.105, right=0.98, top=0.855, bottom=0.11)
+    for ext in ("png", "svg"):
+        fig.savefig("%s.%s" % (stem, ext), dpi=200)
+        print("  wrote %s.%s" % (stem, ext))
+    return fig, ax, time[best["E17.5"]], time[best["P0"]]
 
 
 def find_best_matching_frame(history, experimental_stage="E17.5",
@@ -1381,8 +1487,9 @@ def find_best_timepoint_for_random_arrays(model_names=None, indices=None):
         model_names = [random_array_name(i) for i in indices]
     out_file = os.path.join(RESULTS_DIR, "pval_results.txt")
     for model_name in model_names:
+        # the figure (png AND svg) and the reusable trace are written by
+        # find_best_timepoint_according_to_n_neighbors itself, next to the run
         fig, ax, bestE17, bestP0 = find_best_timepoint_according_to_n_neighbors(model_name)
-        plt.savefig(os.path.join(RESULTS_DIR, model_name + "pval_results.png"))
         plt.close(fig)
         with open(out_file, "a") as f:
             f.write("Best time point for " + model_name + " E17.5: %f, P0: %f\n" % (bestE17, bestP0))
@@ -2008,8 +2115,8 @@ if __name__ == "__main__":
     # for name in ["periodic_fromrandom_periodic_array%d_for_E17_gammaSC-0.01_gammaHC_ratio-10.00_alphaHC_ratio-1.00_psigma-0.00"% i for i in range (1,10)]:
     #     redraw(name,"movie", movie=True,
     #            color_by="delta")
-    redraw("random_periodic_array0_for_E17","with_numbers", movie=False, maximal_number_of_frames_to_save=100,
-           color_by="atoh")
+    # redraw("random_periodic_array0_for_E17","with_numbers", movie=False, maximal_number_of_frames_to_save=100,
+    #        color_by="atoh")
     # extract_fold_free_best_timepoints(corrupted_extracts=[("random_periodic_array6", "E17.5")])
     # compare_model_mechanics_to_experiments("fit_gSC1.63_gHC1.12_aHC2.00_ps0.00_eeca8ad8fd", "E17.5",
     #                                        type_by='delta_level', threshold=0.3350058877,
@@ -2021,3 +2128,5 @@ if __name__ == "__main__":
     #     res = load_experimental_results(stage, "lonely SC percentage")
     #     print(res)
     # plt.show()
+    fig, ax, tE17, tP0 = find_best_timepoint_according_to_n_neighbors("random_periodic_array98")
+    plt.show()
