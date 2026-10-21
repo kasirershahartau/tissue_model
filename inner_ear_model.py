@@ -414,10 +414,14 @@ class InnerEarModel:
             # of the measured mean cell area) instead of the caller's per-type dict.
             preferred_area = {'HC': float(preferred_area_override),
                               'SC': float(preferred_area_override)}
-        # Target perimeter P0 = shape_index * sqrt(A0), PER CELL TYPE. A0 is
-        # already length-normalized above, so P0 scales with it. Consumed by
-        # ContractilityPerimeterElasticity; shape_index=0 -> P0=0 -> the perimeter
-        # effector reduces exactly to plain contractility (Gamma/2 P^2).
+        # Target perimeter P0 = shape_index * sqrt(A0), PER CELL TYPE, from the
+        # preferred area AS GIVEN -- L0 does not enter here. (This comment used
+        # to say A0 was "already length-normalized above", which was true only
+        # before the L0-normalization fix described at the top of __init__; see
+        # also run_model's warning that pre-fix folders used A0 = pi/4*L0^2.)
+        # Consumed by ContractilityPerimeterElasticity; shape_index=0 -> P0=0 ->
+        # the perimeter effector reduces exactly to plain contractility
+        # (Gamma/2 P^2).
         #
         # ``hc_shape_index`` / ``sc_shape_index`` each default to the shared
         # ``shape_index``, so a caller that passes only ``shape_index`` keeps the
@@ -1136,7 +1140,16 @@ class InnerEarModel:
 
     @staticmethod
     def get_draw_sheet_method(number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
-                    maximal_level=1, color_by="atoh", arrange_sheet=False):
+                    maximal_level=1, color_by="atoh", arrange_sheet=False,
+                    uniform_level=None):
+        """``uniform_level`` paints EVERY cell the same, whatever its state.
+
+        The level is read on the same 0..1 scale the colour map uses -- 0 is
+        dark green and 1 is white, so 0.5 is the midpoint -- and it overrides
+        ``color_by`` entirely. For a picture about geometry rather than about
+        pattern, where a colour that varied would invite a reading that is not
+        there.
+        """
         def draw_sheet(sheet):
             if arrange_sheet:
                 sheet.arrange_sheet_from_history()
@@ -1145,7 +1158,9 @@ class InnerEarModel:
             #     sheet.order_all_edges()
             draw_specs = tyssue.config.draw.sheet_spec()
             cmap = plt.cm.get_cmap('Greens').reversed()
-            if color_by == "atoh":
+            if uniform_level is not None:
+                cmap_scale = np.full(len(sheet.face_df), float(uniform_level))
+            elif color_by == "atoh":
                 cmap_scale = sheet.face_df.atoh_level.to_numpy()
             elif color_by == "delta":
                 cmap_scale = sheet.face_df.delta_level.to_numpy() / maximal_level

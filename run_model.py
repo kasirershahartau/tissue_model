@@ -343,6 +343,12 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     return name
 
 
+# The per-cell columns InnerEarModel.set_random_parameters draws, i.e. the
+# state a ``random_forces`` run carries that its parameters cannot rebuild.
+# A resume restores these from the archive; see where they are captured in run().
+_RANDOMISED_FACE_COLUMNS = ("prefered_area", "prefered_vol", "contractility")
+
+
 def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, ablated_cells=None,
         only_differentiation=False, no_differentiation=False, end_on_steady_state=True, t_end=25, dt=0.01,
         random_forces=False, name=None, continue_existing_run=False, divisions=False,
@@ -805,6 +811,25 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # than trusting the caller's flag.
         if continue_existing_run:
             randomize_notch_delta_levels = False
+        # ... and for the same reason a RESUME of a random-forces run must keep
+        # the archive's PER-CELL mechanical state. ``random_forces`` appends
+        # ``get_random_initializer``, which re-draws prefered_area (and
+        # prefered_vol, contractility) per cell every wait_time units; those
+        # draws are the run's state, not something the parameters can rebuild.
+        # InnerEarModel.__init__ calls ``update_specs(..., reset=True)``, which
+        # resets the whole column to the uniform by-type default, so without
+        # this the resumed tissue relaxes toward one target area, no cell ever
+        # reaches ``division_area`` again, and the run FREEZES: a 25->30 resume
+        # of random_periodic_array99 produced 533 faces at every frame and 4
+        # topology changes, against ~33 per 5 time units before it.
+        # Only for random_forces: elsewhere these columns ARE reproducible from
+        # the parameters, and restoring them would silently ignore a resume
+        # that deliberately changes them.
+        resumed_face_state = None
+        if continue_existing_run and random_forces:
+            keep = [c for c in _RANDOMISED_FACE_COLUMNS if c in sheet.face_df.columns]
+            if keep:
+                resumed_face_state = sheet.face_df[keep].copy()
         inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
                               repulsion_exp=repulsion_exponent, preferred_area=preferred_area,
                               preferred_area_override=preferred_area_override, contractility=contractility,
@@ -836,6 +861,13 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                               delta_levels=(None if continue_existing_run else delta_levels),
                               repressor_levels=(None if continue_existing_run else repressor_levels),
                               initial_notch_delta_level=initial_notch_delta_level)
+        if resumed_face_state is not None:
+            # put the archive's draws back over what __init__ reset them to
+            shared = inner.sheet.face_df.index.intersection(resumed_face_state.index)
+            inner.sheet.face_df.loc[shared, resumed_face_state.columns] = \
+                resumed_face_state.loc[shared]
+            run_log.info("resume: restored %s for %d face(s) from the archive",
+                         ", ".join(resumed_face_state.columns), len(shared))
         draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
                                                 color_by="atoh")
         fig1, ax1 = draw_func(inner.sheet)
