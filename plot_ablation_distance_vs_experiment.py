@@ -26,9 +26,13 @@ TWO QUANTITIES, both scored there:
             ablation, which is where a cell would be if nothing drew it towards
             the wound. The domain size divides out.
 
-A POINT IS AN INITIAL ARRAY on the model side and a BIOLOGICAL REPEAT on the
-experimental one — the units the z was computed over. Runs sharing an array are
-averaged first, since they share an initial condition and are not independent.
+THE CLOUD AND THE STATISTIC COME FROM DIFFERENT LEVELS, on both sides. Every
+drawn point is ONE DIFFERENTIATION EVENT — the distribution the measurement
+actually produced — while the star and whisker stay the mean and SEM over the
+INDEPENDENT UNITS: initial arrays for the model (runs sharing an array are
+averaged first, since they share an initial condition), biological repeats for
+the experiment. Those units are what the z was computed over, so the star and
+whisker are comparable across the figure even though the clouds are far wider.
 
 The chi^2 printed by --scored is read from the summary table, not recomputed, so
 the figure cannot drift from the number the comparison reports.
@@ -100,6 +104,10 @@ def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE):
     summary = read_table(os.path.join(results_dir, PREFIX + ".pkl"))
     runs = read_table(os.path.join(results_dir, PREFIX + "_runs.pkl"))
     exp = pd.read_pickle(os.path.join(results_dir, PREFIX + "_exp.pkl"))
+    # one row per differentiation event, joined to its run by folder: the runs
+    # table carries that run's cell diameter and reference distance, which are
+    # what turn a lattice-unit distance into the figure's units
+    events = read_table(os.path.join(results_dir, "ablation_events.pkl"))
     summary = summary[summary["stage"] == stage]
     runs = runs[runs["stage"] == stage]
     exp = exp[(exp["stage"] == stage) & (exp["unit"] == "repeat")]
@@ -116,6 +124,15 @@ def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE):
         # condition, so they are averaged before the mean and SEM, exactly as
         # the comparison script does before scoring
         per_unit = g.groupby("initial_array")[model_col].mean().to_numpy(float)
+        # every event of those runs, each divided by ITS OWN run's scale —
+        # cell diameter, or the reference SC distance for the ratio — so a
+        # point means the same thing it does in the per-run average above
+        scale_col = "cell_diameter" if quantity == "distance" else "ref_mean"
+        scale = g.set_index("run_folder")[scale_col]
+        ev = events[events["run_folder"].isin(set(g["run_folder"]))]
+        per_point = (ev["distance"].to_numpy(float)
+                     / ev["run_folder"].map(scale).to_numpy(float))
+        per_point = per_point[np.isfinite(per_point)]
         row = summary[np.isclose(summary["psigma"].astype(float), pt)]
         m, s = _mean_sem(per_unit)
         face, edge = STYLE[(True, stage)]
@@ -123,16 +140,13 @@ def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE):
                                                     r"$p_T$=%g" % pt,
                         hatch=HATCH if np.isclose(pt, HATCH_PT) else None,
                         face=face, edge=edge, mean=m, sem=s, per_unit=per_unit,
+                        per_point=per_point,
                         z2=float(row[z2_col].iloc[0]) if len(row) else np.nan,
                         n_units=len(per_unit), unit="arrays", n_runs=len(g)))
     per_unit = exp[exp_col].to_numpy(float)
     m, s = _mean_sem(per_unit)
     face, edge = STYLE[(False, stage)]
-    # THE SHAPE AND THE STATISTIC COME FROM DIFFERENT LEVELS on this side. The
-    # violin and its points are the individual differentiation events, which is
-    # the distribution the experiment actually measured; the star and whisker
-    # stay the mean and SEM over BIOLOGICAL REPEATS, which is the unit the z was
-    # computed over and the only one the repeats are independent at.
+    # the experiment's own events, the same treatment as the model's above
     ev = experimental_events(stage)
     if quantity == "ratio":
         # each event against its own repeat's reference distance, the pairing
@@ -224,7 +238,7 @@ def main():
 
     print("  %s, %s\n" % (a.stage, ylabel))
     print("  %-22s %9s %9s %12s %8s %9s"
-          % ("source", "mean", "SEM", "stat units", "drawn", "z^2"))
+          % ("source", "mean", "SEM", "stat units", "events", "z^2"))
     for d in data:
         drawn_n = len(d["per_point"]) if d.get("per_point") is not None \
             else len(d["per_unit"])
@@ -280,7 +294,7 @@ def main():
     handles.append(plt.Line2D([], [], marker=".", linestyle="none",
                               color=POINT_COLOUR, alpha=0.8,
                               markersize=np.sqrt(POINT_SIZE["model"]) * 1.8))
-    names.append("one initial array / one event")
+    names.append("one differentiation event")
     fig.legend(handles, names, frameon=False, fontsize=9, ncol=3,
                loc="lower center", bbox_to_anchor=(0.5, 0.005))
 
