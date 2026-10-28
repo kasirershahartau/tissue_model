@@ -6077,3 +6077,61 @@ class TestFindPsigmaBatchesAPassIntoOnePool:
         # gammaSC happens to be equal at both stages in the v2 fit; assert it
         # is carried per stage rather than hard-wired
         assert {t[1] for t in tasks} == {0.0105}
+
+
+class TestFindPsigmaCLIPassesMechanicsThrough:
+    """`azure_run find-psigma` must hand find_psigma the mechanics it was
+    given. It used to wrap every stage in tuple(), which on a dict yields the
+    KEYS -- so the v2 per-stage form arrived as ('gamma_sc', 'R_gamma', ...)
+    and died with "could not convert string to float: 'gamma_sc'". Only the
+    smoke test on the VM caught it, because the unit tests called find_psigma
+    directly and skipped the CLI's coercion."""
+
+    V2 = ('{"E17.5":{"gamma_sc":0.0105,"R_gamma":6.746124660721616,'
+          '"R_alpha":3.5,"A0":0.741812389049632},'
+          '"P0":{"gamma_sc":0.0105,"R_gamma":3.850521945713907,'
+          '"R_alpha":1.757,"A0":0.7585423232230211}}')
+
+    @staticmethod
+    def _args(mechanical_params):
+        import argparse
+        return argparse.Namespace(
+            mechanical_params=mechanical_params, indices=None,
+            psigma_bounds=[0.06, 0.12], n_grid=2, n_refine=0, n_sheets=10,
+            n_repeats=3, workers=4, bending=0.0, t_end=100.0, qst=0.03,
+            save_interval=0.1, stress_shift=0.0)
+
+    def _run(self, monkeypatch, mechanical_params):
+        import azure_run, full_model
+        seen = {}
+
+        def fake_find_psigma(mp, **kw):
+            seen["mp"] = mp
+            seen["kw"] = kw
+            return 0.09, {0.09: {"objective": 1.0}}
+
+        monkeypatch.setattr(full_model, "find_psigma", fake_find_psigma)
+        monkeypatch.setattr(azure_run, "_ensure_repo_cwd", lambda: None)
+        azure_run._cmd_find_psigma(self._args(mechanical_params))
+        return seen
+
+    def test_v2_dict_survives_the_cli(self, monkeypatch):
+        seen = self._run(monkeypatch, self.V2)
+        mp = seen["mp"]
+        assert isinstance(mp["E17.5"], dict), type(mp["E17.5"])
+        assert mp["E17.5"]["R_gamma"] == 6.746124660721616
+        assert mp["P0"]["A0"] == 0.7585423232230211
+        # and it is a form _stage_mechanics actually accepts
+        import full_model as fm
+        assert fm._stage_mechanics(mp["E17.5"], None)["gammaHC_ratio"] == 6.746124660721616
+
+    def test_legacy_list_still_becomes_a_tuple(self, monkeypatch):
+        seen = self._run(monkeypatch, '{"E17.5":[0.0105,3.5,0.0,0.0]}')
+        assert seen["mp"]["E17.5"] == (0.0105, 3.5, 0.0, 0.0)
+
+    def test_v2_settings_reach_find_psigma(self, monkeypatch):
+        """bending 0.0 and t_end 100, not find_psigma's pre-v2 defaults."""
+        kw = self._run(monkeypatch, self.V2)["kw"]
+        assert kw["bending"] == 0.0 and kw["t_end"] == 100.0
+        assert kw["n_arrays"] == 10 and kw["n_repeats"] == 3
+        assert kw["quasi_static_threshold"] == 0.03

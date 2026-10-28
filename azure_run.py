@@ -459,7 +459,13 @@ def _cmd_find_mech(args):
 def _cmd_find_psigma(args):
     _ensure_repo_cwd()
     from full_model import find_psigma
-    mechanical_params = {stage: tuple(vals) for stage, vals in json.loads(args.mechanical_params).items()}
+    # A stage's mechanics is EITHER a dict (the v2 form, carrying the per-stage
+    # R_gamma and A0) or the legacy 4-sequence. Do not coerce: tuple() on a
+    # dict yields its KEYS, which reached _stage_mechanics as a 4-sequence of
+    # strings and died on float('gamma_sc').
+    mechanical_params = {
+        stage: (vals if isinstance(vals, dict) else tuple(vals))
+        for stage, vals in json.loads(args.mechanical_params).items()}
     best, scores = find_psigma(
         mechanical_params, indices=args.indices,
         psigma_bounds=tuple(args.psigma_bounds), n_grid=args.n_grid,
