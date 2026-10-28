@@ -71,7 +71,40 @@ HATCH = "/"
 HATCH_PT = 0.162
 
 
-def gather(frame, results_dir=RESULTS_DIR):
+# The three ways to build an interface's stress from its mesh edges, and what
+# each needs from the table. "normalized" is what the lateral-inhibition ODE
+# reads and what every figure here used before the others were added.
+#   raw         sum(edge_stress)                  needs stress_raw
+#   weighted    sum(edge_stress * length)         = stress * L0, always derivable
+#   normalized  sum(edge_stress * length) / L0    the stored "stress" column
+VARIANTS = {
+    "raw": ("stress_raw", "interface stress, $\\sum\\sigma$", "_raw",
+            "sum(stress)"),
+    "weighted": ("stress_weighted",
+                 "interface stress, $\\sum\\sigma\\ell$", "_weighted",
+                 "sum(stress x length)"),
+    "normalized": ("stress", "interface stress, $\\sum\\sigma\\ell / L_0$", "",
+                   "sum(stress x length) / $L_0$"),
+}
+
+
+def _variant_column(detail, variant):
+    """The column for this variant, derived when the table predates it."""
+    col = VARIANTS[variant][0]
+    if col in detail.columns:
+        return col
+    if variant == "weighted" and {"stress", "L0"} <= set(detail.columns):
+        # exactly recoverable: the stored stress is already divided by this
+        # row's own L0, so multiplying it back costs nothing and loses nothing
+        detail["stress_weighted"] = detail["stress"] * detail["L0"]
+        return "stress_weighted"
+    raise SystemExit(
+        "fullmodel_edge_stress.pkl has no %r column and it cannot be derived."
+        "\n  Re-run build_edge_stress_table.py, which now stores the raw and"
+        " weighted sums alongside the normalized one." % col)
+
+
+def gather(frame, results_dir=RESULTS_DIR, variant="normalized"):
     """{pT: [one row per (stage, class)]} with pair values and per-array means."""
     detail = pd.read_pickle(os.path.join(results_dir, "fullmodel_edge_stress.pkl"))
     runs = read_table(os.path.join(results_dir, "fullmodel_runs.pkl"))
@@ -82,6 +115,7 @@ def gather(frame, results_dir=RESULTS_DIR):
         raise SystemExit("no rows for frame=%s" % frame)
     detail = detail.merge(runs[["model_name", "stage", "psigma", "initial_array"]],
                           on="model_name", how="left")
+    col = _variant_column(detail, variant)
 
     out = {}
     for pt in PANELS:
@@ -92,8 +126,8 @@ def gather(frame, results_dir=RESULTS_DIR):
                        & (detail["edge_class"] == kl)]
             if not len(g):
                 continue
-            per_pair = g["stress"].to_numpy(float)
-            per_unit = g.groupby("initial_array")["stress"].mean().to_numpy(float)
+            per_pair = g[col].to_numpy(float)
+            per_unit = g.groupby("initial_array")[col].mean().to_numpy(float)
             m, s = _mean_sem(per_unit)
             face, edge = STYLE[(True, stage)]
             rows.append(dict(index=i, stage=stage, pT=pt, edge_class=kl,
@@ -153,10 +187,16 @@ def _draw(ax, rows, rng, mean_markersize, max_points, point_size=POINT_S):
                 color=STAT_COLOUR, linestyle="none", zorder=5)
 
 
-def _finish(ax, ticks, labels, step):
+def _y_locator(ax, step):
+    """A fixed interval when one is given, matplotlib's choice when not."""
+    if step:
+        ax.yaxis.set_major_locator(MultipleLocator(step))
+
+
+def _finish(ax, ticks, labels, step, ylabel="interface stress"):
     """Shared axis dressing: y ticks, x ticks, room at the ends."""
-    ax.set_ylabel("interface stress", fontsize=10.5)
-    ax.yaxis.set_major_locator(MultipleLocator(step))
+    ax.set_ylabel(ylabel, fontsize=10.5)
+    _y_locator(ax, step)
     ax.set_xticks(ticks)
     ax.set_xticklabels(labels, fontsize=10)
     ax.set_xlim(min(ticks) - 0.75, max(ticks) + 0.75)
@@ -172,8 +212,8 @@ def draw_panels(data, a):
     for ax, pt in zip(axes, PANELS):
         _draw(ax, data[pt], np.random.default_rng(a.seed), a.mean_markersize,
               a.max_points, a.point_size)
-        ax.set_ylabel("interface stress", fontsize=10.5)
-        ax.yaxis.set_major_locator(MultipleLocator(a.y_tick_step))
+        ax.set_ylabel(VARIANTS[a.variant][1], fontsize=10.5)
+        _y_locator(ax, a.y_tick_step)
     # no per-panel title: the pT labels are added by hand afterwards. Every
     # other spine stays, so the pair is a closed box; the one that goes is the
     # LOWER panel's top, because the shared border is already drawn by the
@@ -183,7 +223,8 @@ def draw_panels(data, a):
     axes[-1].spines["top"].set_visible(False)
 
     ticks = [_x(i, s[0]) for i, s in enumerate(SOURCES)]
-    _finish(axes[-1], ticks, [kl for _s, kl in SOURCES], a.y_tick_step)
+    _finish(axes[-1], ticks, [kl for _s, kl in SOURCES], a.y_tick_step,
+            VARIANTS[a.variant][1])
     for stage in ("E17.5", "P0"):
         xs = [t for t, s in zip(ticks, SOURCES) if s[0] == stage]
         axes[0].annotate(stage, xy=(np.mean(xs), 1.04),
@@ -200,7 +241,7 @@ def draw_single(data, a):
     _draw(ax, rows, np.random.default_rng(a.seed), a.mean_markersize,
           a.max_points, a.point_size)
     _finish(ax, [d["x"] for d in rows], [d["edge_class"] for d in rows],
-            a.y_tick_step)
+            a.y_tick_step, VARIANTS[a.variant][1])
 
     # two label rows under the axis: the pT of each block, then the stage
     # spanning its two blocks. Both are pushed below the class labels so the
@@ -229,6 +270,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--frame", choices=("t0", "initial"), default="t0")
+    ap.add_argument("--variant", choices=tuple(VARIANTS), default="normalized",
+                    help="how an interface's stress is built from its mesh"
+                         " edges: raw sum, length-weighted sum, or that sum"
+                         " over L0 (the default, and what the LI ODE reads)")
     ap.add_argument("--layout", choices=("panels", "single"), default="panels",
                     help="panels (default): one panel per pT, stacked. "
                          "single: all eight distributions in one axes")
@@ -240,12 +285,19 @@ def main():
                     default=POINT_S, help="scatter marker area (default %g)"
                                           % POINT_S)
     ap.add_argument("--y-tick-step", dest="y_tick_step", type=float,
-                    default=Y_TICK_STEP)
+                    default=None,
+                    help="y tick interval; the default suits the variant"
+                         " (%g for the normalized scale, automatic for the"
+                         " others, whose range is far larger)" % Y_TICK_STEP)
     ap.add_argument("--out", default=None)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    # 0.1 steps were chosen for the normalized scale; on the raw and
+    # weighted ones they produce hundreds of unreadable ticks
+    if a.y_tick_step is None:
+        a.y_tick_step = Y_TICK_STEP if a.variant == 'normalized' else 0.0
 
-    data = gather(a.frame)
+    data = gather(a.frame, variant=a.variant)
     print("  frame %s, %s effectors\n" % (a.frame, EFFECTORS))
     print("  %-7s %-6s %-7s %10s %10s %8s %7s"
           % ("pT", "stage", "class", "mean", "SEM", "pairs", "arrays"))
@@ -282,16 +334,20 @@ def main():
                loc="lower center", bbox_to_anchor=(0.5, 0.005))
 
     fig.suptitle("Mechanical stress on a cell-cell interface at %s\n"
-                 "sum(stress x length) / $L_0$ per neighbour pair;"
-                 "  star = mean over arrays, whisker = SEM" % a.frame,
+                 "%s per neighbour pair;"
+                 "  star = mean over arrays, whisker = SEM"
+                 % (a.frame, VARIANTS[a.variant][3]),
                  fontsize=11, y=0.99, va="top", linespacing=1.6)
     fig.subplots_adjust(left=0.115, right=0.98, top=0.875, bottom=0.135)
 
     # the two layouts write to different names, so making one does not
     # overwrite the other
+    # layout and variant each get their own name, so building one never
+    # overwrites another
     stem = os.path.splitext(a.out or os.path.join(
-        RESULTS_DIR, "edge_stress_%s%s"
-        % (a.frame, "_single" if a.layout == "single" else "")))[0]
+        RESULTS_DIR, "edge_stress_%s%s%s"
+        % (a.frame, "_single" if a.layout == "single" else "",
+           VARIANTS[a.variant][2])))[0]
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)
         print("\nwrote %s.%s" % (stem, ext))

@@ -14,7 +14,7 @@ __pycache__/
 *.key
 
 # Simulation output and analysis products. Results live under TISSUE_RESULTS_DIR
-# (D:\Kasirer\results by default), not in the tree; these patterns catch the
+# (D:\kasirer\model_results by default), not in the tree; these patterns catch the
 # strays that land here. The tables are reproducible from the runs and are
 # submitted to the journal separately.
 *.hf5

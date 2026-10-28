@@ -26,8 +26,15 @@ _MAX_GIF_PATH_LEN = 200
 # Where run folders live: one sub-directory per run, each holding history.hf5 and
 # its parameters. Simulation archives reach several GB, so this usually points at
 # a data drive rather than the working copy.
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR",
-                             os.path.join(os.getcwd(), "results"))
+#
+# The default is an ABSOLUTE path, deliberately: it used to fall back to
+# ``cwd/results``, so a script launched from the wrong directory wrote a fresh
+# tree of run folders somewhere else and silently found none of the existing
+# ones. A fixed path fails loudly on the wrong machine instead of quietly
+# succeeding in the wrong place. Override with TISSUE_RESULTS_DIR — mandatory
+# off this box, e.g. on the Linux VM (see azure_run.py).
+DEFAULT_RESULTS_DIR = r"D:\kasirer\model_results"
+RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", DEFAULT_RESULTS_DIR)
 
 
 def load_history_file(load_name):

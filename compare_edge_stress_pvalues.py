@@ -45,7 +45,9 @@ import warnings
 import numpy as np
 import pandas as pd
 
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\Kasirer\results")
+# keep in step with history_io.DEFAULT_RESULTS_DIR (not imported: that module
+# pulls in tyssue, which this script does not otherwise need)
+RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\kasirer\model_results")
 ANALYZER_PATH = os.environ.get(
     "TISSUE_ANALYZER_PATH",
     r"C:\Users\Kasirer\Phd\mouse_ear_project\tissue_image_processing\tissue_analyzing_tool")

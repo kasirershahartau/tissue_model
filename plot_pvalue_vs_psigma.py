@@ -56,7 +56,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\Kasirer\results")
+# keep in step with history_io.DEFAULT_RESULTS_DIR (not imported: that module
+# pulls in tyssue, which this script does not otherwise need)
+RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\kasirer\model_results")
 EXP_DIR = os.environ.get(                       # same default as post_processing
     "EXPERIMENTAL_DATA_DIR",
     r"C:\Users\Kasirer\Phd\mouse_ear_project\papers"

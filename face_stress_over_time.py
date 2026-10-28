@@ -67,6 +67,30 @@ def _face_stress(sheet, effectors, L0):
     return tmp.groupby("face")["ws"].sum() / L0
 
 
+# The three ways to build a face's stress from its edges. "normalized" is what
+# the lateral-inhibition ODE reads and keeps the plain effector-set name, so
+# every table and figure written before the others existed stays valid; the
+# other two are tagged onto the effector key as "<set>|raw" / "<set>|weighted"
+# and travel through the per-run / per-array / summary tables untouched.
+FACE_VARIANTS = ("normalized", "weighted", "raw")
+
+
+def variant_key(set_name, variant):
+    return set_name if variant == "normalized" else "%s|%s" % (set_name, variant)
+
+
+def _face_stress_all(sheet, effectors, L0):
+    """{variant: per-face stress}, all three off one pass over the edges."""
+    edge_stress = _Shim(sheet).get_edge_stress(effectors)
+    tmp = sheet.edge_df[["face", "length"]].copy()
+    tmp["s"] = np.asarray(edge_stress.values)
+    tmp["ws"] = tmp["s"].values * tmp["length"].values
+    g = tmp.groupby("face")
+    raw = g["s"].sum()
+    weighted = g["ws"].sum()
+    return {"raw": raw, "weighted": weighted, "normalized": weighted / L0}
+
+
 def one_run(args):
     """Sample one run: returns rows of (time, effector_set, cell_type, nbrs, stress)."""
     name, interval, type_by, threshold = args
@@ -106,15 +130,19 @@ def one_run(args):
                                  float(np.nanmean(area[m])), float(np.nanmean(perim[m])),
                                  float("nan")))
             for set_name, effectors in EFFECTOR_SETS.items():
-                stress = _face_stress(sheet, effectors, L0).reindex(labels).values
-                for cell_type, nb in GROUPS:
-                    mask = (is_hc if cell_type == "HC" else ~is_hc) & (bins == nb)
-                    vals = stress[mask]
-                    vals = vals[np.isfinite(vals)]
-                    if vals.size:
-                        rows.append((float(t), set_name, cell_type, nb,
-                                     vals.size, float(vals.mean()), float(vals.std()),
-                                     float(np.mean(vals > 0))))
+                per_variant = _face_stress_all(sheet, effectors, L0)
+                for variant in FACE_VARIANTS:
+                    stress = per_variant[variant].reindex(labels).values
+                    key = variant_key(set_name, variant)
+                    for cell_type, nb in GROUPS:
+                        mask = (is_hc if cell_type == "HC" else ~is_hc) & (bins == nb)
+                        vals = stress[mask]
+                        vals = vals[np.isfinite(vals)]
+                        if vals.size:
+                            rows.append((float(t), key, cell_type, nb,
+                                         vals.size, float(vals.mean()),
+                                         float(vals.std()),
+                                         float(np.mean(vals > 0))))
         return name, rows, None
     except Exception as exc:  # noqa: BLE001 - one bad run must not kill the sweep
         return name, rows, "%s: %s" % (type(exc).__name__, exc)

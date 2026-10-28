@@ -15,7 +15,7 @@ from concurrent.futures import ProcessPoolExecutor
 MODEL = r"C:/Users/Kasirer/Phd/mouse_ear_project/tissue_model"
 sys.path.insert(0, MODEL)
 sys.path.insert(0, os.path.join(MODEL, "tyssue", "src"))
-os.environ.setdefault("TISSUE_RESULTS_DIR", r"D:/Kasirer/results")
+os.environ.setdefault("TISSUE_RESULTS_DIR", r"D:/kasirer/model_results")
 
 # best E17.5 re-fit point so far
 GSC, AHC, HC_P0, SC_P0 = 0.2461, 1.0633, 3.9460, 4.6440

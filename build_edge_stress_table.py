@@ -123,14 +123,25 @@ def one_run(args):
                                     float)[where]
                 # sum(stress * length) / L0 over the mesh edges of one interface —
                 # the face-stress construction restricted to a single neighbour
+                # All three definitions come off the same per-edge numbers, so
+                # they are stored together and the figures pick one without
+                # re-reading an archive:
+                #   stress_raw      sum(edge_stress)            -- unweighted
+                #   stress_weighted sum(edge_stress * length)   -- what the
+                #                   model's get_face_stress returns
+                #   stress          stress_weighted / L0        -- what the LI
+                #                   ODE reads, and the historical column name
                 edges = pd.DataFrame(dict(face_a=face_a, face_b=face_b,
                                           edge_class=klass, length=length,
+                                          raw=stress,
                                           weighted=stress * length))
                 pair = edges.groupby(["face_a", "face_b", "edge_class"],
                                      sort=False).agg(
-                    stress=("weighted", lambda w: w.sum() / L0),
+                    stress_raw=("raw", "sum"),
+                    stress_weighted=("weighted", "sum"),
                     contact_length=("length", "sum"),
                     n_edges=("length", "size")).reset_index()
+                pair["stress"] = pair["stress_weighted"] / L0
                 pair.insert(0, "effectors", set_name)
                 pair.insert(0, "time", t)
                 pair.insert(0, "frame", frame)

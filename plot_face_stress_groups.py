@@ -65,6 +65,13 @@ def gather(psigmas=PSIGMAS, results_dir=RESULTS_DIR):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--variant", choices=("normalized", "weighted", "raw"),
+                    default="normalized",
+                    help="how a face's stress is built from its edges: the raw"
+                         " sum, the length-weighted sum, or that sum over L0"
+                         " (the default, and what the Hill gate reads). It is"
+                         " composed onto --effectors to give the key the"
+                         " tables are stored under")
     ap.add_argument("--effectors", default="contractility",
                     choices=("contractility", "all"),
                     help="which stress the figure shows (the gate reads"
@@ -77,6 +84,10 @@ def main():
                     help="output path; the extension is ignored, both .png and"
                          " .svg are written")
     a = ap.parse_args()
+    # the tables key the two non-default variants as "<set>|<variant>"; the
+    # normalized one keeps the plain set name, so older tables stay readable
+    a.effectors = (a.effectors if a.variant == "normalized"
+                   else "%s|%s" % (a.effectors, a.variant))
 
     table = gather()
     print("  combined summary: %d rows  (psigma %s, stages %s, effectors %s)"
@@ -138,8 +149,9 @@ def main():
     fig.subplots_adjust(left=0.085, right=0.915, top=0.985, bottom=0.085,
                         hspace=0, wspace=0)
 
-    stem = os.path.splitext(a.out or os.path.join(RESULTS_DIR,
-                                                  "face_stress_groups"))[0]
+    stem = os.path.splitext(a.out or os.path.join(
+        RESULTS_DIR, "face_stress_groups%s"
+        % ("" if a.variant == "normalized" else "_" + a.variant)))[0]
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)
         print("\nwrote %s.%s" % (stem, ext))

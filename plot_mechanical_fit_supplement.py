@@ -36,10 +36,11 @@ from post_processing import RESULTS_DIR
 from plot_mechanical_fit_history import (load_scan, TERMS, TERM_LABEL,
                                          TERM_COLOUR, CHOSEN, save)
 
-CMAP = "plasma"
-# the box round the winning cell: plasma runs dark blue -> yellow, so black is
-# lost on a low-score cell, which is exactly where the winner sits
-BEST_BOX_COLOUR = "#00ff3b"
+CMAP = "plasma_r"             # yellow = low score, dark blue = high
+# The box round the winning cell. With the scale reversed the winner always
+# sits on the LIGHT end, so black reads against it; under the un-reversed
+# plasma it sat on dark blue and had to be bright green instead.
+BEST_BOX_COLOUR = "black"
 COMBINED_LABEL = r"combined, $\sum z^2$"
 COMBINED_COLOUR = "black"
 # the gamma_SC walk that picked each stage's point: A0 solved self-consistently

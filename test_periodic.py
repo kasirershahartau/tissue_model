@@ -5669,3 +5669,411 @@ class TestFindNonBoundaryCells:
         kept = list(find_non_boundary_cells(sheet))
         assert 7 in kept, "face 7 excluded by an edge/face label collision"
         assert 0 not in kept and 6 not in kept    # boundary face and its neighbour
+
+
+class TestEdgeTensionIsTheEnergyDerivative:
+    """``get_edge_stress`` must return dE/dl of the interface, not a
+    projection of the vertex forces.
+
+    The energy depends on edge lengths ONLY through the face perimeters
+    (the area term is not a function of edge length at fixed vertex
+    positions), so for E = sum_c [K/2 (A_c-A0_c)^2 + Gamma_c/2 P_c^2]
+
+        dE/dl_e = Gamma_n P_n + Gamma_m P_m
+
+    over the one or two faces containing e. These tests differentiate that
+    energy NUMERICALLY, in edge-length space, and compare.
+    """
+
+    @staticmethod
+    def _build():
+        np.random.seed(0)
+        sheet = VirtualSheet.planar_virtual_sheet_2d(
+            "p4x4", nx=4, ny=4, distx=1.0, disty=1.0,
+            maximal_bond_length=10.0, minimal_bond_length=0.05,
+            periodic=True, draw_debug=False,
+        )
+        from inner_ear_model import InnerEarModel
+        inner = InnerEarModel(
+            sheet,
+            tension={('HC', 'HC'): 0.05, ('HC', 'SC'): 0.05, ('SC', 'SC'): 0.05},
+            repulsion={'HC': 0., 'SC': 0.},
+            repulsion_distance={'HC': 0., 'SC': 0.},
+            preferred_area={'HC': 0.5, 'SC': 0.5},
+            contractility={'HC': 0.1, 'SC': 0.1},
+            elasticity={'HC': 1., 'SC': 1.},
+        )
+        # Make the cells mechanically DIFFERENT, so a formula that used one
+        # cell's contractility for both sides of a junction would be caught.
+        rng = np.random.default_rng(3)
+        n = inner.sheet.face_df.shape[0]
+        inner.sheet.face_df["contractility"] = rng.uniform(0.05, 0.4, n)
+        inner.sheet.geom.update_all(inner.sheet)
+        return inner
+
+    @staticmethod
+    def _energy_from_edge_lengths(sheet, lengths):
+        """The contractility energy as a function of the edge-length vector:
+        sum_c Gamma_c/2 (sum_{e in c} l_e)^2. The area term is independent of
+        l and so drops out of the derivative."""
+        face = sheet.edge_df["face"].to_numpy()
+        perim = np.bincount(sheet.face_df.index.get_indexer(face),
+                            weights=lengths,
+                            minlength=sheet.face_df.shape[0])
+        gamma = (sheet.face_df["contractility"]
+                 * sheet.face_df["is_alive"]).to_numpy(dtype=float)
+        return float(np.sum(0.5 * gamma * perim ** 2))
+
+    def test_matches_numerical_dE_dl(self):
+        from inner_ear_model import ContractilityPerimeterElasticity
+        from tyssue.dynamics.effectors import FaceAreaElasticity
+        inner = self._build()
+        sheet = inner.sheet
+        tension = inner.get_edge_stress(
+            [ContractilityPerimeterElasticity, FaceAreaElasticity]).to_numpy()
+
+        lengths = sheet.edge_df["length"].to_numpy(dtype=float).copy()
+        eps = 1e-6
+        # a spread of edges, including ones on the periodic seam
+        probes = np.linspace(0, len(lengths) - 1, 25).astype(int)
+        for e in probes:
+            plus = lengths.copy(); plus[e] += eps
+            minus = lengths.copy(); minus[e] -= eps
+            numeric = ((self._energy_from_edge_lengths(sheet, plus)
+                        - self._energy_from_edge_lengths(sheet, minus))
+                       / (2 * eps))
+            # The numerical derivative moves ONE half-edge, so it picks up only
+            # that half-edge's face; the physical junction carries both, which
+            # is what get_edge_stress returns. Add the opposite's own term.
+            opp = int(sheet.edge_df["opposite"].to_numpy()[e])
+            if opp >= 0:
+                o = sheet.edge_df.index.get_indexer([opp])[0]
+                plus = lengths.copy(); plus[o] += eps
+                minus = lengths.copy(); minus[o] -= eps
+                numeric += ((self._energy_from_edge_lengths(sheet, plus)
+                             - self._energy_from_edge_lengths(sheet, minus))
+                            / (2 * eps))
+            assert abs(tension[e] - numeric) < 1e-6 * max(1.0, abs(numeric)), (
+                "edge %d: get_edge_stress gave %.8g, numerical dE/dl is %.8g"
+                % (e, tension[e], numeric))
+
+    def test_equals_gamma_n_Pn_plus_gamma_m_Pm(self):
+        from inner_ear_model import ContractilityPerimeterElasticity
+        inner = self._build()
+        sheet = inner.sheet
+        tension = inner.get_edge_stress([ContractilityPerimeterElasticity]).to_numpy()
+
+        gamma_p = (sheet.face_df["contractility"] * sheet.face_df["is_alive"]
+                   * sheet.face_df["perimeter"])
+        own = sheet.upcast_face(gamma_p).to_numpy(dtype=float)
+        opp = sheet.edge_df["opposite"].to_numpy()
+        expected = own.copy()
+        has = opp >= 0
+        expected[has] += own[sheet.edge_df.index.get_indexer(opp[has])]
+        assert np.allclose(tension, expected)
+
+    def test_both_half_edges_of_a_junction_carry_the_same_tension(self):
+        from inner_ear_model import ContractilityPerimeterElasticity
+        inner = self._build()
+        sheet = inner.sheet
+        tension = inner.get_edge_stress([ContractilityPerimeterElasticity]).to_numpy()
+        opp = sheet.edge_df["opposite"].to_numpy()
+        has = np.where(opp >= 0)[0]
+        mirror = sheet.edge_df.index.get_indexer(opp[has])
+        assert np.allclose(tension[has], tension[mirror]), (
+            "a junction carries one tension; its two half-edges disagree")
+
+    def test_area_elasticity_does_not_change_the_tension(self):
+        from inner_ear_model import ContractilityPerimeterElasticity
+        from tyssue.dynamics.effectors import FaceAreaElasticity
+        inner = self._build()
+        without = inner.get_edge_stress([ContractilityPerimeterElasticity])
+        with_area = inner.get_edge_stress(
+            [ContractilityPerimeterElasticity, FaceAreaElasticity])
+        assert np.allclose(without.to_numpy(), with_area.to_numpy()), (
+            "the area term is not a function of edge length; it must not "
+            "enter dE/dl")
+
+    def test_switched_on_unsupported_effector_raises(self):
+        from inner_ear_model import ContractilityPerimeterElasticity, BoundaryBending
+        from tyssue.dynamics.effectors import LineTension
+        inner = self._build()
+        inner.sheet.face_df["bending"] = 0.3
+        inner.sheet.edge_df["line_tension"] = 0.2
+        for extra in (LineTension, BoundaryBending):
+            with pytest.raises(NotImplementedError) as exc:
+                inner.get_edge_stress([ContractilityPerimeterElasticity, extra])
+            assert extra.__name__ in str(exc.value)
+
+    def test_switched_off_unsupported_effector_is_allowed(self):
+        """kappa = 0 bending is an exact no-op, and the v2 runs carry it in
+        their "all" set. Refusing it by class alone would reject a set this
+        expression handles exactly."""
+        from inner_ear_model import ContractilityPerimeterElasticity, BoundaryBending
+        inner = self._build()
+        inner.sheet.face_df["bending"] = 0.0
+        plain = inner.get_edge_stress([ContractilityPerimeterElasticity])
+        with_bending = inner.get_edge_stress(
+            [ContractilityPerimeterElasticity, BoundaryBending])
+        assert np.allclose(plain.to_numpy(), with_bending.to_numpy())
+
+    def test_no_contractility_effector_raises(self):
+        from tyssue.dynamics.effectors import FaceAreaElasticity
+        inner = self._build()
+        with pytest.raises(ValueError):
+            inner.get_edge_stress([FaceAreaElasticity])
+
+    def test_non_zero_target_perimeter_raises(self):
+        from inner_ear_model import ContractilityPerimeterElasticity
+        inner = self._build()
+        inner.sheet.face_df["prefered_perimeter"] = 0.0
+        inner.sheet.face_df.loc[inner.sheet.face_df.index[2],
+                                "prefered_perimeter"] = 0.7
+        with pytest.raises(NotImplementedError) as exc:
+            inner.get_edge_stress([ContractilityPerimeterElasticity])
+        assert "P0" in str(exc.value)
+
+
+class TestFindPsigmaBatchesAPassIntoOnePool:
+    """``find_psigma`` must pool a whole PASS -- every (psigma, stage, array)
+    run -- and still attribute each run to the point it belongs to.
+
+    The risk the batching introduces is a slice that silently scores one
+    point's runs under another point's psigma, which would corrupt the fit
+    without erroring. These tests run the serial path (n_workers=1) and check
+    the attribution directly.
+    """
+
+    @staticmethod
+    def _params():
+        return {"E17.5": (0.0105, 3.5, 0.0, 0.0), "P0": (0.0105, 1.757, 0.0, 0.0)}
+
+    def _patch(self, monkeypatch, seen):
+        import full_model as fm
+
+        def fake_run(task):
+            # mirror _run_full_model_one's name: the prefix (task[22]) is what
+            # separates one repeat's folder from another's
+            initial, psigma, prefix = task[0], task[15], task[22]
+            return "%s_%s|ps=%.5g" % (prefix, initial, psigma)
+
+        def fake_score(stage, model_names=None, type_by=None, threshold=None,
+                       max_number_of_neighbors=None):
+            ps = {n.split("|ps=")[1] for n in model_names}
+            assert len(ps) == 1, "one point's scoring saw several psigma: %s" % ps
+            seen.append((stage, float(ps.pop()), tuple(model_names)))
+            # score minimised at psigma = 0.1 so the refinement has a target
+            value = abs(float(model_names[0].split("|ps=")[1]) - 0.1)
+            return {"total": value}
+
+        monkeypatch.setattr(fm, "_run_full_model_one", fake_run)
+        monkeypatch.setattr(fm, "compare_full_model_differentiation_to_experiments",
+                            fake_score)
+        return fm
+
+    def test_each_point_is_scored_on_its_own_runs(self, monkeypatch):
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        best, scores = fm.find_psigma(
+            self._params(), psigma_bounds=(0.0, 0.2), n_grid=3, n_refine=0,
+            n_arrays=4, n_repeats=1, n_workers=1, plot=False,
+            save_json=False, use_score_cache=False)
+
+        assert sorted(scores) == [0.0, 0.1, 0.2]
+        for psigma, entry in scores.items():
+            for stage in ("E17.5", "P0"):
+                # the score the fake returns IS |psigma - 0.1|; if the batching
+                # mixed points up this would be another point's value
+                assert abs(entry[stage]["total"] - abs(psigma - 0.1)) < 1e-12, (
+                    "psigma=%g %s scored %g" % (psigma, stage, entry[stage]["total"]))
+            assert abs(entry["objective"]
+                       - sum(entry[s]["total"] for s in ("E17.5", "P0"))) < 1e-12
+        assert abs(best - 0.1) < 1e-12
+
+    def test_every_run_of_the_pass_is_launched_once(self, monkeypatch):
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        fm.find_psigma(self._params(), psigma_bounds=(0.0, 0.2), n_grid=3,
+                       n_refine=0, n_arrays=4, n_repeats=1, n_workers=1,
+                       plot=False, save_json=False, use_score_cache=False)
+        # 3 psigma x 2 stages scored, each on its own 4 arrays
+        assert len(seen) == 6, [s[:2] for s in seen]
+        assert {(s, p) for s, p, _ in seen} == {
+            (st, ps) for st in ("E17.5", "P0") for ps in (0.0, 0.1, 0.2)}
+        for stage, psigma, names in seen:
+            assert len(names) == 4 and len(set(names)) == 4
+            suffix = "_for_E17" if stage == "E17.5" else "_for_P0"
+            assert all(suffix in n for n in names), (
+                "%s point scored the other stage's arrays: %s" % (stage, names))
+
+    def test_repeats_are_pooled_into_one_score_per_point(self, monkeypatch):
+        """Each point is scored on n_arrays x n_repeats runs, each repeat in
+        its own folder prefix -- otherwise repeat 2 would be handed repeat 1's
+        folder by reuse_existing_run."""
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        fm.find_psigma(self._params(), psigma_bounds=(0.06, 0.12), n_grid=3,
+                       n_refine=0, n_arrays=4, n_repeats=3, n_workers=1,
+                       plot=False, save_json=False, use_score_cache=False)
+        assert len(seen) == 6
+        for stage, psigma, names in seen:
+            assert len(names) == 12, "%d runs pooled, expected 4x3" % len(names)
+            assert len(set(names)) == 12, "a repeat reused another's folder"
+            prefixes = {n.split("_random_periodic")[0] for n in names}
+            assert prefixes == {fm.REPEAT_PREFIX[r] for r in (1, 2, 3)}, prefixes
+
+    def test_the_fit_never_visits_psigma_zero_when_bounds_exclude_it(self, monkeypatch):
+        """pT = 0 is scored locally from the archived baseline, not on the VM.
+        The refinement window is clamped to psigma_bounds, so a lower bound
+        above 0 keeps every pass off it."""
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        _best, scores = fm.find_psigma(
+            self._params(), psigma_bounds=(0.06, 0.12), n_grid=7, n_refine=2,
+            n_arrays=2, n_repeats=1, n_workers=1, plot=False, save_json=False,
+            use_score_cache=False)
+        assert 0.0 not in scores
+        assert min(scores) >= 0.06 - 1e-12, sorted(scores)[:3]
+        assert all(p >= 0.06 - 1e-12 for _s, p, _n in seen)
+
+    def test_n_repeats_out_of_range_is_refused(self, monkeypatch):
+        import full_model as fm
+        for bad in (0, len(fm.REPEAT_PREFIX) + 1):
+            with pytest.raises(ValueError):
+                fm.find_psigma(self._params(), psigma_bounds=(0.06, 0.12),
+                               n_grid=2, n_refine=0, n_arrays=1, n_repeats=bad,
+                               n_workers=1, plot=False, save_json=False,
+                               use_score_cache=False)
+
+    def test_refinement_passes_still_run_in_sequence(self, monkeypatch):
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        best, scores = fm.find_psigma(
+            self._params(), psigma_bounds=(0.0, 0.4), n_grid=5, n_refine=1,
+            n_arrays=2, n_repeats=1, n_workers=1, plot=False,
+            save_json=False, use_score_cache=False)
+        # pass 1: 0, .1, .2, .3, .4 (step .1) -> best .1; pass 2 halves the step
+        # around it, adding .05 and .15. Only the PASSES are sequential: the
+        # second cannot be batched with the first because it needs its minimum.
+        assert {0.0, 0.1, 0.2, 0.3, 0.4} <= set(scores)
+        assert {0.05, 0.15} <= set(scores), sorted(scores)
+        assert abs(best - 0.1) < 1e-12
+        # and no point was simulated or scored twice across the two passes
+        scored = [(s, p) for s, p, _ in seen]
+        assert len(scored) == len(set(scored)), scored
+
+    def test_task_tuple_keeps_l0_ratio_last(self):
+        import full_model as fm
+        tasks = fm.full_model_tasks(
+            "E17.5", 0.0105, 3.5, 0.0, 0.0, atoh_sensitivity=0.355,
+            psigma=0.123, n_arrays=3, l0_ratio=7.0)
+        assert len(tasks) == 3
+        for t in tasks:
+            assert t[-1] == 7.0, "l0_ratio must stay LAST in the positional tuple"
+            assert t[15] == 0.123, "psigma moved within the task tuple"
+            assert "_for_E17" in t[0]
+
+    def test_run_full_model_arrays_builds_the_same_tasks(self, monkeypatch):
+        import full_model as fm
+        captured = []
+        monkeypatch.setattr(fm, "_run_full_model_one",
+                            lambda task: captured.append(task) or "n")
+        fm.run_full_model_arrays("P0", 0.0105, 1.757, 0.0, 0.0,
+                                 atoh_sensitivity=0.355, psigma=0.05,
+                                 n_arrays=3, n_workers=1)
+        expected = fm.full_model_tasks("P0", 0.0105, 1.757, 0.0, 0.0,
+                                       atoh_sensitivity=0.355, psigma=0.05,
+                                       n_arrays=3)
+        assert captured == expected
+
+    def test_per_stage_gammaHC_ratio_and_A0_reach_the_runs(self, monkeypatch):
+        """The v2 fit has R_gamma 6.746 / 3.851 and A0 0.7418 / 0.7585 PER
+        STAGE. The legacy 4-tuple cannot carry either, so a dict must, and the
+        values must reach the task tuple (gammaHC_ratio is arg 2, A0 arg 16)."""
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        tasks = []
+        real = fm._run_full_model_one
+
+        def capture(task):
+            tasks.append(task)
+            return real(task)
+
+        monkeypatch.setattr(fm, "_run_full_model_one", capture)
+        fm.find_psigma(
+            {"E17.5": {"gamma_sc": 0.0105, "R_gamma": 6.746, "R_alpha": 3.5,
+                       "A0": 0.741812},
+             "P0": {"gamma_sc": 0.0105, "R_gamma": 3.850522, "R_alpha": 1.757,
+                    "A0": 0.758542}},
+            psigma_bounds=(0.06, 0.12), n_grid=2, n_refine=0, n_arrays=1,
+            n_repeats=1, n_workers=1, plot=False, save_json=False,
+            use_score_cache=False)
+        by_stage = {}
+        for t in tasks:
+            stage = "E17.5" if "_for_E17" in t[0] else "P0"
+            by_stage.setdefault(stage, set()).add((t[2], t[3], t[16]))
+        assert by_stage["E17.5"] == {(6.746, 3.5, 0.741812)}, by_stage["E17.5"]
+        assert by_stage["P0"] == {(3.850522, 1.757, 0.758542)}, by_stage["P0"]
+
+    def test_legacy_four_tuple_still_works(self):
+        import full_model as fm
+        m = fm._stage_mechanics((0.0105, 3.5, 0.0, 0.0), 0.74)
+        assert m["gammaSC"] == 0.0105 and m["alphaHC_ratio"] == 3.5
+        assert m["gammaHC_ratio"] == 1.0          # the old hard-wired value
+        assert m["preferred_area"] == 0.74        # falls back to the sweep-wide one
+
+    def test_malformed_stage_mechanics_is_refused(self):
+        import full_model as fm
+        with pytest.raises(ValueError):
+            fm._stage_mechanics((0.0105, 3.5, 0.0), None)
+        with pytest.raises(ValueError):
+            fm._stage_mechanics({"R_gamma": 6.746}, None)    # no gammaSC
+
+    def test_shared_LI_params_but_per_stage_arrays_and_mechanics(self, monkeypatch):
+        """pT (psigma), pS, pR and the atoh threshold are SHARED by both
+        stages at every sweep point; the initial arrays and the mechanics are
+        per stage. Asserted on the task tuples actually handed to the runner."""
+        seen = []
+        fm = self._patch(monkeypatch, seen)
+        tasks = []
+        real = fm._run_full_model_one
+        monkeypatch.setattr(fm, "_run_full_model_one",
+                            lambda t: (tasks.append(t), real(t))[1])
+        fm.find_psigma(
+            {"E17.5": {"gamma_sc": 0.0105, "R_gamma": 6.746124660721616,
+                       "R_alpha": 3.5, "A0": 0.741812389049632},
+             "P0": {"gamma_sc": 0.0105, "R_gamma": 3.850521945713907,
+                    "R_alpha": 1.757, "A0": 0.7585423232230211}},
+            psigma_bounds=(0.06, 0.12), n_grid=3, n_refine=0, n_arrays=2,
+            n_repeats=1, n_workers=1, plot=False, save_json=False,
+            use_score_cache=False,
+            notch_sensitivity=0.1, repressor_sensitivity=0.3,
+            atoh_sensitivity=0.355079)
+
+        e17 = [t for t in tasks if "_for_E17" in t[0]]
+        p0 = [t for t in tasks if "_for_P0" in t[0]]
+        assert len(e17) == len(p0) == 6          # 3 psigma x 2 arrays
+
+        # --- SHARED across stages: the lateral-inhibition parameters --------
+        # task layout: 6 atoh, 7 notch(pS), 8 repressor(pR), 15 psigma
+        for i in (6, 7, 8):
+            assert {t[i] for t in tasks} == {(0.355079, 0.1, 0.3)[i - 6]}, (
+                "LI parameter at index %d differs between stages/points" % i)
+        # every psigma appears for BOTH stages, i.e. pT is swept jointly
+        assert ({t[15] for t in e17} == {t[15] for t in p0}
+                == {0.06, 0.09, 0.12})
+
+        # --- PER STAGE: the initial arrays ----------------------------------
+        assert {t[0] for t in e17} == {
+            "random_periodic_array0_for_E17", "random_periodic_array1_for_E17"}
+        assert {t[0] for t in p0} == {
+            "random_periodic_array0_for_P0", "random_periodic_array1_for_P0"}
+
+        # --- PER STAGE: the mechanics (gammaHC_ratio 2, alphaHC 3, A0 16) ---
+        assert {(t[2], t[3], t[16]) for t in e17} == {
+            (6.746124660721616, 3.5, 0.741812389049632)}
+        assert {(t[2], t[3], t[16]) for t in p0} == {
+            (3.850521945713907, 1.757, 0.7585423232230211)}
+        # gammaSC happens to be equal at both stages in the v2 fit; assert it
+        # is carried per stage rather than hard-wired
+        assert {t[1] for t in tasks} == {0.0105}
