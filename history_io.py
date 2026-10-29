@@ -37,6 +37,33 @@ DEFAULT_RESULTS_DIR = r"D:\kasirer\model_results"
 RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", DEFAULT_RESULTS_DIR)
 
 
+def _results_dir_problem(results_dir, default=DEFAULT_RESULTS_DIR,
+                         os_name=os.name):
+    """Why ``results_dir`` is unusable on this OS, or None if it is fine.
+
+    "Fails loudly on the wrong machine" (above) was not true off Windows: a
+    drive-letter path is not absolute on POSIX, so ``os.path.join`` quietly
+    produced a RELATIVE directory and every run landed under the current
+    working directory. On the Azure VM that meant a tree literally named
+    ``D:\\kasirer\\model_results`` inside the repo, filling the 128 GB OS disk
+    while the 2 TiB data disk sat empty -- and it only came to light hours in.
+    """
+    if os_name == "nt" or results_dir != default:
+        return None
+    return (
+        "TISSUE_RESULTS_DIR is not set, and the built-in default %r is a "
+        "Windows path. On this OS it is RELATIVE, so every run would be "
+        "written under the current working directory instead of the results "
+        "drive. Set it before importing, e.g.\n"
+        "    export TISSUE_RESULTS_DIR=/data/results" % default)
+
+
+_problem = _results_dir_problem(RESULTS_DIR)
+if _problem:
+    raise RuntimeError(_problem)
+del _problem
+
+
 def load_history_file(load_name):
     load_path = os.path.join(RESULTS_DIR, load_name)
     history = HistoryHdf5.from_archive(os.path.join(load_path, "history.hf5"), eptm_class=VirtualSheet)

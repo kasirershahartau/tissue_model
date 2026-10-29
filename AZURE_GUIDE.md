@@ -185,7 +185,8 @@ conda config --add channels conda-forge
 conda env create -f environment.yml          # creates the `tyssue` env
 # --- or build it explicitly if you don't have the yml: ---
 # conda create -n tyssue -c conda-forge python=3.10 tyssue numpy scipy pandas \
-#     matplotlib pytables openpyxl
+#     matplotlib pytables openpyxl pytest \
+#     vispy ipyvolume scikit-image networkx quantities tqdm requests ipywidgets
 # plus, ONLY if you also want the hierarchical p-value tooling on the VM
 # (statistical_analysis, §5 -- the pT sweep does not use it):
 #     statsmodels scikit-posthocs odfpy
@@ -239,16 +240,42 @@ mkdir -p "$TISSUE_RESULTS_DIR"
 > `pandas.HDFStore`, which is backed by **PyTables** — nothing in this codebase
 > imports `h5py` at all. The list used to name `h5py`; if conda happens not to
 > pull PyTables in as a `tyssue` dependency, every run dies at its first save.
-> `openpyxl` is for the `.xlsx` the post-processing writes (§9.7).
+> `openpyxl` is for the `.xlsx` the post-processing writes (§9.7), and `pytest`
+> for the §9.5 checks — the test file needs nothing else beyond the packages
+> above.
+>
+> If the env is already built, add what is missing with one solve rather than
+> several: `conda install -n tyssue -c conda-forge pytables openpyxl pytest`.
+> Set `conda config --set solver libmamba` first — the classic solver can spin
+> for 30+ minutes on this env and does not always respond to Ctrl-C (kill it
+> from a second session with `pkill -f "conda.*install"`).
 >
 > `statsmodels` / `scikit-posthocs` / `odfpy` are only needed by
 > `statistical_analysis` (the hierarchical p-value compare, §5). The pT sweep
 > and `build_run_table` run without them — verified by importing the whole
 > find-psigma path on a machine that has none of the three.
 >
-> Expect a slow solve either way: `tyssue` drags in a notebook/visualisation
-> stack (ipyvolume, pythreejs, vispy, bqplot, ipywidgets) that a headless VM
-> never uses but that must still import cleanly.
+> Measured on a fresh israelcentral VM (2026-10-29): `conda create` with the
+> first line alone left **`vispy` and `tqdm`** missing; everything else on the
+> second line came in as a `tyssue` dependency. Which ones the solver happens
+> to pull is not worth relying on — name them all.
+>
+> **The visualisation stack is NOT optional**, even headless. `post_processing`
+> does `from tyssue.draw.plt_draw import sheet_view`, and importing a submodule
+> runs the package `__init__` first — which imports `ipv_draw` (ipyvolume) and
+> `vispy_draw`. tyssue guards the latter with `except OSError`, so a missing
+> *display* is handled but a missing *module* is not: without vispy installed
+> the import dies with `ModuleNotFoundError`. Hence the second line above.
+>
+> To find everything missing in one pass rather than one `ModuleNotFoundError`
+> at a time:
+>
+> ```bash
+> python -c "import importlib.util; pkg={'vispy':'vispy','ipyvolume':'ipyvolume','skimage':'scikit-image','networkx':'networkx','quantities':'quantities','tqdm':'tqdm','requests':'requests','IPython':'ipython','ipywidgets':'ipywidgets','bqplot':'bqplot','pythreejs':'pythreejs','traittypes':'traittypes','numexpr':'numexpr','PIL':'pillow','tables':'pytables','openpyxl':'openpyxl','pytest':'pytest'}; m=sorted({n for k,n in pkg.items() if not importlib.util.find_spec(k)}); print('conda install -n tyssue -c conda-forge '+' '.join(m)+' -y' if m else 'nothing missing')"
+> ```
+>
+> then the check that settles it:
+> `python -c "import post_processing, full_model, azure_run, build_run_table; print('ok')"`.
 
 **Sanity check** the env on the VM. This verifies the LAPACK/`svd` backend *and*
 that the vendored tyssue is the one being imported:
@@ -606,9 +633,14 @@ lsblk                                   # the 2 TiB disk is usually /dev/sdc
 sudo mkfs.ext4 -F /dev/sdc
 sudo mkdir -p /data && sudo mount /dev/sdc /data
 sudo chown -R azureuser:azureuser /data
+# Create the results directory HERE, after the mount. Making it earlier puts
+# it on the OS disk, where the mount then hides it -- and the §9.4 uploads
+# fail with "scp: realpath /data/results/: No such file".
+mkdir -p /data/results
 # survive a reboot
 echo "UUID=$(sudo blkid -s UUID -o value /dev/sdc) /data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
 df -h /data                             # must show ~2.0T available
+ls -ld /data/results                    # must be owned by azureuser
 ```
 
 ### 9.3 Base setup
@@ -619,11 +651,26 @@ set **three** environment variables instead of two — add all three to
 
 ```bash
 cd ~/tissue_model
-export PYTHONPATH="$PWD:$PWD/tyssue/src"
+mkdir -p /data/results                           # no-op if §9.2 made it
+
+# WRITE them to ~/.bashrc, do not just export them in this shell. A tmux pane
+# is a fresh shell: without this it has no `conda activate`, and -- worse --
+# no TISSUE_RESULTS_DIR, so the sweep silently writes to a RELATIVE directory
+# literally named "D:\kasirer\model_results" under the repo, on the OS disk.
+cat >> ~/.bashrc <<'EOF'
+source ~/miniconda/etc/profile.d/conda.sh
+export PYTHONPATH="$HOME/tissue_model:$HOME/tissue_model/tyssue/src"
 export TISSUE_RESULTS_DIR=/data/results          # the DATA DISK, not $HOME
 export EXPERIMENTAL_DATA_DIR=$HOME/experimental  # scoring reads this
-mkdir -p "$TISSUE_RESULTS_DIR"
+EOF
+
+# apply to the CURRENT shell as well, and check
+source ~/.bashrc
+echo "$PYTHONPATH" && echo "$TISSUE_RESULTS_DIR" && echo "$EXPERIMENTAL_DATA_DIR"
 ```
+
+Note `$HOME/...` rather than `$PWD/...`: `.bashrc` is sourced from whatever
+directory the shell starts in, so `$PWD` there would point somewhere else.
 
 `$HOME/results` would fill the 128 GB OS disk after ~130 runs. The sweep needs
 ~1.1 TB.
@@ -668,7 +715,18 @@ python -m pytest test_periodic.py -k "FindPsigma or EdgeTension" -q
 
 # (c) end-to-end plumbing on a THROWAWAY results dir, so a deliberately
 #     truncated run can never be reused by the real sweep (the folder name
-#     does not encode t_end)
+#     does not encode t_end).
+#
+#     Make the directory first -- run() creates each run folder with os.mkdir,
+#     which does NOT create parents, so a missing /data/smoke fails with the
+#     whole output path in the message. And link in the ONE array the smoke
+#     test uses (--n-sheets 1 means array 0), because the run loads its
+#     initial sheet from TISSUE_RESULTS_DIR too; the links are read-only here,
+#     and `rm -rf /data/smoke` later removes the links, not the extracts.
+mkdir -p /data/smoke
+ln -s /data/results/random_periodic_array0_for_E17 /data/smoke/
+ln -s /data/results/random_periodic_array0_for_P0  /data/smoke/
+
 TISSUE_RESULTS_DIR=/data/smoke python azure_run.py find-psigma \
   --mechanical-params '{"E17.5":{"gamma_sc":0.0105,"R_gamma":6.746124660721616,"R_alpha":3.5,"A0":0.741812389049632},"P0":{"gamma_sc":0.0105,"R_gamma":3.850521945713907,"R_alpha":1.757,"A0":0.7585423232230211}}' \
   --psigma-bounds 0.09 0.09 --n-grid 1 --n-refine 0 \
@@ -688,7 +746,14 @@ rm -rf /data/smoke          # nothing in it is reusable
 
 ```bash
 tmux new -s psigma            # survives the ssh session dropping
+
+# A tmux pane is a FRESH shell: source conda's hook before activating, or
+# `conda activate` is "command not found". Harmless if ~/.bashrc already does
+# it (§9.3). Check the three exports survived too -- they must, or the run
+# writes to the OS disk and imports the wrong tyssue.
+source ~/miniconda/etc/profile.d/conda.sh
 conda activate tyssue && cd ~/tissue_model
+echo "$PYTHONPATH" && echo "$TISSUE_RESULTS_DIR" && echo "$EXPERIMENTAL_DATA_DIR"
 
 { python azure_run.py find-psigma \
     --mechanical-params '{"E17.5":{"gamma_sc":0.0105,"R_gamma":6.746124660721616,"R_alpha":3.5,"A0":0.741812389049632},"P0":{"gamma_sc":0.0105,"R_gamma":3.850521945713907,"R_alpha":1.757,"A0":0.7585423232230211}}' \

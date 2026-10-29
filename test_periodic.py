@@ -6135,3 +6135,31 @@ class TestFindPsigmaCLIPassesMechanicsThrough:
         assert kw["bending"] == 0.0 and kw["t_end"] == 100.0
         assert kw["n_arrays"] == 10 and kw["n_repeats"] == 3
         assert kw["quasi_static_threshold"] == 0.03
+
+
+class TestResultsDirMustBeUsableOnThisOS:
+    """A drive-letter default is not absolute on POSIX, so os.path.join made
+    it RELATIVE and every run landed under the cwd. On the Azure VM that
+    filled the 128 GB OS disk with a directory literally named
+    'D:\\kasirer\\model_results' inside the repo, while the 2 TiB data disk
+    sat empty -- and it surfaced only hours into the sweep."""
+
+    def test_posix_without_the_env_var_is_refused(self):
+        from history_io import _results_dir_problem, DEFAULT_RESULTS_DIR
+        msg = _results_dir_problem(DEFAULT_RESULTS_DIR, os_name="posix")
+        assert msg and "TISSUE_RESULTS_DIR" in msg
+        assert "/data/results" in msg, "the message should show the fix"
+
+    def test_posix_with_the_env_var_is_fine(self):
+        from history_io import _results_dir_problem
+        assert _results_dir_problem("/data/results", os_name="posix") is None
+
+    def test_windows_default_is_fine(self):
+        from history_io import _results_dir_problem, DEFAULT_RESULTS_DIR
+        assert _results_dir_problem(DEFAULT_RESULTS_DIR, os_name="nt") is None
+
+    def test_the_live_value_passed_the_check(self):
+        """history_io imported at all, so whatever RESULTS_DIR resolved to is
+        usable here -- this guards the guard against being a no-op."""
+        import history_io
+        assert history_io._results_dir_problem(history_io.RESULTS_DIR) is None
