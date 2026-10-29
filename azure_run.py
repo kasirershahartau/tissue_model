@@ -479,7 +479,8 @@ def _cmd_find_psigma(args):
         # it will be merged with.
         bending=args.bending, t_end=args.t_end,
         quasi_static_threshold=args.qst, save_interval=args.save_interval,
-        stress_shift=args.stress_shift)
+        stress_shift=args.stress_shift,
+        objective_terms=tuple(args.objective_terms))
     print("Best shared psigma: %.2f" % best)
 
 
@@ -639,6 +640,14 @@ def build_parser():
     fp.add_argument("--indices", type=int, nargs="+", default=None,
                     help="array indices for the initial sheets (default: range(--n-sheets))")
     fp.add_argument("--n-sheets", dest="n_sheets", type=int, default=10)
+    fp.add_argument("--objective-terms", dest="objective_terms", nargs="+",
+                    default=["score1", "score2"],
+                    choices=["score1", "score2", "score3"],
+                    help="which sub-scores the fit MINIMISES (default score1 "
+                         "score2 = 4 terms per stage). All three are still "
+                         "computed and stored; score3 is ~79%% of the 7-term "
+                         "total at the optimum, so including it picks a "
+                         "different psigma")
     fp.add_argument("--bending", type=float, default=0.0,
                     help="v2 is pure contractility: 0.0 (find_psigma's own "
                          "default is the pre-v2 0.02)")

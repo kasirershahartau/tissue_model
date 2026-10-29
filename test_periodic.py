@@ -5857,14 +5857,20 @@ class TestFindPsigmaBatchesAPassIntoOnePool:
             initial, psigma, prefix = task[0], task[15], task[22]
             return "%s_%s|ps=%.5g" % (prefix, initial, psigma)
 
-        def fake_score(stage, model_names=None, type_by=None, threshold=None,
+        def fake_score(stage, model_names=None, model_groups=None,
+                       type_by=None, threshold=None,
                        max_number_of_neighbors=None):
-            ps = {n.split("|ps=")[1] for n in model_names}
+            # find_psigma passes per-array GROUPS; flatten for these checks
+            names = ([n for grp in model_groups for n in grp]
+                     if model_groups is not None else model_names)
+            ps = {n.split("|ps=")[1] for n in names}
             assert len(ps) == 1, "one point's scoring saw several psigma: %s" % ps
-            seen.append((stage, float(ps.pop()), tuple(model_names)))
-            # score minimised at psigma = 0.1 so the refinement has a target
-            value = abs(float(model_names[0].split("|ps=")[1]) - 0.1)
-            return {"total": value}
+            seen.append((stage, float(ps.pop()), tuple(names)))
+            # score minimised at psigma = 0.1 so the refinement has a target.
+            # The fit sums score1+score2, so put the value there.
+            value = abs(float(names[0].split("|ps=")[1]) - 0.1)
+            return {"score1": value, "score2": 0.0, "score3": 0.0,
+                    "total": value}
 
         monkeypatch.setattr(fm, "_run_full_model_one", fake_run)
         monkeypatch.setattr(fm, "compare_full_model_differentiation_to_experiments",
@@ -6099,7 +6105,8 @@ class TestFindPsigmaCLIPassesMechanicsThrough:
             mechanical_params=mechanical_params, indices=None,
             psigma_bounds=[0.06, 0.12], n_grid=2, n_refine=0, n_sheets=10,
             n_repeats=3, workers=4, bending=0.0, t_end=100.0, qst=0.03,
-            save_interval=0.1, stress_shift=0.0)
+            save_interval=0.1, stress_shift=0.0,
+            objective_terms=["score1", "score2"])
 
     def _run(self, monkeypatch, mechanical_params):
         import azure_run, full_model
@@ -6163,3 +6170,139 @@ class TestResultsDirMustBeUsableOnThisOS:
         usable here -- this guards the guard against being a no-op."""
         import history_io
         assert history_io._results_dir_problem(history_io.RESULTS_DIR) is None
+
+
+class TestRepeatsAreScoredAsGroupsNotIndependentPoints:
+    """Repeats re-roll the LI seed on the SAME initial sheet, so they are
+    repeated measurements, not independent tissues. Scored flat, SEM_sim
+    shrinks by ~sqrt(n_repeats) and every chi^2 inflates -- the first cloud
+    sweep came back ~3x worse than the archived numbers purely from this.
+    compare_full_model_differentiation_to_experiments takes model_groups for
+    exactly this reason; find_psigma must use it."""
+
+    @staticmethod
+    def _params():
+        return {"E17.5": {"gamma_sc": 0.0105, "R_gamma": 6.746, "R_alpha": 3.5,
+                          "A0": 0.7418}}
+
+    def test_each_point_is_scored_with_per_array_groups(self, monkeypatch):
+        import full_model as fm
+        captured = []
+
+        def fake_run(task):
+            return "%s_%s|ps=%.5g" % (task[22], task[0], task[15])
+
+        def fake_compare(stage, model_names=None, model_groups=None, **kw):
+            captured.append({"names": model_names, "groups": model_groups})
+            return {"score1": 1.0, "score2": 0.0, "score3": 0.0, "total": 1.0}
+
+        monkeypatch.setattr(fm, "_run_full_model_one", fake_run)
+        monkeypatch.setattr(fm,
+                            "compare_full_model_differentiation_to_experiments",
+                            fake_compare)
+        fm.find_psigma(self._params(), psigma_bounds=(0.08, 0.08), n_grid=1,
+                       n_refine=0, n_arrays=4, n_repeats=3, n_workers=1,
+                       plot=False, save_json=False, use_score_cache=False)
+
+        assert len(captured) == 1
+        call = captured[0]
+        assert call["names"] is None, "a flat name list must NOT be passed"
+        groups = call["groups"]
+        assert len(groups) == 4, "one group per ARRAY, got %d" % len(groups)
+        for grp in groups:
+            assert len(grp) == 3, "each group holds that array's 3 repeats"
+            # same array in every repeat...
+            arrays = {n.split("|")[0].split("fullmodel_v2")[-1].lstrip("r123_")
+                      for n in grp}
+            assert len(arrays) == 1, grp
+            # ...and three DIFFERENT repeat prefixes
+            prefixes = {n.split("_random_periodic")[0] for n in grp}
+            assert prefixes == {fm.REPEAT_PREFIX[r] for r in (1, 2, 3)}, prefixes
+
+    def test_one_repeat_still_gives_one_run_per_group(self, monkeypatch):
+        import full_model as fm
+        captured = []
+        monkeypatch.setattr(fm, "_run_full_model_one",
+                            lambda t: "%s_%s" % (t[22], t[0]))
+        monkeypatch.setattr(
+            fm, "compare_full_model_differentiation_to_experiments",
+            lambda stage, model_groups=None, **kw: captured.append(model_groups)
+            or {"score1": 1.0, "score2": 0.0, "score3": 0.0, "total": 1.0})
+        fm.find_psigma(self._params(), psigma_bounds=(0.08, 0.08), n_grid=1,
+                       n_refine=0, n_arrays=5, n_repeats=1, n_workers=1,
+                       plot=False, save_json=False, use_score_cache=False)
+        assert [len(g) for g in captured[0]] == [1] * 5
+
+    def test_the_cache_key_separates_the_two_groupings(self):
+        from run_model import _score_cache_key
+        a = _score_cache_key("E17.5", 0.08, 0.0, None, "delta_level", 0.355, 2,
+                             grouping="arrays")
+        b = _score_cache_key("E17.5", 0.08, 0.0, None, "delta_level", 0.355, 2,
+                             grouping="flat")
+        assert a != b, ("a score cached under one grouping must never be served"
+                        " to the other -- the run set is identical, so the"
+                        " fingerprint cannot tell them apart")
+
+
+class TestObjectiveTermsSelectWhatIsMinimised:
+    """score3 (% of initial SCs differentiating by HC-neighbour count) is ~79%
+    of the 7-term total at the optimum, so minimising the total picks a
+    different psigma than minimising the four terms the campaign is fitted on.
+    find_psigma minimises score1+score2 by default; score3 is still computed
+    and stored."""
+
+    @staticmethod
+    def _patch(monkeypatch, per_psigma):
+        """per_psigma: psigma -> (score1, score2, score3)."""
+        import full_model as fm
+        monkeypatch.setattr(fm, "_run_full_model_one",
+                            lambda t: "%s_%s|ps=%.5g" % (t[22], t[0], t[15]))
+
+        def fake_compare(stage, model_groups=None, **kw):
+            ps = float(model_groups[0][0].split("|ps=")[1])
+            s1, s2, s3 = per_psigma[round(ps, 5)]
+            return {"score1": s1, "score2": s2, "score3": s3,
+                    "total": s1 + s2 + s3}
+
+        monkeypatch.setattr(
+            fm, "compare_full_model_differentiation_to_experiments",
+            fake_compare)
+        return fm
+
+    #: psigma -> (s1, s2, s3). 0.08 wins on s1+s2; 0.10 wins on the total.
+    TABLE = {0.06: (10.0, 10.0, 1.0),
+             0.08: (1.0, 1.0, 100.0),
+             0.10: (9.0, 9.0, 0.5)}
+
+    def _run(self, monkeypatch, **kw):
+        fm = self._patch(monkeypatch, self.TABLE)
+        return fm.find_psigma(
+            {"E17.5": {"gamma_sc": 0.0105, "R_gamma": 6.746, "R_alpha": 3.5,
+                       "A0": 0.7418}},
+            psigma_bounds=(0.06, 0.10), n_grid=3, n_refine=0, n_arrays=2,
+            n_repeats=1, n_workers=1, plot=False, save_json=False,
+            use_score_cache=False, **kw)
+
+    def test_default_minimises_score1_plus_score2(self, monkeypatch):
+        best, scores = self._run(monkeypatch)
+        assert abs(best - 0.08) < 1e-12, (
+            "fit followed score3 instead of s1+s2: best=%s" % best)
+        assert abs(scores[0.08]["objective"] - 2.0) < 1e-12, scores[0.08]
+
+    def test_score3_is_still_recorded(self, monkeypatch):
+        _best, scores = self._run(monkeypatch)
+        assert scores[0.08]["E17.5"]["score3"] == 100.0
+        assert scores[0.08]["E17.5"]["total"] == 102.0
+
+    def test_including_score3_picks_a_different_psigma(self, monkeypatch):
+        best, scores = self._run(
+            monkeypatch, objective_terms=("score1", "score2", "score3"))
+        assert abs(best - 0.10) < 1e-12, best
+        assert abs(scores[0.10]["objective"] - 18.5) < 1e-12
+
+    def test_the_cli_default_is_s1_plus_s2(self):
+        import azure_run
+        p = azure_run.build_parser()
+        a = p.parse_args(["find-psigma", "--mechanical-params",
+                          '{"E17.5":[0.01,1,0,0]}'])
+        assert a.objective_terms == ["score1", "score2"]

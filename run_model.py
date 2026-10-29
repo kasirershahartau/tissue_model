@@ -1444,12 +1444,21 @@ def _history_fingerprint(model_names):
 
 
 def _score_cache_key(stage, psigma, stress_shift, stress_hill_exponent,
-                     type_by, threshold, max_number_of_neighbors):
-    """Everything that changes the score but is NOT captured by the fingerprint."""
-    return ("%s|ps=%.5f|ks=%.4f|m=%s|by=%s|thr=%.6f|nb=%d"
+                     type_by, threshold, max_number_of_neighbors,
+                     grouping="arrays"):
+    """Everything that changes the score but is NOT captured by the fingerprint.
+
+    ``grouping`` is in the key because it changes the SCORE SCALE, not just the
+    runs: scoring a point's repeats as independent points shrinks SEM_sim by
+    ~sqrt(n_repeats) and inflates every chi^2. A cache written under one
+    grouping must never be served to the other -- the fingerprint cannot tell
+    them apart, since the set of runs is identical.
+    """
+    return ("%s|ps=%.5f|ks=%.4f|m=%s|by=%s|thr=%.6f|nb=%d|grp=%s"
             % (stage, float(psigma), float(stress_shift),
                "default" if stress_hill_exponent is None else stress_hill_exponent,
-               type_by, float(threshold), int(max_number_of_neighbors)))
+               type_by, float(threshold), int(max_number_of_neighbors),
+               grouping))
 
 
 def _load_score_cache():

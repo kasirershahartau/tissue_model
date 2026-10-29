@@ -153,13 +153,22 @@ def _stage_mechanics(entry, default_preferred_area=None, default_shape_index=0.0
 
 
 def _score_one_point(args):
-    """Score one (stage, model_names) point. Module-level and picklable so the
-    scoring pass can run in the same pool as the simulations -- it rescans
-    every frame of every run, so with the points themselves parallel it would
-    otherwise become the serial bottleneck."""
-    (stage, model_names, type_by, threshold, max_number_of_neighbors) = args
+    """Score one point. Module-level and picklable so the scoring pass can run
+    in the same pool as the simulations -- it rescans every frame of every run,
+    so with the points themselves parallel it would otherwise become the serial
+    bottleneck.
+
+    ``model_groups`` is a list of per-ARRAY groups, each holding that array's
+    repeats. It must NOT be flattened: the repeats re-roll the
+    lateral-inhibition seed on the same initial sheet, so they are repeated
+    measurements, not independent tissues. Passing all of them as independent
+    points shrinks SEM_sim by ~sqrt(n_repeats) and inflates every chi^2 -- 3
+    repeats scored flat came out ~3x worse than the same runs grouped, which
+    is a scoring artefact, not a worse model.
+    """
+    (stage, model_groups, type_by, threshold, max_number_of_neighbors) = args
     return compare_full_model_differentiation_to_experiments(
-        stage, model_names=model_names, type_by=type_by, threshold=threshold,
+        stage, model_groups=model_groups, type_by=type_by, threshold=threshold,
         max_number_of_neighbors=max_number_of_neighbors)
 
 
@@ -222,8 +231,20 @@ def run_full_model_arrays(stage, gammaSC, alphaHC_ratio, hc_shape_index, sc_shap
     return names
 
 
+#: Which of the comparison's sub-scores the fit MINIMISES. score1 (HC:HC and
+#: HC:SC neighbour pairs at t0) and score2 (HC neighbours at differentiation)
+#: are the four terms per stage the campaign is fitted on. score3 (% of initial
+#: SCs differentiating, by initial HC-neighbour count) is still computed,
+#: stored and printed -- it is simply not allowed to steer the fit, because it
+#: dwarfs the others: at the s1+s2 optimum it was 79% of the 7-term total, and
+#: minimising the total therefore chose a different psigma than minimising the
+#: terms the campaign is about.
+DEFAULT_OBJECTIVE_TERMS = ("score1", "score2")
+
+
 def find_psigma(mechanical_params, psigma_bounds=(0.0, 2.0), n_grid=11, n_refine=2,
                 n_arrays=10, n_repeats=3, indices=None, n_workers=None,
+                objective_terms=DEFAULT_OBJECTIVE_TERMS,
                 notch_sensitivity=0.1, repressor_sensitivity=0.3,
                 atoh_sensitivity=0.355079, bending=0.02,
                 quasi_static_threshold=0.03, initial_notch_delta_level=0.01,
@@ -234,8 +255,12 @@ def find_psigma(mechanical_params, psigma_bounds=(0.0, 2.0), n_grid=11, n_refine
                 save_json=True, use_score_cache=True):
     """Search the single mechanosensitivity ``psigma`` (SHARED across stages)
     that MINIMIZES the FULL-model differentiation score of
-    :func:`compare_full_model_differentiation_to_experiments` — the sum of its
-    three chi^2 scores — summed over the fitted stages.
+    :func:`compare_full_model_differentiation_to_experiments`, summed over the
+    fitted stages. ``objective_terms`` picks WHICH of that comparison's
+    sub-scores are minimised — by default ``score1 + score2``, the four terms
+    per stage the campaign is fitted on. ``score3`` is still computed, stored
+    and printed; see :data:`DEFAULT_OBJECTIVE_TERMS` for why it does not steer
+    the fit.
 
     ``psigma`` (mechanosensitivity) gates delta production by mechanical stress,
     so it only acts when > 0 (``stress_dependent`` is turned on automatically).
@@ -400,6 +425,14 @@ def find_psigma(mechanical_params, psigma_bounds=(0.0, 2.0), n_grid=11, n_refine
         # Scoring rescans every frame of every run, so once the simulations are
         # parallel it is the next bottleneck; the points are independent here
         # too. The cache is read and written by the PARENT only.
+        def _groups(model_names):
+            """Per-ARRAY groups from the flat run list. The tasks were built
+            repeat-by-repeat, each repeat covering the arrays in the same
+            order, so array i owns positions i, i+n, i+2n."""
+            per_repeat = len(model_names) // n_repeats
+            return [[model_names[r * per_repeat + i] for r in range(n_repeats)]
+                    for i in range(per_repeat)]
+
         results, to_score = {}, []
         for psigma in wanted:
             for stage in stages:
@@ -421,7 +454,8 @@ def find_psigma(mechanical_params, psigma_bounds=(0.0, 2.0), n_grid=11, n_refine
                 else:
                     to_score.append((psigma, stage, _ck, _fp, model_names))
         if to_score:
-            args = [(stage, names, type_by, threshold, max_number_of_neighbors)
+            args = [(stage, _groups(names), type_by, threshold,
+                     max_number_of_neighbors)
                     for _p, stage, _c, _f, names in to_score]
             score_pool = max(1, min(pool_size, len(args)))
             print("[find_psigma] scoring %d point(s) on %d worker(s)"
@@ -449,12 +483,18 @@ def find_psigma(mechanical_params, psigma_bounds=(0.0, 2.0), n_grid=11, n_refine
             for stage in stages:
                 result = results[(psigma, stage)]
                 entry[stage] = result
-                objective += float(result["total"])
+                # Only the fitted terms enter the objective; the rest of the
+                # result dict is kept so the json stays a full record.
+                objective += float(sum(result[t] for t in objective_terms))
             entry["objective"] = objective
             scores[psigma] = entry
-            print("[find_psigma] psigma=%.5g -> total score (sum over stages) = %.3f  [%s]"
-                  % (psigma, objective,
-                     ", ".join("%s=%.1f" % (s, entry[s]["total"]) for s in stages)), flush=True)
+            print("[find_psigma] psigma=%.5g -> objective (%s, summed over "
+                  "stages) = %.3f  [%s]   (all-terms total %.3f)"
+                  % (psigma, "+".join(objective_terms), objective,
+                     ", ".join("%s=%.1f"
+                               % (s, sum(entry[s][t] for t in objective_terms))
+                               for s in stages),
+                     sum(entry[s]["total"] for s in stages)), flush=True)
             # Persist after EVERY point, not at the end: a sweep that dies
             # (disk, OOM) otherwise leaves hours of scoring only on screen.
             if json_path:
@@ -462,6 +502,8 @@ def find_psigma(mechanical_params, psigma_bounds=(0.0, 2.0), n_grid=11, n_refine
                     json.dump({"stages": stages, "stress_shift": stress_shift,
                                "stress_hill_exponent": stress_hill_exponent,
                                "preferred_area": preferred_area,
+                               # what "objective" means in this file
+                               "objective_terms": list(objective_terms),
                                # the RESOLVED mechanics, so the json says what
                                # was actually run rather than what was passed
                                "mechanical_params": mechanics,
