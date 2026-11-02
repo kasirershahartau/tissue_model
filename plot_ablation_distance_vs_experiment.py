@@ -47,6 +47,7 @@ import numpy as np
 import pandas as pd
 
 from post_processing import RESULTS_DIR
+from best_pt import BEST_PT
 from build_experimental_tables import read_table
 from compare_ablation_distance_to_experiment import EXP_XLSX, SHEETS
 from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_SIZE, POINT_COLOUR,
@@ -55,7 +56,11 @@ from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_SIZE, POINT_COLOUR,
 
 PREFIX = "ablation_distance_vs_experiment"
 STAGE = "P0"                    # the experimental ablation series is P0 only
-PT = (0.0, 0.162)               # one model source per gate value, left to right
+PT = (0.0, BEST_PT)             # one model source per gate value, left to right
+# ...but overridable with --pt, because the campaign ended up with THREE
+# candidate gate values worth drawing side by side: 0 (no gate), 0.08556
+# (matches the experimental differentiation rate) and 0.08667 (the fitted
+# optimum). A module constant could only ever show two of them.
 # (model column, experimental column, summary chi^2 column, y label, stem suffix)
 QUANTITY = {
     "distance": ("diff_diameters", "dist_diameters", "z2_diameters",
@@ -66,7 +71,7 @@ QUANTITY = {
 # the chosen gate value is marked with a hatch rather than a colour of its own,
 # as in plot_neighbor_pair_bars, plot_isolated_sc_violin and the stress figures
 HATCH = "/"
-HATCH_PT = 0.162
+HATCH_PT = BEST_PT
 # space between the frame and the outer edge of the end shapes, in the same
 # units as the positions; a bar is BAR_W wide, so this is the pad past its edge
 # plus half a bar
@@ -98,7 +103,7 @@ def experimental_events(stage, group="diff"):
                              dist_um=d[m].to_numpy(float)))
 
 
-def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE):
+def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE, pts=None):
     """One row per source: its per-unit values, its mean and SEM, and its chi^2."""
     model_col, exp_col, z2_col, _ylabel, _suffix = QUANTITY[quantity]
     summary = read_table(os.path.join(results_dir, PREFIX + ".pkl"))
@@ -115,8 +120,9 @@ def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE):
         raise SystemExit("no experimental repeats for %s in %s_exp.pkl"
                          % (stage, PREFIX))
 
+    pts = tuple(PT if pts is None else pts)
     out = []
-    for i, pt in enumerate(PT):
+    for i, pt in enumerate(pts):
         g = runs[np.isclose(runs["psigma"].astype(float), pt)]
         if not len(g):
             raise SystemExit("no model ablations at pT=%g" % pt)
@@ -157,7 +163,7 @@ def gather(quantity, results_dir=RESULTS_DIR, stage=STAGE):
         denom = float(exp["cell_diameter_um"].iloc[0])
     per_point = ev["dist_um"].to_numpy(float) / denom
     per_point = per_point[np.isfinite(per_point)]
-    out.append(dict(index=len(PT), kind="exp", label="experiment", hatch=None,
+    out.append(dict(index=len(pts), kind="exp", label="experiment", hatch=None,
                     face=face, edge=edge, mean=m, sem=s, per_unit=per_unit,
                     per_point=per_point,
                     z2=np.nan, n_units=len(per_unit), unit="repeats",
@@ -227,6 +233,8 @@ def main():
                     help="space left of the first shape and right of the last"
                          " (default %g; a bar is %g wide)" % (X_PAD, BAR_W))
     ap.add_argument("--stage", default=STAGE)
+    ap.add_argument("--pt", type=float, nargs="+", default=None,
+                    help="gate values to draw, left to right (default %s)" % (PT,))
     ap.add_argument("--out", default=None,
                     help="output path; the extension is ignored, both .png and"
                          " .svg are written")
@@ -234,7 +242,7 @@ def main():
     a = ap.parse_args()
 
     _mc, _ec, _zc, ylabel, suffix = QUANTITY[a.quantity]
-    data = gather(a.quantity, stage=a.stage)
+    data = gather(a.quantity, stage=a.stage, pts=a.pt)
 
     print("  %s, %s\n" % (a.stage, ylabel))
     print("  %-22s %9s %9s %12s %8s %9s"
