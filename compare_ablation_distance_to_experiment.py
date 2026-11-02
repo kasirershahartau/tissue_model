@@ -311,7 +311,7 @@ def main():
             for _i, r in summary.iterrows():
                 z = _z(r["model_dist_diameters_mean"],
                        r["model_dist_diameters_sem"], m, s)
-                print("        psigma %.3f  z^2 = %.3f" % (r["psigma"], z * z))
+                print("        psigma %g  z^2 = %.3f" % (r["psigma"], z * z))
 
     # the experimental side, as measured: movie rows carry the cell size, repeat
     # rows the distances (divided by the mean diameter over the movies)

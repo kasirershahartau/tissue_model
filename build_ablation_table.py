@@ -334,12 +334,18 @@ def main():
     print("  runs    %4d rows x %3d cols" % runs.shape)
     print("  events  %4d rows x %3d cols" % events.shape)
     if len(overall):
-        print("\n  %-6s %-7s %5s %7s %9s %9s %9s %9s"
-              % ("stage", "psigma", "abl", "events", "ev/abl", "dist mean",
+        # ``to_output_names`` has already renamed psigma -> pT by this point, so
+        # asking for "psigma" raised KeyError and killed the script AFTER both
+        # the pickles and the xlsx were written -- a crash that looked like a
+        # failed build but had in fact lost nothing. Take whichever name is
+        # present. %g, not %.3f, so 0.08667 is not printed as 0.087.
+        pt_col = "pT" if "pT" in overall.columns else "psigma"
+        print("\n  %-6s %-9s %5s %7s %9s %9s %9s %9s"
+              % ("stage", "pT", "abl", "events", "ev/abl", "dist mean",
                  "dist med", "<=2.5%"))
         for _i, r in overall.iterrows():
-            print("  %-6s %-7.3f %5d %7d %9.2f %9.2f %9.2f %9.0f"
-                  % (r["stage"], r["psigma"], r["n_ablations"], r["n_events"],
+            print("  %-6s %-9g %5d %7d %9.2f %9.2f %9.2f %9.0f"
+                  % (r["stage"], r[pt_col], r["n_ablations"], r["n_events"],
                      r["events_per_ablation_mean"], r["dist_mean"],
                      r["dist_median"], r["pct_events_within_2.5"]))
     print("\nwrote %s" % xlsx)
