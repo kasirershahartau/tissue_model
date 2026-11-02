@@ -236,6 +236,14 @@ export TISSUE_RESULTS_DIR="$HOME/results"
 mkdir -p "$TISSUE_RESULTS_DIR"
 ```
 
+> **If you are following §9, do NOT use this value.** §9.3 sets
+> `/data/results` — the data disk — and there must be exactly **one**
+> `TISSUE_RESULTS_DIR` line in `~/.bashrc`, or whichever comes last silently
+> wins and everything lands on the 128 GB OS disk. Check with
+> `grep -n TISSUE_RESULTS_DIR ~/.bashrc`, and remember that an `export` typed
+> into a live shell beats `~/.bashrc` for that shell no matter what the file
+> says.
+
 > **`pytables`, not `h5py`.** Every history archive is read and written through
 > `pandas.HDFStore`, which is backed by **PyTables** — nothing in this codebase
 > imports `h5py` at all. The list used to name `h5py`; if conda happens not to
@@ -812,7 +820,87 @@ The pT = 0 baseline is merged here, locally, where its 60 runs already live. It
 is 3 repeats too, so it joins the sweep on equal footing — do not merge a
 baseline scored on a different repeat count.
 
-### 9.8 Tear down (the disk bills while the VM is off)
+### 9.8 The single-HC ablation pipeline (run BEFORE tearing down)
+
+Ten strict steady states — one per array, forked from the **first** repeat — then
+five ablations each, every one removing a different HC.
+
+**First, two files the sweep never needed.** `ablate_single_hc.py` builds `MECH`
+**at import time** by reading the self-consistent mechanical fit out of
+`$TISSUE_RESULTS_DIR`, so without them `strict_steady_state.py` and
+`ablate_from_strict.py` both die on the import — even `--dry-run`, which is how
+this was found. They are 3 KB each; the sweep got its mechanics from the command
+line instead, which is why §9.4 never asked for them.
+
+```bat
+rem from your LOCAL machine
+scp "D:\Kasirer\results\e17_selfconsistent_scan.json" azureuser@%IP%:/data/results/
+scp "D:\Kasirer\results\p0_selfconsistent_scan.json"  azureuser@%IP%:/data/results/
+
+rem and the two scripts, both fixed after the §9.4 upload: the psigma folder tag
+rem was a bare %%.3f, which writes the fitted 0.08667 as "ps0.087" -- and so
+rem would every psigma in 0.0865-0.0874, sharing one folder.
+scp strict_steady_state.py ablate_from_strict.py azureuser@%IP%:~/tissue_model/
+```
+
+Check the mechanics resolve to the v2 fit before running anything. **Confirm the
+results dir first** — `RESULTS_DIR` is read from the environment at *import*
+time, so if the shell still carries §4d-ii's `$HOME/results` the scan files are
+looked for on the OS disk and the import fails however correctly you uploaded
+them:
+
+```bash
+cd ~/tissue_model
+export TISSUE_RESULTS_DIR=/data/results
+python -c "from history_io import RESULTS_DIR; print(RESULTS_DIR)"   # /data/results
+ls -l /data/results/*_selfconsistent_scan.json
+
+python -c "from ablate_single_hc import MECH; [print(k, v) for k, v in MECH.items()]"
+# E17.5 (0.0105, 6.746124660721616, 3.5, 0.741812389049632)
+# P0    (0.0105, 3.850521945713907, 1.757, 0.7585423232230211)
+```
+
+If `RESULTS_DIR` printed anything else, fix `~/.bashrc` before the real run —
+the ablations write ~22 GB and the OS disk is 128 GB:
+
+```bash
+grep -n TISSUE_RESULTS_DIR ~/.bashrc
+sed -i 's#^export TISSUE_RESULTS_DIR=.*#export TISSUE_RESULTS_DIR=/data/results#' ~/.bashrc
+```
+
+Then, in `tmux`:
+
+```bash
+# 1. ten forks of 100 time units, scanned for a 5-unit window with zero
+#    differentiation events.  --dry-run first: it prints the source run and the
+#    fork time for each array and runs nothing.
+python strict_steady_state.py --psigma 0.08667 --stage P0 --dry-run
+python strict_steady_state.py --psigma 0.08667 --stage P0 --workers 10
+
+# 2. five distinct-HC ablations per array.  Existing ablations count towards the
+#    target and already-ablated cells are excluded, so a rerun tops up.
+python ablate_from_strict.py --repeats 5 --workers 46
+```
+
+`--workers 10` for step 1, not 46: there are only ten tasks, and each is a
+single-threaded 100-unit run. Expect ~22 GB on `/data` (10 x ~950 MB of strict
+state plus 50 x ~250 MB of ablation).
+
+An array that finds no event-free window is **flagged, not ablated** — check the
+verdict table before step 2, because `ablate_from_strict.py` silently skips
+those arrays and you would get fewer than 50 runs.
+
+Download the two small records; the histories stay on the VM:
+
+```bat
+scp azureuser@%IP%:/data/results/strict_steady_state.json "D:\Kasirer\results\strict_steady_state_ps0.08667.json"
+scp azureuser@%IP%:/data/results/ablate_from_strict.json  "D:\Kasirer\results\ablate_from_strict_ps0.08667.json"
+```
+
+Rename on arrival, as above: the pT = 0 pipeline runs locally and writes the
+same two filenames.
+
+### 9.9 Tear down (the disk bills while the VM is off)
 
 ```bat
 rem deallocate stops COMPUTE only -- the disk keeps billing
