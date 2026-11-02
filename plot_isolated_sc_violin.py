@@ -29,6 +29,7 @@ import pandas as pd
 
 from post_processing import RESULTS_DIR, _nsigma_and_chi2
 from build_experimental_tables import read_table
+from best_pt import BEST_PT
 from plot_neighbor_pairs import (LI_DIR, SOURCES, STYLE, STYLE_LABEL, POINT_SIZE,
                                  STAT_COLOUR,
                                  POINT_COLOUR, MEAN_MARKERSIZE, BLOCK_GAP,
@@ -56,7 +57,7 @@ PAIR = "isolated SC"            # _draw filters on this; there is only one here
 # since colour here already says model-or-experiment and which stage — the same
 # convention as plot_neighbor_pair_bars.
 HATCH = "/"
-HATCH_PSIGMA = 0.162
+HATCH_PSIGMA = BEST_PT
 
 
 def gather(column, exp_term, li_dir=LI_DIR, results_dir=RESULTS_DIR,
@@ -74,6 +75,16 @@ def gather(column, exp_term, li_dir=LI_DIR, results_dir=RESULTS_DIR,
     """
     li = pd.read_pickle(os.path.join(li_dir, "runs.pkl"))
     full = read_table(os.path.join(results_dir, "fullmodel_runs.pkl"))
+    # Collapsed runs are a different outcome, not a noisy sample of this one --
+    # the same exclusion plot_hc_neighbors_bars makes. It matters DOUBLY here:
+    # this statistic is read off the FINAL frame, and a collapsed run has no hair
+    # cells left, so every surviving SC is trivially isolated and the run scores
+    # exactly 100%. At E17.5 pT = 0.08556 that is 5 of 30 runs (array 4 collapsed
+    # in all three repeats, array 0 in two), and including them moved the stage
+    # mean from 0.07% to 16.73% against an experimental 9.63% -- turning a large
+    # miss into an apparent near-match. Score 1 is immune because it is measured
+    # at t0, where those same runs still carry ~135 HCs.
+    full = full[~full["collapsed"].astype(bool)]
     exp = pd.read_pickle(os.path.join(results_dir, "fullmodel_experiment.pkl"))
 
     out = []
