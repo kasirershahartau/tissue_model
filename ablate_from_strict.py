@@ -33,7 +33,7 @@ import numpy as np
 
 from post_processing import (RESULTS_DIR, load_history_file, get_time_points,
                              get_non_boundary_cell_ids_from_type)
-from run_model import run, load_sheet_from_file
+from run_model import run, load_sheet_from_file, _psigma_tag
 from ablate_single_hc import (MECH, SHAPE_INDEX, BENDING, ATOH_SENSITIVITY,
                               TYPE_BY, THRESHOLD, BOX, analyse)
 from strict_steady_state import OUT_JSON as STRICT_JSON
@@ -55,8 +55,13 @@ def strict_states(path=None):
 
 
 def base_folder(stage, psigma, i):
-    return "ablstrict_ps%.3f_array%d_for_%s" % (
-        psigma, i, "E17" if stage == "E17.5" else "P0")
+    """Folder stem for one array's ablations, tagged like the strict fork.
+
+    The tag has to be ``_psigma_tag``, not a bare ``%.3f``: the fitted psigma is
+    0.08667, which ``%.3f`` writes as ``ps0.087`` -- and so would every psigma in
+    0.0865-0.0874, silently sharing one folder. Same fix as ``fork_name``."""
+    return "ablstrict_ps%s_array%d_for_%s" % (
+        _psigma_tag(psigma), i, "E17" if stage == "E17.5" else "P0")
 
 
 def used_labels(stage, psigma, i, records):
@@ -200,6 +205,16 @@ def main():
     print("ABLATION FROM STRICT STEADY STATE | %d ablation(s) to run" % len(tasks))
     print("=" * 78)
     if not tasks:
+        # Two very different reasons to have nothing to do, and saying only the
+        # first one sent a debugging session chasing a steady state that was
+        # fine: every array was ALREADY at the requested number of ablations.
+        done = sum(len(used_labels(st, ps, i, existing)[1])
+                   for (st, ps, i) in strict)
+        if strict and done:
+            raise SystemExit(
+                "nothing to run: all %d array(s) already have %d usable "
+                "ablation(s) each (%d in total). Raise --repeats to add more, "
+                "or --only to retry a point." % (len(strict), a.repeats, done))
         raise SystemExit("no array reached a strict steady state — nothing to ablate")
     if a.dry_run:
         for t in tasks[:8]:

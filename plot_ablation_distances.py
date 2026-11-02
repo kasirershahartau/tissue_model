@@ -108,7 +108,7 @@ def main():
             pairs = ((ao, "ablation-only", "tab:red"), (co, "control-only", "0.6"))
         for vals, tag, col in pairs:
             data.append(vals if vals.size else np.array([np.nan]))
-            labels.append("$p_T$=%.3f\n%s" % (ps, tag))
+            labels.append("$p_T$=%g\n%s" % (ps, tag))
             colors.append(col)
             counts.append(vals.size)
             print("  %-9.3f %-14s %7d %8.2f %8s %8s %8s"
