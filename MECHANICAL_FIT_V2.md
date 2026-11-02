@@ -2,7 +2,10 @@
 
 Fits the HC/SC mechanical parameters of the periodic vertex model to the
 E17.5 and P0 utricle, then hands them to the full (differentiation) model.
-Companion to `SHRINKAGE_ESTIMATE_METHOD.md`.
+Companion to `SHRINKAGE_ESTIMATE_METHOD.md`, and to
+`MECHANICAL_FIT_HISTORY.md`, which records the chronology — the order the steps
+were taken, what each one scored, and why the earlier ones were abandoned.
+This document is the authoritative one for method and results.
 
 ## 1. The model
 
@@ -182,6 +185,8 @@ or an active HC response to wounding — not a different parameter.
 | `p0_boundary_scan.py` | the A0 = pi/4 family (superseded by the self-consistent A0) |
 | `selfconsistent_scan.py` | **the fit** — either stage, exact A0, optional R_alpha scan |
 | `plot_selfconsistent_scan.py` | the result figure, per stage |
+| `plot_mechanical_fit_history.py` | the six figures of `MECHANICAL_FIT_HISTORY.md`, from the scan JSONs |
+| `plot_mechanics_landscape.py` | the scored landscape over the parameters, from `mechanics_points.pkl` |
 | `run_fitted_full_model.py` | hands the fitted mechanics to the full model at psigma = 0 |
 
 Worker pools are **recycled** every `3 x workers` tasks (`run_task_pool`). A

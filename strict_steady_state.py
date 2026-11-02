@@ -37,7 +37,7 @@ import os
 import numpy as np
 
 from post_processing import RESULTS_DIR, load_history_file, get_time_points
-from run_model import run
+from run_model import run, _psigma_tag
 from ablate_single_hc import (MECH, SHAPE_INDEX, BENDING, ATOH_SENSITIVITY,
                               TYPE_BY, THRESHOLD)
 from run_psigma_repeats import REPEAT_PREFIX
@@ -47,8 +47,16 @@ OUT_JSON = "strict_steady_state.json"
 
 
 def fork_name(stage, psigma, i):
+    """Folder for one array's strict-steady-state fork.
+
+    The psigma tag follows ``_psigma_tag`` (3 decimals when that is EXACT,
+    otherwise 5), as the run folders do. It used to be a bare ``%.3f``, which
+    labelled the fitted 0.08667 as ``ps0.087`` -- wrong in the name, and a
+    collision waiting to happen, since every psigma in 0.0865-0.0874 rounds to
+    the same folder.
+    """
     suffix = "E17" if stage == "E17.5" else "P0"
-    return "strictss_ps%.3f_array%d_for_%s" % (psigma, i, suffix)
+    return "strictss_ps%s_array%d_for_%s" % (_psigma_tag(psigma), i, suffix)
 
 
 def one_run(args):
@@ -211,15 +219,18 @@ def main():
             if r.get("psigma") != ps:
                 continue
             if r.get("error"):
-                print("  %-6s %-8.3f %6d   %s" % (r["stage"], ps, r["array"], r["error"][:50]))
+                print("  %-6s %-8g %6d   %s" % (r["stage"], ps, r["array"], r["error"][:50]))
                 continue
             good = r.get("converged")
             ok += bool(good)
-            print("  %-6s %-8.3f %6d %8d %9.1f %10s %s"
+            print("  %-6s %-8g %6d %8d %9.1f %10s %s"
                   % (r["stage"], ps, r["array"], r["n_events"], r["t_end"],
                      "%.1f" % r["t_strict"] if good else "-",
                      "strict" if good else "FAILED (no quiet window)"))
-        print("    -> psigma %.3f: %d of %d arrays reached a strict steady state"
+        # %g, not %.3f: 0.08556 and 0.08667 both print as "0.086", so the
+        # verdict table could not be told apart between two runs whose FOLDERS
+        # (tagged by _psigma_tag) are correctly distinct.
+        print("    -> psigma %g: %d of %d arrays reached a strict steady state"
               % (ps, ok, len([r for r in out if r.get("psigma") == ps])))
         rows = [r for r in out if r.get("psigma") == ps and r.get("window_counts")]
         if rows:

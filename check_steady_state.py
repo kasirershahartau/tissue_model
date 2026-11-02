@@ -194,7 +194,7 @@ def main():
         ax.plot(r["t"], r["hc_fraction"], "-", color=c, alpha=0.7, lw=1.3)
         ax2.plot(r["t"], r["delta_rate"], "-", color=c, alpha=0.7, lw=1.3)
     for ps in a.psigma:
-        ax.plot([], [], "-", color=cols[ps], label="$p_\\sigma$=%.3f" % ps)
+        ax.plot([], [], "-", color=cols[ps], label="$p_T$=%.3f" % ps)
     ax.set_xlabel("time since the declared steady state")
     ax.set_ylabel("HC fraction")
     ax.set_title("Does the pattern keep growing after 'steady'?", fontsize=10)

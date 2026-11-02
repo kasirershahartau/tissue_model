@@ -63,7 +63,15 @@ COLOUR = {"SC, 0 HC nb": "tab:blue", "SC, 1 HC nb": "tab:orange",
 
 
 def base_name(psigma):
-    return "face_stress_ps0" if float(psigma) == 0.0 else "face_stress_ps%.3f" % psigma
+    """Output stem for one psigma's pickles.
+
+    The tag follows ``_psigma_tag``, as the run folders do. It was a bare
+    ``%.3f``, which writes the fitted 0.08667 as ``ps0.087`` -- wrong, and
+    shared by every psigma in 0.0865-0.0874.
+    """
+    from best_pt import pt_tag
+    return ("face_stress_ps0" if float(psigma) == 0.0
+            else "face_stress_ps%s" % pt_tag(psigma))
 
 
 def collect(stage, psigma, repeats, interval, type_by, threshold, workers):
@@ -187,7 +195,10 @@ def main():
         print("re-using %s: %d row(s)" % (os.path.basename(per_run_path), len(per_run)))
     else:
         print("=" * 78)
-        print("FACE STRESS OVER TIME | psigma = %.3f | repeats %s | every %.2g t"
+        # %g, not %.3f: the fitted psigma is 0.08667 and %.3f prints it as
+        # 0.087 -- here only a misleading banner, but the same format on the
+        # axis label and the suptitle below put a wrong number ON the figure.
+        print("FACE STRESS OVER TIME | psigma = %g | repeats %s | every %.2g t"
               % (a.psigma, a.repeats, a.interval))
         print("=" * 78)
         raw = pd.concat([collect(s, a.psigma, a.repeats, a.interval, a.type_by,
@@ -255,14 +266,14 @@ def main():
                 # and a group below it less than half. The gate reads the
                 # contractility stress, so the line belongs only on that panel.
                 ax.axhline(a.psigma, color="k", lw=1.3, ls="--", alpha=0.8,
-                           label="$p_\\sigma$ = %.3f (gate half-max)" % a.psigma)
+                           label="$p_T$ = %g (gate half-max)" % a.psigma)
             ax.set_xlabel("time")
             ax.set_ylabel("mean face stress (%s)" % eff)
             ax.set_title("%s — %s effectors" % (stage, eff), fontsize=11)
             ax.grid(alpha=0.25)
             if r == 0 and c == 0:
                 ax.legend(fontsize=8, loc="best")
-    fig.suptitle("Face stress from $t$ = %g at $p_\\sigma$ = %.3f — mean over arrays "
+    fig.suptitle("Face stress from $t$ = %g at $p_T$ = %g — mean over arrays "
                  "of (mean over %d repeats), error bars = SEM over %d arrays"
                  % (a.t_min, a.psigma, len(a.repeats),
                     int(summary["n_arrays"].max())), fontsize=11)

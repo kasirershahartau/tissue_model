@@ -56,7 +56,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\Kasirer\results")
+# keep in step with history_io.DEFAULT_RESULTS_DIR (not imported: that module
+# pulls in tyssue, which this script does not otherwise need)
+RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", r"D:\kasirer\model_results")
 EXP_DIR = os.environ.get(                       # same default as post_processing
     "EXPERIMENTAL_DATA_DIR",
     r"C:\Users\Kasirer\Phd\mouse_ear_project\papers"
@@ -216,19 +218,19 @@ def draw(res, a):
             ax.axhline(0.05, color="k", lw=1.0, ls=":", alpha=0.7)
             ax.set_yscale("log")
             ax.set_ylim(floor / 3.0, 3.0)
-            ax.set_xlabel("$p_\\sigma$")
+            ax.set_xlabel("$p_T$")
             ax.set_ylabel("hierarchical p-value  (HIGHER = better agreement)")
             ax.grid(alpha=0.25, which="both")
             if zoom:
                 ax.set_xlim(*ZOOM)
-                ax.set_title("zoom: $p_\\sigma$ 0.159 – 0.171", fontsize=9)
+                ax.set_title("zoom: $p_T$ 0.159 – 0.171", fontsize=9)
             else:
                 ax.annotate("p = 0.05", (ax.get_xlim()[0], 0.058), fontsize=7.5,
                             alpha=0.8)
                 ax.set_title("Score %d — %s" % (score, " and ".join(labels)),
                              fontsize=11)
                 ax.legend(fontsize=7.5, loc="lower right")
-    fig.suptitle("Hierarchical p-value against $p_\\sigma$ — bold: the score's two "
+    fig.suptitle("Hierarchical p-value against $p_T$ — bold: the score's two "
                  "buckets combined (min-p x2); faint: each bucket. Triangles = "
                  "clipped at p $\\leq$ %g%s"
                  % (floor, "   [FAKE p-values]" if a.fake else ""), fontsize=10)

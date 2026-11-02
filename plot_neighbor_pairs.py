@@ -44,6 +44,7 @@ import pandas as pd
 
 from post_processing import RESULTS_DIR
 from build_experimental_tables import read_table
+from best_pt import BEST_PT, BEST_PT_LABEL
 
 LI_DIR = r"D:\Kasirer\results\lateral inhibition only results"
 # (stage, kind, label, selector) in the order they are plotted. The stage blocks
@@ -52,12 +53,12 @@ LI_DIR = r"D:\Kasirer\results\lateral inhibition only results"
 # the experiment it is all being compared to.
 SOURCES = [
     ("E17.5", "li", "lateral inhibition\nonly\npS=0.1, pR=0.3", dict(pS=0.1, pR=0.3)),
-    ("E17.5", "full", "full model\n" r"p$\sigma$=0", dict(psigma=0.0)),
-    ("E17.5", "full", "full model\n" r"p$\sigma$=0.162", dict(psigma=0.162)),
+    ("E17.5", "full", "full model\n" r"$p_T$=0", dict(psigma=0.0)),
+    ("E17.5", "full", "full model\n" r"$p_T$=%s" % BEST_PT_LABEL, dict(psigma=BEST_PT)),
     ("E17.5", "exp", "experiment", {}),
     ("P0", "li", "lateral inhibition\nonly\npS=0.15, pR=0.25", dict(pS=0.15, pR=0.25)),
-    ("P0", "full", "full model\n" r"p$\sigma$=0", dict(psigma=0.0)),
-    ("P0", "full", "full model\n" r"p$\sigma$=0.162", dict(psigma=0.162)),
+    ("P0", "full", "full model\n" r"$p_T$=0", dict(psigma=0.0)),
+    ("P0", "full", "full model\n" r"$p_T$=%s" % BEST_PT_LABEL, dict(psigma=BEST_PT)),
     ("P0", "exp", "experiment", {}),
 ]
 # (panel title, model/LI column, experimental term)
@@ -95,7 +96,7 @@ def _mean_sem(v):
 
 def _plain(label):
     """The axis label as readable text — the console has no mathtext."""
-    return (label.replace("\n", " ").replace(r"p$\sigma$", "psigma")
+    return (label.replace("\n", " ").replace("$p_T$", "pT")
             .replace("$", ""))
 
 
@@ -167,9 +168,12 @@ def _draw(ax, data, pair, points, rng, mean_markersize=MEAN_MARKERSIZE):
                  else "violin" if (as_violin and len(v) > 1 and np.ptp(v) > 0)
                  else "bar")
         width = BAR_W
+        # an optional hatch marks one source out from its neighbours without
+        # spending a colour on it, which colour here already carries
+        hatch = d.get("hatch")
         if shape == "bar":
             ax.bar(x, d["mean"], BAR_W, color=d["face"], edgecolor=d["edge"],
-                   linewidth=1.6, zorder=2)
+                   linewidth=1.6, hatch=hatch, zorder=2)
         elif shape == "violin":
             width = VIOLIN_W
             body = ax.violinplot([v], positions=[x], widths=width,
@@ -180,6 +184,8 @@ def _draw(ax, data, pair, points, rng, mean_markersize=MEAN_MARKERSIZE):
             body.set_linewidth(1.6)
             body.set_alpha(1.0)
             body.set_zorder(2)
+            if hatch:
+                body.set_hatch(hatch)
         if shape != "bar":
             # a bar shows its mean as the bar top; anything else needs it drawn
             ax.plot(x, d["mean"], marker="*", markersize=mean_markersize,

@@ -26,8 +26,42 @@ _MAX_GIF_PATH_LEN = 200
 # Where run folders live: one sub-directory per run, each holding history.hf5 and
 # its parameters. Simulation archives reach several GB, so this usually points at
 # a data drive rather than the working copy.
-RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR",
-                             os.path.join(os.getcwd(), "results"))
+#
+# The default is an ABSOLUTE path, deliberately: it used to fall back to
+# ``cwd/results``, so a script launched from the wrong directory wrote a fresh
+# tree of run folders somewhere else and silently found none of the existing
+# ones. A fixed path fails loudly on the wrong machine instead of quietly
+# succeeding in the wrong place. Override with TISSUE_RESULTS_DIR — mandatory
+# off this box, e.g. on the Linux VM (see azure_run.py).
+DEFAULT_RESULTS_DIR = r"D:\kasirer\model_results"
+RESULTS_DIR = os.environ.get("TISSUE_RESULTS_DIR", DEFAULT_RESULTS_DIR)
+
+
+def _results_dir_problem(results_dir, default=DEFAULT_RESULTS_DIR,
+                         os_name=os.name):
+    """Why ``results_dir`` is unusable on this OS, or None if it is fine.
+
+    "Fails loudly on the wrong machine" (above) was not true off Windows: a
+    drive-letter path is not absolute on POSIX, so ``os.path.join`` quietly
+    produced a RELATIVE directory and every run landed under the current
+    working directory. On the Azure VM that meant a tree literally named
+    ``D:\\kasirer\\model_results`` inside the repo, filling the 128 GB OS disk
+    while the 2 TiB data disk sat empty -- and it only came to light hours in.
+    """
+    if os_name == "nt" or results_dir != default:
+        return None
+    return (
+        "TISSUE_RESULTS_DIR is not set, and the built-in default %r is a "
+        "Windows path. On this OS it is RELATIVE, so every run would be "
+        "written under the current working directory instead of the results "
+        "drive. Set it before importing, e.g.\n"
+        "    export TISSUE_RESULTS_DIR=/data/results" % default)
+
+
+_problem = _results_dir_problem(RESULTS_DIR)
+if _problem:
+    raise RuntimeError(_problem)
+del _problem
 
 
 def load_history_file(load_name):
@@ -167,8 +201,16 @@ def create_gif_safe(history, output, num_frames=None, interval=None,
         shutil.rmtree(graph_dir, ignore_errors=True)
     return output
 
-def redraw(load_name, save_name, movie=True, maximal_number_of_frames_to_save=100, color_by="atoh", maximal_level=1):
+def redraw(load_name, save_name, movie=True, maximal_number_of_frames_to_save=100, color_by="atoh", maximal_level=1,
+           uniform_level=None):
+    """Re-draw a finished run: first frame, last frame and (optionally) a gif.
 
+    ``uniform_level`` paints every cell the same colour instead of colouring by
+    state -- 0 is dark green, 1 is white, so 0.5 is the midpoint between them.
+    It overrides ``color_by``, and is what to use when the drawing is about the
+    tissue's GEOMETRY: the random arrays carry no differentiation, so a colour
+    that varied would suggest a pattern that is not there.
+    """
     load_path = os.path.join(RESULTS_DIR, load_name)
     history = HistoryHdf5.from_archive(os.path.join(load_path, "history.hf5"), eptm_class=VirtualSheet)
     initial_sheet = history.retrieve(0)
@@ -179,7 +221,8 @@ def redraw(load_name, save_name, movie=True, maximal_number_of_frames_to_save=10
 
     save_path = os.path.join(RESULTS_DIR, load_name, save_name)
     static_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
-                                         arrange_sheet=False, color_by=color_by, maximal_level=maximal_level)
+                                         arrange_sheet=False, color_by=color_by, maximal_level=maximal_level,
+                                         uniform_level=uniform_level)
     fig1, ax1 = static_draw_func(initial_sheet)
     annotate_time(ax1, 0.0)
     plt.savefig("%s_initial.png" % save_path)
@@ -188,7 +231,8 @@ def redraw(load_name, save_name, movie=True, maximal_number_of_frames_to_save=10
     plt.savefig("%s_finale.png" % save_path)
     if movie:
         gif_draw_func = InnerEarModel.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
-                                             arrange_sheet=False, color_by=color_by, maximal_level=maximal_level)
+                                             arrange_sheet=False, color_by=color_by, maximal_level=maximal_level,
+                                             uniform_level=uniform_level)
         create_gif_safe(history, os.path.join(os.getcwd(), "%s_movie.gif" % save_path), num_frames=number_of_frames_to_save,
                    draw_func=gif_draw_func)
     return 0

@@ -7,10 +7,29 @@ primary cells (high signal) scattered through secondary cells (low signal)
 emerges. A cell is called primary once its signal passes a threshold.
 
 Coupling is by CONTACT LENGTH, not neighbour count: a cell that shares a long
-border with a neighbour inhibits it more than one touching at a corner. Contact
-lengths are normalised by ``length_normalization_factor`` (L0), the mean cell
-perimeter of the first frame, so the strength of inhibition does not change
-merely because the tissue was built at a different scale.
+border with a neighbour inhibits it more than one touching at a corner.
+
+Contact lengths are normalised by ``length_normalization_factor`` (L0), the
+mean cell perimeter of the first frame, so the strength of inhibition does not
+change merely because the tissue was built at a different scale.
+
+PHASE 1 vs PHASE 2. L0 normalises TWO things here and nothing else: the contact
+coupling below (the ``L0 / perimeter`` factor) and the face stress that feeds
+the mechanosensitive gate. It does NOT rescale every length in the equations.
+Measuring all lengths in units of the mean perimeter -- which separates the
+length UNIT from the physical lateral-inhibition length
+
+    L0_phys = kappa * beta_D / gamma_R^2,    l0_ratio = L0_phys / <perimeter>
+
+-- was tried on 2026-10-26 and is deferred to phase 2, together with the
+literature estimate of ``l0_ratio`` itself (see lateral_inhibition_parameters.md
+for the derivation and the sources, which put it at 10^1-10^5 rather than 1).
+
+``l0_ratio`` survives as a plain multiplier on the coupling so phase 2 has its
+lever ready. Its default, 1.0, is an exact IEEE no-op, so phase-1 runs are
+bit-identical to the archived ones -- which matters, because lateral inhibition
+amplifies a 1-ULP difference into a different cell being selected over a long
+trajectory.
 
 MECHANOSENSITIVITY. Signal production can additionally be gated by the cell's own
 mechanical stress, through a Hill function of the stress computed from
@@ -32,7 +51,7 @@ class LateralInhibitionModel:
                  notch_repressor_degradation_ratio=1, length_normalization_factor=1, repressor_sensitivity=1,
                  atoh_sensitivity=1, delta_repressor_degradation_ratio=1, notch_delta_production_ratio=1,
                  stress_effectors=None, mechanosensitivity=0, stress_shift=0.0,
-                 stress_hill_exponent=None):
+                 stress_hill_exponent=None, l0_ratio=1.0):
         self.model = model
         # General parameters
         self.inhibition = inhibition
@@ -46,7 +65,13 @@ class LateralInhibitionModel:
         # Contact dependent model parameters
         self.notch_repressor_degradation_ratio = notch_repressor_degradation_ratio  # tauN
         self.delta_repressor_degradation_ratio = delta_repressor_degradation_ratio  # tauR
-        self.length_normalization_factor = length_normalization_factor  # L0
+        # L0: mean perimeter of the initial array. It normalises the contact
+        # coupling and the face stress, and nothing else (module docstring).
+        self.length_normalization_factor = length_normalization_factor
+        # Plain multiplier on the coupling, carrying the physical
+        # lateral-inhibition length scale in phase 2. 1.0 (an exact no-op) is
+        # the historical assumption and what every phase-1 run uses.
+        self.l0_ratio = float(l0_ratio)
         self.repressor_sensitivity = repressor_sensitivity  # pR
         self.atoh_sensitivity = atoh_sensitivity  # patoh
         self.notch_delta_production_ratio = notch_delta_production_ratio  # alpha
@@ -145,6 +170,7 @@ class LateralInhibitionModel:
             # matters when differentiation is active at the same time as a cell is
             # dying.
             dying = (sheet.face_df["type"].to_numpy() == -1)
+
             if dying.any():
                 contact_matrix = contact_matrix.copy()
                 contact_matrix[dying, :] = 0.0
@@ -163,9 +189,16 @@ class LateralInhibitionModel:
                     delta_production = delta_production * self.increasing_hill(
                             np.maximum(face_stress - self.stress_shift, 0), self.mechanosensitivity,
                             self.stress_hill_exponent)
-                notch_with_neighboring_delta_interaction = (notch_level * (self.length_normalization_factor / face_perimeter) *
+                # Si - notch in this cell meeting delta in its neighbours, summed
+                # over the shared boundaries; Ti is its mirror. PHASE 1 FORM:
+                # the only length normalisation is L0/perimeter here (and L0 on
+                # the face stress above) -- lengths are NOT globally rescaled.
+                # ``l0_ratio`` multiplies the coupling and defaults to 1.0,
+                # which is an exact IEEE no-op, so this is bit-identical to the
+                # form every archived run was produced with.
+                notch_with_neighboring_delta_interaction = (self.l0_ratio * notch_level * (self.length_normalization_factor / face_perimeter) *
                                            np.matmul(contact_matrix, (delta_level / face_perimeter))) # Si - notch in cell with delta in neighbors
-                delta_with_neighboring_notch_interaction = (delta_level * (self.length_normalization_factor / face_perimeter) *
+                delta_with_neighboring_notch_interaction = (self.l0_ratio * delta_level * (self.length_normalization_factor / face_perimeter) *
                                            np.matmul(contact_matrix, (notch_level / face_perimeter))) # Ti - delta in cell with notch in neighbors
                 repressor_production = 0 if self.inhibition else self.increasing_hill(notch_with_neighboring_delta_interaction, face_sensitivity)
                 notch_change = 1 - self.notch_repressor_degradation_ratio * notch_level - notch_with_neighboring_delta_interaction

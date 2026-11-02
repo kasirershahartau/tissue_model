@@ -93,7 +93,7 @@ ssh azureuser@<PUBLIC_IP>
 cd ~/tissue_model
 export PYTHONPATH=$PWD/tyssue/src            # MANDATORY: use the vendored tyssue
 export TISSUE_RESULTS_DIR=$HOME/results      # MANDATORY on Linux: the default
-                                             # is the Windows path D:\Kasirer\results
+                                             # is the Windows path D:\kasirer\model_results
 python azure_run.py find-mech --stage E17.5      # defaults mirror run_model.__main__
 
 # 3) pull results back and STOP/DELETE the VM so billing stops
@@ -325,8 +325,14 @@ def _ensure_repo_cwd():
 
 def _cmd_random_arrays(args):
     _ensure_repo_cwd()
-    from run_model import create_random_arrays
-    names = create_random_arrays(n=args.n, indices=args.indices, n_workers=args.workers)
+    from run_model import create_random_arrays, random_array_variant_name
+    indices = args.indices if args.indices is not None else list(range(args.n or 0))
+    variant = args.division_area != 1.2
+    names = create_random_arrays(
+        n=args.n, indices=args.indices, n_workers=args.workers,
+        division_area=args.division_area,
+        names=([random_array_variant_name(i, args.division_area)
+                for i in indices] if variant else None))
     print("Created %d arrays:\n%s" % (len(names), "\n".join(map(str, names))))
 
 
@@ -453,12 +459,28 @@ def _cmd_find_mech(args):
 def _cmd_find_psigma(args):
     _ensure_repo_cwd()
     from full_model import find_psigma
-    mechanical_params = {stage: tuple(vals) for stage, vals in json.loads(args.mechanical_params).items()}
+    # A stage's mechanics is EITHER a dict (the v2 form, carrying the per-stage
+    # R_gamma and A0) or the legacy 4-sequence. Do not coerce: tuple() on a
+    # dict yields its KEYS, which reached _stage_mechanics as a 4-sequence of
+    # strings and died on float('gamma_sc').
+    mechanical_params = {
+        stage: (vals if isinstance(vals, dict) else tuple(vals))
+        for stage, vals in json.loads(args.mechanical_params).items()}
     best, scores = find_psigma(
         mechanical_params, indices=args.indices,
         psigma_bounds=tuple(args.psigma_bounds), n_grid=args.n_grid,
-        n_refine=args.n_refine, n_initial_sheets=args.n_sheets,
-        n_workers=args.workers)
+        # n_arrays, NOT n_initial_sheets: the keyword here never matched the
+        # signature, so this command raised TypeError before doing any work.
+        n_refine=args.n_refine, n_arrays=args.n_sheets,
+        n_repeats=args.n_repeats, n_workers=args.workers,
+        # v2 mechanics / recording. find_psigma's own defaults predate the v2
+        # fit (bending 0.02, t_end 50); passing them explicitly keeps the sweep
+        # on the same model and the same stopping rule as the pT = 0 baseline
+        # it will be merged with.
+        bending=args.bending, t_end=args.t_end,
+        quasi_static_threshold=args.qst, save_interval=args.save_interval,
+        stress_shift=args.stress_shift,
+        objective_terms=tuple(args.objective_terms))
     print("Best shared psigma: %.2f" % best)
 
 
@@ -504,6 +526,14 @@ def build_parser():
                     help="build arrays range(n) (shorthand for --indices 0..n-1)")
     ra.add_argument("--indices", type=int, nargs="+", default=None,
                     help="explicit array indices to build, e.g. one per Batch task")
+    ra.add_argument("--division-area", dest="division_area", type=float,
+                    default=1.2,
+                    help="area at which a cell divides (default 1.2, what the "
+                         "production arrays were built with); a lower value "
+                         "divides cells sooner and leaves a more disordered "
+                         "tiling. A non-default value builds into its own "
+                         "folder (random_periodic_array{i}_da{value}) so it "
+                         "cannot be mistaken for the production set")
     add_workers(ra)
     ra.set_defaults(func=_cmd_random_arrays)
 
@@ -610,6 +640,35 @@ def build_parser():
     fp.add_argument("--indices", type=int, nargs="+", default=None,
                     help="array indices for the initial sheets (default: range(--n-sheets))")
     fp.add_argument("--n-sheets", dest="n_sheets", type=int, default=10)
+    fp.add_argument("--objective-terms", dest="objective_terms", nargs="+",
+                    default=["score1", "score2"],
+                    choices=["score1", "score2", "score3"],
+                    help="which sub-scores the fit MINIMISES (default score1 "
+                         "score2 = 4 terms per stage). All three are still "
+                         "computed and stored; score3 is ~79%% of the 7-term "
+                         "total at the optimum, so including it picks a "
+                         "different psigma")
+    fp.add_argument("--bending", type=float, default=0.0,
+                    help="v2 is pure contractility: 0.0 (find_psigma's own "
+                         "default is the pre-v2 0.02)")
+    fp.add_argument("--t-end", dest="t_end", type=float, default=100.0,
+                    help="CAP, not a duration: end_on_steady_state stops each "
+                         "run when it settles. 100 matches the baseline runs")
+    fp.add_argument("--quasi-static-threshold", dest="qst", type=float,
+                    default=0.03)
+    fp.add_argument("--save-interval", dest="save_interval", type=float,
+                    default=0.1,
+                    help="frame spacing; 0.1 is what the differentiation "
+                         "statistics were measured at (~0.9 GB per run)")
+    fp.add_argument("--stress-shift", dest="stress_shift", type=float,
+                    default=0.0, help="K, the gate's stress offset")
+    fp.add_argument("--n-repeats", dest="n_repeats", type=int, default=3,
+                    help="independent repeats of every (array, stage, psigma), "
+                         "pooled into one score per point (default 3). One "
+                         "repeat cannot separate a psigma dependence from "
+                         "run-to-run scatter. Every point in a sweep is scored "
+                         "on the same number, so this must not be changed "
+                         "part-way through one.")
     add_workers(fp)
     fp.set_defaults(func=_cmd_find_psigma)
 

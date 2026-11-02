@@ -19,7 +19,7 @@ import pandas as pd
 
 sys.path.insert(0, r"C:/Users/Kasirer/Phd/mouse_ear_project/tissue_model")
 sys.path.insert(0, r"C:/Users/Kasirer/Phd/mouse_ear_project/tissue_model/tyssue/src")
-os.environ.setdefault("TISSUE_RESULTS_DIR", r"D:/Kasirer/results")
+os.environ.setdefault("TISSUE_RESULTS_DIR", r"D:/kasirer/model_results")
 from post_processing import load_history_file, get_time_points
 
 XL = (r"C:/Users/Kasirer/Phd/mouse_ear_project/papers/Dynamic lateral inhibition"

@@ -28,7 +28,9 @@ import argparse
 import os
 
 from post_processing import RESULTS_DIR
-from full_model import run_full_model_arrays
+# REPEAT_PREFIX is imported, not redefined: find_psigma runs repeats itself
+# now, and two copies of this map would be two ways to name the same run.
+from full_model import run_full_model_arrays, REPEAT_PREFIX
 import grid_fit_mechanics_v2 as g2
 from run_fitted_full_model import (best_point, ATOH_SENSITIVITY, NOTCH_SENSITIVITY,
                                    REPRESSOR_SENSITIVITY, INITIAL_LI_LEVEL,
@@ -36,11 +38,6 @@ from run_fitted_full_model import (best_point, ATOH_SENSITIVITY, NOTCH_SENSITIVI
 
 STAGES = ("E17.5", "P0")
 PSIGMA = [0.0, 0.160, 0.161, 0.162, 0.163, 0.164, 0.165]
-REPEAT_PREFIX = {1: "fullmodel_v2", 2: "fullmodel_v2r2", 3: "fullmodel_v2r3",
-                 4: "fullmodel_v2r4", 5: "fullmodel_v2r5",
-                 6: "fullmodel_v2r6", 7: "fullmodel_v2r7",
-                 8: "fullmodel_v2r8", 9: "fullmodel_v2r9",
-                 10: "fullmodel_v2r10"}
 
 
 def main():
@@ -56,6 +53,12 @@ def main():
     ap.add_argument("--t-end", dest="t_end", type=float, default=100)
     ap.add_argument("--dt", type=float, default=0.01)
     ap.add_argument("--save-interval", dest="save_interval", type=float, default=0.1)
+    ap.add_argument("--l0-ratio", dest="l0_ratio", type=float, default=1.0,
+                    help="L0/<perimeter>: the lateral-inhibition length scale as a "
+                         "multiple of the mean initial perimeter. 1.0 (default) is "
+                         "the historical L0 == perimeter assumption; see "
+                         "lateral_inhibition_parameters.md. A non-default value "
+                         "gets its own _l0r<value> folders.")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -71,6 +74,9 @@ def main():
               % (s, f["gamma_sc"], f["R_gamma"], f["R_alpha"], f["A0"]))
     print("  psigma: %s" % ", ".join("%.3f" % p for p in a.psigma))
     print("  prefixes: %s" % ", ".join(REPEAT_PREFIX[r] for r in a.repeats))
+    print("  l0_ratio: %.4g%s" % (a.l0_ratio,
+                                  "  (L0 == average perimeter)" if a.l0_ratio == 1.0
+                                  else "  -> folders tagged _l0r%.4g" % a.l0_ratio))
     print("\n  up to %d run(s) (completed ones are reused)" % n)
     if a.dry_run:
         raise SystemExit("\n--dry-run: nothing was simulated.")
@@ -97,7 +103,8 @@ def main():
                     initial_notch_delta_level=INITIAL_LI_LEVEL,
                     t_end=a.t_end, dt=a.dt, save_interval=a.save_interval,
                     n_arrays=a.n_arrays, n_workers=a.workers,
-                    reuse_existing_run=True, name_prefix=prefix)
+                    reuse_existing_run=True, name_prefix=prefix,
+                    l0_ratio=a.l0_ratio)
     print("\nall repeats done")
 
 

@@ -2,7 +2,7 @@
 
     python plot_scores_vs_psigma.py
 
-Reads fullmodel_runs.csv (built by build_fullmodel_table.py) and writes
+Reads fullmodel_runs.pkl (built by build_fullmodel_table.py) and writes
 <results>/scores_vs_psigma.png plus scores_vs_psigma.csv with the plotted values.
 
 REPEATS ARE THE TRAP HERE. The sweep has 1 repeat at most psigma values, 3 at
@@ -31,6 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from post_processing import RESULTS_DIR
+from build_experimental_tables import read_table
 from build_fullmodel_table import psigma_table
 
 OUT_PNG = "scores_vs_psigma.png"
@@ -39,22 +40,25 @@ COLOUR = {"E17.5": "tab:blue", "P0": "tab:red"}
 ZOOM = (0.1585, 0.1715)
 
 
-def read_runs_csv():
-    """Tolerate a torn final line, which happens if the builder is still running."""
-    path = os.path.join(RESULTS_DIR, "fullmodel_runs.csv")
-    with open(path) as fh:
-        lines = fh.read().splitlines()
-    ncol = lines[0].count(",") + 1
-    if lines and lines[-1].count(",") + 1 != ncol:
-        lines = lines[:-1]
-        print("  (dropped a torn final line - the builder is still writing)")
-    from io import StringIO
-    df = pd.read_csv(StringIO("\n".join(lines) + "\n"))
+def read_runs():
+    """The saved runs table, with the parameter under the name the code uses.
+
+    read_table, not read_pickle: the table is PUBLISHED with the gate half-max
+    as pT (the manuscript's name) while psigma_table and everything here call it
+    psigma, so the name is mapped back on load.
+
+    This used to read fullmodel_runs.csv, which the builder appends to as it
+    goes and which therefore let the figure be drawn mid-build off a partial
+    file. The pickle is written once, at the end, so that is no longer possible
+    — but it is the file every other figure reads, and the two drifted apart
+    when the published name changed.
+    """
+    df = read_table(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
     return df.drop_duplicates("model_name", keep="last")
 
 
 def main():
-    df = read_runs_csv()
+    df = read_runs()
     # incomplete runs are dropped when the table is written, so the column
     # may be absent from the saved file
     ok = df[df["error"].fillna("") == ""] if "error" in df.columns else df
@@ -106,7 +110,7 @@ def main():
         ax.set_yscale("log")
         if zoom:
             ax.set_xlim(*ZOOM)
-        ax.set_xlabel("$p_\\sigma$")
+        ax.set_xlabel("$p_T$")
         ax.set_ylabel("%s  ($\\chi^2$)" % score)
         ax.grid(alpha=0.25, which="both")
 
@@ -120,10 +124,10 @@ def main():
         axes[0][col].legend(fontsize=8, loc="best")
         # the sweep is dense between 0.16 and 0.17, where the full range hides it
         draw(axes[1][col], score, zoom=True)
-        axes[1][col].set_title("zoom: $p_\\sigma$ 0.159 – 0.171", fontsize=9)
+        axes[1][col].set_title("zoom: $p_T$ 0.159 – 0.171", fontsize=9)
 
     n_col = int(allr["n_collapsed"].sum()) if len(allr) else 0
-    fig.suptitle("Full-model scores against $p_\\sigma$ — open markers are the same "
+    fig.suptitle("Full-model scores against $p_T$ — open markers are the same "
                  "point with more repeats (%d collapsed run(s) included)" % n_col,
                  fontsize=11, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.95))

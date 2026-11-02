@@ -92,6 +92,33 @@ class ContractilityPerimeterElasticity(PerimeterElasticity):
         return grad_srce, grad_trgt
 
 
+#: Effectors whose energy depends on a face's PERIMETER, and so contribute to
+#: the tension dE/dl. Module-level, not class attributes, because
+#: ``get_edge_stress`` is borrowed by light-weight shims that wrap a bare sheet
+#: (``face_stress_over_time._Shim``) and have no InnerEarModel class behind them.
+TENSION_PERIMETER_EFFECTORS = (ContractilityPerimeterElasticity, FaceContractility)
+
+#: Effectors that may be in the set and contribute NOTHING to dE/dl. A face's
+#: area is not a function of its edge lengths at fixed vertex positions: it
+#: enters the force balance as a pressure NORMAL to the interface, not as a
+#: tension along it.
+TENSION_NEUTRAL_EFFECTORS = (FaceAreaElasticity,)
+
+
+def effector_is_active(sheet, effector):
+    """Whether ``effector`` can contribute anything on this sheet: its
+    per-element magnitude column exists and is not identically zero. An
+    effector that is present but switched off (kappa = 0 bending, say) changes
+    no energy and so no tension."""
+    column = getattr(effector, "magnitude", None)
+    if column is None:
+        return True                           # unknown shape: assume it counts
+    for df in (sheet.face_df, sheet.edge_df, sheet.vert_df):
+        if column in df.columns:
+            return bool(np.any(np.abs(df[column].to_numpy(dtype=float)) > 0))
+    return True                               # not set up: assume it counts
+
+
 class BoundaryBending(AbstractEffector):
     """Uniform BENDING (curvature) energy along cell boundaries::
 
@@ -205,6 +232,53 @@ class BoundaryBending(AbstractEffector):
 
 
 from lateral_inhibition_model import LateralInhibitionModel
+
+# Experimental cell-area distribution in units of the MEAN PERIMETER SQUARED,
+# i.e. A/<P>^2, so it is scale-free and can be converted into any length unit.
+# Measured 2026-10-26 from frame_1 (the UNDIFFERENTIATED start -- the state a
+# freshly created random array is meant to resemble) of the three experiments
+# per stage, valid non-edge cells only, then averaged over the experiments.
+#
+#   stage    mean A/<P>^2   std       CV
+#   E17.5    0.05896        0.01990   0.338
+#   P0       0.05539        0.01790   0.323
+#
+# Sanity: mean(A/P^2) = <roundness>/(4*pi), so these reproduce the known ~0.74
+# (E17.5) and ~0.70 (P0) experimental roundness. For reference a circle gives
+# 0.0796, a regular hexagon 0.0722 -- real cells are markedly less round.
+#
+# ``None`` is the pooled value and is the DEFAULT, because array creation is
+# stage-agnostic: one random_periodic_array<i> serves both stages and the
+# per-stage frame is chosen afterwards by the neighbour-distribution match.
+EXPERIMENTAL_NORMALIZED_AREA = {
+    "E17.5": (0.05896, 0.01990),
+    "P0": (0.05539, 0.01790),
+    None: (0.05717, 0.01890),
+}
+# These are DISORDER GENERATORS for building initial configurations, not an
+# attempt to reproduce experimental cell shapes. Only A0 claims a connection to
+# the data.
+#
+# A0 IS NORMAL, and the data back that: per experiment a Gaussian beats a
+# log-normal on the KS statistic in all six frames, and the skew of log(area)
+# is strongly NEGATIVE (-0.84 at E17.5, -1.75 at P0), i.e. the log transform
+# over-corrects. The price is positivity -- at CV 0.33 the mean sits 3.0 sigma
+# from zero, so ~0.3% of draws come out non-positive and are clipped to this
+# fraction of the mean. A zero or negative preferred area is meaningless and
+# collides with the delamination criterion, so the clip is not optional.
+_MIN_PREFERED_AREA_FRACTION = 0.1
+
+# Contractility and area elasticity are plain uniforms. No experimental
+# distribution is claimed for either; they only have to disorder the packing.
+#
+# The historical range, restored (it was ``np.random.rand(n)/5``). U(0, 1) was
+# the historical range of the PREFERRED AREA, not of gamma; using it here would
+# be a 5x increase in mean contractility and makes the solver stiff.
+_RANDOM_CONTRACTILITY_RANGE = (0.0, 0.2)
+# Deliberately NOT per cell type: during array creation there are no types yet
+# (no_differentiation=True leaves every cell an SC), so a type-dependent draw
+# would be a distinction without a difference.
+_RANDOM_ELASTICITY_RANGE = (1.0, 2.0)
 
 
 def _truncate_history_file(path, continue_from_time):
@@ -368,7 +442,9 @@ class InnerEarModel:
                  notch_sensitivity=1, atoh_by_repressor=False,
                  randomize_notch_delta_levels=False,
                  notch_levels=None, delta_levels=None, repressor_levels=None,
-                 initial_notch_delta_level=None):
+                 initial_notch_delta_level=None,
+                 length_normalization_factor=None, l0_ratio=1.0,
+                 random_area_stage=None, uniform_delta_level=None):
         # Setting class constants
         self.CELL_TYPES = ['SC', 'HC']
         self.DIMENSIONS = ['2D']
@@ -408,16 +484,42 @@ class InnerEarModel:
         # ``repulsion_distance *= L0``) inflates the preferred area by ~L0^2 and
         # leaves the tissue compressed, so it EXPANDS when cut instead of
         # relaxing inward.
-        length_normalization_factor = self.get_average_face_perimeter()
+        # Measured from the sheet unless the caller supplies it. A FORK must
+        # supply the value its source used: by then the tissue has settled and
+        # re-measuring gives a ~9% larger L0 than the initial array, which
+        # quietly changes the lateral-inhibition coupling (see run()).
+        if length_normalization_factor is None:
+            length_normalization_factor = self.get_average_face_perimeter()
+        else:
+            length_normalization_factor = float(length_normalization_factor)
+        self.length_normalization_factor = length_normalization_factor
+        # L0 / <perimeter>: the lateral-inhibition length scale, as a multiple of
+        # the length unit above. The two used to be the same number by fiat;
+        # they are separated here so L0 can be set from measured rates. 1.0 is
+        # the pre-2026-10-26 model (to ~1 ULP, see lateral_inhibition_model).
+        self.l0_ratio = float(l0_ratio)
+        # (mean, std) of A/<P>^2 that set_random_parameters draws A0 from, in
+        # units of length_normalization_factor**2. None = pooled over stages,
+        # which is right for stage-agnostic array creation.
+        if random_area_stage not in EXPERIMENTAL_NORMALIZED_AREA:
+            raise ValueError("random_area_stage must be one of %s, got %r"
+                             % (sorted(k for k in EXPERIMENTAL_NORMALIZED_AREA
+                                       if k is not None) + [None],
+                                random_area_stage))
+        self.random_area_stats = EXPERIMENTAL_NORMALIZED_AREA[random_area_stage]
         if preferred_area_override is not None:
             # Optional: set the effective preferred area DIRECTLY (e.g. a fraction
             # of the measured mean cell area) instead of the caller's per-type dict.
             preferred_area = {'HC': float(preferred_area_override),
                               'SC': float(preferred_area_override)}
-        # Target perimeter P0 = shape_index * sqrt(A0), PER CELL TYPE. A0 is
-        # already length-normalized above, so P0 scales with it. Consumed by
-        # ContractilityPerimeterElasticity; shape_index=0 -> P0=0 -> the perimeter
-        # effector reduces exactly to plain contractility (Gamma/2 P^2).
+        # Target perimeter P0 = shape_index * sqrt(A0), PER CELL TYPE, from the
+        # preferred area AS GIVEN -- L0 does not enter here. (This comment used
+        # to say A0 was "already length-normalized above", which was true only
+        # before the L0-normalization fix described at the top of __init__; see
+        # also run_model's warning that pre-fix folders used A0 = pi/4*L0^2.)
+        # Consumed by ContractilityPerimeterElasticity; shape_index=0 -> P0=0 ->
+        # the perimeter effector reduces exactly to plain contractility
+        # (Gamma/2 P^2).
         #
         # ``hc_shape_index`` / ``sc_shape_index`` each default to the shared
         # ``shape_index``, so a caller that passes only ``shape_index`` keeps the
@@ -451,7 +553,8 @@ class InnerEarModel:
             delta_repressor_degradation_ratio=delta_repressor_degradation_ratio,
             notch_delta_production_ratio=notch_delta_production_ratio,
             stress_effectors=stress_effectors, mechanosensitivity=mechanosensitivity,
-            stress_shift=stress_shift, stress_hill_exponent=stress_hill_exponent)
+            stress_shift=stress_shift, stress_hill_exponent=stress_hill_exponent,
+            l0_ratio=self.l0_ratio)
         # If ``sheet`` came in with LI columns already populated
         # (typical of a sheet retrieved from HDF5 history), those
         # values are preserved by ``initialize_notch_delta``;
@@ -473,6 +576,7 @@ class InnerEarModel:
             notch_levels=notch_levels, delta_levels=delta_levels,
             repressor_levels=repressor_levels,
             initial_level_range=initial_notch_delta_level,
+            uniform_delta_level=uniform_delta_level,
         )
         active_edges = (self.sheet.edge_df.opposite.values >= 0).astype(int)
         self.sheet.edge_df.loc[:, 'is_active'] = active_edges
@@ -519,9 +623,39 @@ class InnerEarModel:
             self.sheet.edge_df.loc[:, param] = new_vals
 
     def set_random_parameters(self):
-        self.sheet.face_df.loc[:, "prefered_area"] = np.random.rand(self.sheet.face_df.shape[0],)
-        self.sheet.face_df.loc[:, "prefered_vol"] = self.sheet.face_df.loc[:, "prefered_area"]
-        self.sheet.face_df.loc[:, "contractility"] = np.random.rand(self.sheet.face_df.shape[0],)/5
+        """Re-draw the per-cell mechanical parameters (every ``wait_time`` units
+        of a ``random_forces`` run -- this is the churn that disorders the
+        packing while the array grows by division).
+
+          * A0    NORMAL, with the mean and std of the experimental cell-area
+                  distribution. Drawn in units of the mean perimeter squared and
+                  converted with the model's own length unit, so the draw is
+                  scale-free and independent of the lattice spacing:
+
+                      A0_i = N(mean, std) * length_normalization_factor**2
+
+                  This IS a change of mean against the old U(0,1): 0.664 rather
+                  than 0.5. Non-positive draws (~0.3%) are clipped -- see
+                  _MIN_PREFERED_AREA_FRACTION.
+          * gamma U(0, 0.2), the historical range.
+          * alpha U(1, 2), NOT per cell type -- there are no types yet while an
+                  array is being built.
+
+        None of gamma or alpha claims an experimental basis; they exist to
+        disorder the packing.
+        """
+        n = self.sheet.face_df.shape[0]
+        mean_hat, std_hat = self.random_area_stats
+        scale = self.length_normalization_factor ** 2      # area ~ length^2
+
+        a0 = np.random.normal(mean_hat * scale, std_hat * scale, n)
+        a0 = np.maximum(a0, _MIN_PREFERED_AREA_FRACTION * mean_hat * scale)
+        self.sheet.face_df.loc[:, "prefered_area"] = a0
+        self.sheet.face_df.loc[:, "prefered_vol"] = a0
+        self.sheet.face_df.loc[:, "contractility"] = np.random.uniform(
+            *_RANDOM_CONTRACTILITY_RANGE, size=n)
+        self.sheet.face_df.loc[:, "area_elasticity"] = np.random.uniform(
+            *_RANDOM_ELASTICITY_RANGE, size=n)
 
     def get_specs_2d(self, notch_sensitivity):
         # NOTE: ``notch_level`` / ``delta_level`` / ``repressor_level``
@@ -582,39 +716,96 @@ class InnerEarModel:
             return 0
 
     def get_edge_stress(self, relevant_effectors):
-        edge_data = self.sheet.edge_df[["ux", "uy", "opposite"]].copy()
-        stress_model = model_factory(relevant_effectors)
-        grads = stress_model.compute_gradient(self.sheet, components=True)
-        norm_factor = self.sheet.specs["settings"].get("nrj_norm_factor", 1)
-        srce_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Ne]
-        if srce_grads:
-            edge_data["srce_gx"] = np.array([grad.gx.values for grad in srce_grads]).sum(axis=0)
-            edge_data["srce_gy"] = np.array([grad.gy.values for grad in srce_grads]).sum(axis=0)
-        trgt_grads = [
-            g[1] for g in grads if (g[1] is not None) and (g[1].shape[0] == self.sheet.Ne)
-        ]
-        if trgt_grads:
-            edge_data["trgt_gx"] = np.array([grad.gx.values for grad in trgt_grads]).sum(axis=0)
-            edge_data["trgt_gy"] = np.array([grad.gy.values for grad in trgt_grads]).sum(axis=0)
-        vert_grads = [g[0] for g in grads if g[0].shape[0] == self.sheet.Nv]
-        if vert_grads:
-            raise NotImplementedError
-        edge_data["stress"] = edge_data.eval("((trgt_gx - srce_gx) * ux + (trgt_gy - srce_gy) * uy)/ %s" % str(norm_factor))
-        # Couple each edge to its OPPOSITE (the shared junction carries both):
-        # stress[e] = base[e] + base[opposite(e)]. Snapshot the base stress first
-        # so BOTH terms use pre-coupling values, and map opposite LABELS to array
-        # positions (get_indexer) so it is correct even for a non-contiguous index.
-        base_stress = edge_data["stress"].to_numpy().copy()
-        opp = edge_data["opposite"].to_numpy()
-        # >= 0, not > 0: edge label 0 is a perfectly good opposite. Testing > 0
-        # left whichever edge is paired with edge 0 uncoupled while edge 0 itself
-        # was coupled, so the shared junction carried different stress on its two
-        # sides. -1 is the only "no opposite" sentinel.
+        """Tension on each cell-cell interface: the derivative of the energy
+        with respect to that interface's LENGTH.
+
+        For our energy, E = sum_c [ K_c/2 (A_c - A0_c)^2 + Gamma_c/2 P_c^2 ],
+        the interface between cells n and m carries
+
+            T = dE/dl = Gamma_n * P_n + Gamma_m * P_m
+
+        and that is what this returns (divided by ``nrj_norm_factor``, the
+        convention the rest of the energy is expressed in; ``compute_gradient``
+        with ``components=True`` does NOT apply it). Both half-edges of a
+        junction get the same value, because they are one physical interface
+        carrying one tension. A half-edge with no opposite carries its own
+        cell's term alone.
+
+        THIS REPLACES a projection of the vertex forces,
+
+            ((trgt_g - srce_g) . u) / nrj_norm_factor,
+
+        summed with the opposite half-edge. That is not dE/dl: the net gradient
+        at a vertex collects every term acting there -- the area/pressure
+        contribution and the pull of the OTHER edges meeting at that vertex --
+        so projecting it onto one edge's direction mixes in forces that are not
+        that interface's tension. The two agree only in the special case of a
+        straight, isolated edge. Every pT > 0 result changes, because the
+        stress feeds back into differentiation through the mechanosensitive
+        gate.
+
+        Raises on any effector set the expression does not cover, rather than
+        silently returning a tension that is missing a term.
+        """
+        effectors = list(relevant_effectors)
+        perimeter_terms = [e for e in effectors
+                           if e in TENSION_PERIMETER_EFFECTORS]
+        unknown = [e for e in effectors
+                   if e not in TENSION_PERIMETER_EFFECTORS
+                   and e not in TENSION_NEUTRAL_EFFECTORS]
+        # An effector WOULD add a term, but only if it is switched on. The v2
+        # runs carry BoundaryBending in their "all" set with kappa = 0, where
+        # it is an exact no-op, so refusing it by class alone would reject a
+        # set this expression handles perfectly. Refuse exactly the cases where
+        # the answer would be wrong: a non-zero magnitude.
+        active = [e for e in unknown if effector_is_active(self.sheet, e)]
+        if active:
+            raise NotImplementedError(
+                "get_edge_stress computes dE/dl for perimeter contractility "
+                "(+ area elasticity, which contributes nothing to it) only; "
+                "it has no term for %s, and %s switched on (non-zero "
+                "magnitude). Add the missing derivative before using these "
+                "effectors for stress."
+                % (", ".join(sorted(e.__name__ for e in active)),
+                   "it is" if len(active) == 1 else "they are"))
+        if not perimeter_terms:
+            raise ValueError(
+                "get_edge_stress needs a perimeter-contractility effector "
+                "(%s); with none the tension is identically zero."
+                % " or ".join(e.__name__ for e in TENSION_PERIMETER_EFFECTORS))
+
+        face_df = self.sheet.face_df
+        # The expression assumes P0 = 0, i.e. ContractilityPerimeterElasticity
+        # reduced to FaceContractility. With a target perimeter the derivative
+        # is Gamma*(P - P0), so refuse rather than return the wrong number.
+        if "prefered_perimeter" in face_df.columns:
+            p0 = face_df["prefered_perimeter"].to_numpy()
+            if np.any(np.abs(p0) > 1e-12):
+                raise NotImplementedError(
+                    "get_edge_stress assumes a zero target perimeter (P0 = 0), "
+                    "but %d face(s) have prefered_perimeter != 0 (max %.4g). "
+                    "The tension is then Gamma*(P - P0) per cell."
+                    % (int(np.count_nonzero(np.abs(p0) > 1e-12)), np.abs(p0).max()))
+
+        # Gamma_c * P_c per face, upcast to each of that face's half-edges.
+        # is_alive mirrors the effector's own "contractility * is_alive".
+        gamma_perimeter = (face_df["contractility"]
+                           * face_df["is_alive"]
+                           * face_df["perimeter"])
+        own = self.sheet.upcast_face(gamma_perimeter).to_numpy(dtype=float)
+
+        edge_df = self.sheet.edge_df
+        opp = edge_df["opposite"].to_numpy()
+        # >= 0, not > 0: edge label 0 is a perfectly good opposite, and -1 is
+        # the only "no opposite" sentinel. Map opposite LABELS to array
+        # positions (get_indexer) so this is correct for a non-contiguous index.
         has = opp >= 0
-        new_stress = base_stress.copy()
-        new_stress[has] = base_stress[has] + base_stress[edge_data.index.get_indexer(opp[has])]
-        edge_data["stress"] = new_stress
-        return edge_data.stress
+        tension = own.copy()
+        tension[has] += own[edge_df.index.get_indexer(opp[has])]
+
+        norm_factor = self.sheet.specs["settings"].get("nrj_norm_factor", 1)
+        return pd.Series(tension / norm_factor, index=edge_df.index,
+                         name="stress")
 
     def get_face_stress(self, relevant_effectors):
         edge_stress = self.get_edge_stress(relevant_effectors)
@@ -772,7 +963,8 @@ class InnerEarModel:
     def initialize_notch_delta(self, random_sensitivity=False,
                                contact_dependent=False, force_random=False,
                                notch_levels=None, delta_levels=None,
-                               repressor_levels=None, initial_level_range=None):
+                               repressor_levels=None, initial_level_range=None,
+                               uniform_delta_level=None):
         """Seed the lateral-inhibition columns on ``face_df``.
 
         Behaviour
@@ -883,13 +1075,21 @@ class InnerEarModel:
                 self.sheet.face_df["repressor_level"] = (
                     np.random.rand(n_faces) * maximal_repressor_level
                 )
+        if uniform_delta_level is not None:
+            # Last, so it overrides every branch above, including a loaded
+            # sheet's preserved values. Used when building the random arrays:
+            # there is no differentiation there, so a flat delta is a neutral
+            # starting state rather than noise that means nothing.
+            self.sheet.face_df["delta_level"] = float(uniform_delta_level)
         if random_sensitivity:
             self.sheet.face_df["notch_sensitivity"] = np.random.rand(n_faces)
 
     def simulate(self, t_end, dt, only_differentiation=False, random_forces=False,
                  aging_sensitivity=False, no_differentiation=False, contact_dependent_differentiation=False,
                  divisions=True, intercalations=True, delaminations=True, ablated_cells=[], sensitivity_aging_rate=0,
-                 division_area=1.3, intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
+                 division_area=1.3, division_rule="area", division_interval=None,
+                 division_start=None,
+                 intercalation_length=0.04, delamination_area=0.1, delamination_rate=1.2,
                  sharp_angle_threshold=None, verbose_log=False,
                  viscosity=3, effectors=None, quasi_static=False, quasi_static_threshold=0.01, atoh_by_repressor=True,
                  history_file=None, save_interval=None,
@@ -996,7 +1196,23 @@ class InnerEarModel:
             manager.append(self.lateral_inhibition_model.get_aging_sensitivity_function(rate=sensitivity_aging_rate, dt=dt))
         if not only_differentiation:
             if divisions:
-                manager.append(self.topological_events_handler.get_division_function(crit_area=division_area))
+                # Two rules. "area": every cell over division_area divides, so
+                # division is perfectly correlated with size and itself keeps
+                # the tiling uniform. "random": one uniformly chosen cell every
+                # division_interval time units, independent of geometry.
+                if division_rule == "random":
+                    if not division_interval:
+                        raise ValueError(
+                            "division_rule='random' needs a division_interval")
+                    manager.append(
+                        self.topological_events_handler.get_random_division_function(
+                            interval=division_interval, dt=dt,
+                            start=division_start))
+                elif division_rule == "area":
+                    manager.append(self.topological_events_handler.get_division_function(crit_area=division_area))
+                else:
+                    raise ValueError("unknown division_rule %r (area|random)"
+                                     % (division_rule,))
             if intercalations:
                 manager.append(self.topological_events_handler.get_intercalation_function(crit_edge_length=intercalation_length))
             if delaminations:
@@ -1136,7 +1352,16 @@ class InnerEarModel:
 
     @staticmethod
     def get_draw_sheet_method(number_vertices=False, number_edges=False, number_faces=False, is_ordered=True,
-                    maximal_level=1, color_by="atoh", arrange_sheet=False):
+                    maximal_level=1, color_by="atoh", arrange_sheet=False,
+                    uniform_level=None):
+        """``uniform_level`` paints EVERY cell the same, whatever its state.
+
+        The level is read on the same 0..1 scale the colour map uses -- 0 is
+        dark green and 1 is white, so 0.5 is the midpoint -- and it overrides
+        ``color_by`` entirely. For a picture about geometry rather than about
+        pattern, where a colour that varied would invite a reading that is not
+        there.
+        """
         def draw_sheet(sheet):
             if arrange_sheet:
                 sheet.arrange_sheet_from_history()
@@ -1145,7 +1370,9 @@ class InnerEarModel:
             #     sheet.order_all_edges()
             draw_specs = tyssue.config.draw.sheet_spec()
             cmap = plt.cm.get_cmap('Greens').reversed()
-            if color_by == "atoh":
+            if uniform_level is not None:
+                cmap_scale = np.full(len(sheet.face_df), float(uniform_level))
+            elif color_by == "atoh":
                 cmap_scale = sheet.face_df.atoh_level.to_numpy()
             elif color_by == "delta":
                 cmap_scale = sheet.face_df.delta_level.to_numpy() / maximal_level

@@ -50,7 +50,8 @@ from post_processing import (RESULTS_DIR, experimental_results_folder,
                              get_non_boundary_cell_ids_from_type,
                              calc_contact_with_neighbors_from_type,
                              _best_matching_frame_by_neighbor_pairs,
-                             _exp_neighbor_pair_percentages, _nsigma_and_chi2,
+                             _exp_neighbor_pair_percentages, experimental_cell_mask,
+                             _nsigma_and_chi2,
                              calc_HC_neighbors_at_differentiation)
 from build_experimental_tables import (carried_over_sheets, FULLMODEL_SHEETS,
                                        to_output_names)
@@ -163,9 +164,11 @@ _ISO_CACHE = {}
 def exp_isolated_sc(stage):
     """Per-experiment (%SCs, %cells) with no HC neighbour, frame 1.
 
-    Same valid-cell mask and same type column as _exp_neighbor_pair_percentages,
-    so this is the population score 1's target comes from — the model number is
-    therefore comparable to it without further correction."""
+    Same cell mask and same type column as _exp_neighbor_pair_percentages — i.e.
+    experimental_cell_mask, which drops invalid cells, edge cells and the
+    neighbours of invalid cells — so this is the population score 1's target
+    comes from and the model number is comparable to it without further
+    correction."""
     if stage in _ISO_CACHE:
         return _ISO_CACHE[stage]
     prefix = "E17" if stage == "E17.5" else "P0"
@@ -175,13 +178,13 @@ def exp_isolated_sc(stage):
                             "%s_experiment%d_cells_info_frame_1" % (prefix, e)))
         cm = np.load(os.path.join(experimental_results_folder, stage,
                      "%s_experiment%d_contact_matrix_frame_1.npy" % (prefix, e)))
-        valid = ci.valid.values.astype(bool)
-        is_hc = (ci.type.values == 1)[valid]
-        A = np.asarray(cm)[np.ix_(valid, valid)] > 0
+        keep = experimental_cell_mask(ci, cm)
+        is_hc = (ci.type.values == 1)[keep]
+        A = np.asarray(cm)[np.ix_(keep, keep)] > 0
         np.fill_diagonal(A, False)
         iso = int(((~is_hc) & (A[:, is_hc].sum(axis=1) == 0)).sum())
         of_sc.append(100.0 * iso / max(int((~is_hc).sum()), 1))
-        of_all.append(100.0 * iso / max(int(valid.sum()), 1))
+        of_all.append(100.0 * iso / max(int(keep.sum()), 1))
     _ISO_CACHE[stage] = (of_sc, of_all)
     return _ISO_CACHE[stage]
 

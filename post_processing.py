@@ -60,7 +60,9 @@ experimental_results_folder = os.environ.get(
 # each with its ``history.hf5`` etc.). Imported from history_io above rather than
 # redefined: archives are large, so this usually points at a data drive, and two
 # copies of the default would drift apart. Set TISSUE_RESULTS_DIR to override —
-# this project uses D:\Kasirer\results.
+# this project uses D:\kasirer\model_results. The previous root, D:\Kasirer\results,
+# holds the runs made before the derivation was corrected; it is kept for
+# reference and nothing writes there any more.
 # Circular-ablation raw data (initial radius 60 um, per-ablation final radius).
 # Lives in a sibling "Raw Data" folder by default; also looked for INSIDE the
 # experimental data dir, which is how it is staged on the VM. Override with
@@ -395,7 +397,8 @@ def _read_ablation_area_ratios(stage):
     return [(np.array(hc), np.array(sc)) for hc, sc in repeats.values()]
 
 
-def load_experimental_results(stage, type, cell_type='all', neighbor_type='all'):
+def load_experimental_results(stage, type, cell_type='all', neighbor_type='all',
+                              interior_only=True):
     """``cell_type`` / ``neighbor_type`` (``'all'`` / ``'HC'`` / ``'SC'``)
     restrict, for the ``"number of neighbors"`` and ``"contact length"``
     branches, which cells are counted and which of their neighbors are
@@ -403,6 +406,21 @@ def load_experimental_results(stage, type, cell_type='all', neighbor_type='all')
     behavior (total neighbors of every valid cell); ``cell_type='HC'`` with
     ``neighbor_type='HC'`` yields the number of HC neighbors for each HC.
     The experimental ``type`` column encodes HCs as ``1`` and SCs as ``0``.
+
+    ``interior_only`` (``"number of neighbors"`` only, default True) drops
+    every cell whose neighbour list is TRUNCATED, which the row/column masks
+    alone do not do:
+
+      * a cell flagged ``edge_cell`` has part of its neighbourhood outside the
+        imaged field, so those neighbours were never segmented at all;
+      * a cell touching a cell that failed validation loses that contact to
+        the column mask, and is then counted with fewer neighbours than it has.
+
+    Both keep the cell in the sample with an undercount, which piles cells into
+    the low bins: at E17.5 the k=3 fraction is 0.033 with them and 0.0018
+    without, and the ``<=4`` fraction 0.111 against 0.037. The model is
+    periodic and has no cells of either kind, so only the filtered set is a
+    like-for-like comparison. Pass False for the historical behaviour.
     """
     res = []
     if type == "number of neighbors" or type == "contact length":
@@ -425,6 +443,15 @@ def load_experimental_results(stage, type, cell_type='all', neighbor_type='all')
 
             row_mask = _mask(cell_type)
             col_mask = _mask(neighbor_type)
+            if type == "number of neighbors" and interior_only:
+                # Truncation is a property of the cell's WHOLE neighbourhood,
+                # so it is judged against every neighbour of any type — not
+                # against the (possibly HC- or SC-restricted) column mask.
+                adjacency = contact_matrix > 0
+                truncated = (adjacency.sum(axis=1)
+                             != adjacency[:, valid_cells].sum(axis=1))
+                edge_cell = cells_info.edge_cell.values.astype(bool)
+                row_mask = row_mask & ~truncated & ~edge_cell
             valid_contacts = contact_matrix[np.ix_(row_mask, col_mask)]
             if type == "number of neighbors":
                 valid_contacts = (valid_contacts > 0).astype(int)
@@ -801,32 +828,492 @@ def compare_to_experimental_results(history, model_name, experimental_stage, res
     return calc_pval([model_results], experimental_results, maximal_n=max_number_of_neighbors,
                                    continues=continues, plot=plot)
 
-def find_best_timepoint_according_to_n_neighbors(model_name):
+# The stage's own colour, matching plot_neighbor_pairs' STYLE table (the model
+# edge colour of each stage). Hard-coded rather than imported: that module
+# imports THIS one, so reaching back would be a circular import.
+_STAGE_COLOUR = {"E17.5": "green", "P0": "orangered"}
+# The chosen frame is marked in a colour that CONTRASTS with its curve, so the
+# marker does not read as part of it; these are the two stages' experiment
+# colours in plot_neighbor_pairs' STYLE table, against the model colours the
+# curves use. The dashed line dropped to each marker stays black.
+_SELECTED_COLOUR = {"E17.5": "blue", "P0": "red"}
+_POINT_MS = 3.2           # a dot per scored frame, over the line
+_SELECTED_MS = 9.0        # ... and a bigger one where the maximum is
+
+
+def _pval_trace_path(model_name):
+    """Where a run's p-value-against-time trace lives (no extension).
+
+    Inside the run's own folder when it exists, so the trace travels with the
+    archive it was computed from; beside it otherwise.
+    """
+    folder = os.path.join(RESULTS_DIR, model_name)
+    if os.path.isdir(folder):
+        return os.path.join(folder, "pval_vs_time")
+    return os.path.join(RESULTS_DIR, "%s_pval_vs_time" % model_name)
+
+
+def _z2_trace_path(model_name, tag=""):
+    """Where a run's chi-square-against-time trace lives (no extension).
+
+    Deliberately a DIFFERENT stem from _pval_trace_path: the two scores point
+    in opposite directions (p is maximised, z^2 minimised), so a file holding
+    one must never be mistaken for the other. ``tag`` separates binning
+    schemes for the same reason -- a trace scored on merged tails is not
+    comparable with one scored on single counts.
+    """
+    stem = "z2_vs_time" + tag
+    folder = os.path.join(RESULTS_DIR, model_name)
+    if os.path.isdir(folder):
+        return os.path.join(folder, stem)
+    return os.path.join(RESULTS_DIR, "%s_%s" % (model_name, stem))
+
+
+# The neighbour counts the z^2 score runs over. A bin is either a single count
+# or an inclusive (lo, hi) range, with None for open-ended. Cells outside every
+# bin are NOT dropped: fractions below are taken over ALL cells, so a model
+# frame that puts weight outside the bins shows up as a deficit spread across
+# them rather than being quietly renormalised away.
+_NEIGHBOR_BINS = (3, 4, 5, 6, 7, 8, 9)
+
+# Tails merged. The separate 3 and 9 bins are the rarest and carry the smallest
+# experimental SEMs, so they dominate the score out of proportion to their
+# absolute weight: on array0 at E17.5 the k=3 bin alone contributed ~290 of
+# ~460, from a 3-percentage-point difference. Merging them puts the score back
+# on the bulk of the distribution.
+NEIGHBOR_BINS_MERGED_TAILS = ((None, 4), 5, 6, 7, (8, None))
+
+# THE PRODUCTION SCHEME -- what the selection and the ensemble score use when
+# no ``bins`` is passed. Merged tails, because the k=9 bin holds under 1% of
+# cells and its three-animal SEM is the least trustworthy number in the whole
+# reference, while the two schemes return the same verdict (E17.5 matches, P0
+# does not) on the variant-C reference. _NEIGHBOR_BINS remains the single-count
+# alternative, still passable explicitly.
+NEIGHBOR_BINS = NEIGHBOR_BINS_MERGED_TAILS
+
+_EXPERIMENTAL_NEIGHBOR_STATS = {}
+
+
+def _neighbor_trace_tag(bins=None):
+    """Filename tag separating the binning schemes' traces and result files.
+
+    Historical, and deliberately NOT keyed off which scheme is the default: the
+    single-count scheme owns the untagged names because it was scored first and
+    ten runs' traces already sit under them. Re-tagging would orphan those
+    caches (or, worse, let a merged-tails trace be read back as a single-count
+    one) for nothing. So the production scheme is the TAGGED one -- see the
+    ``#`` header the untagged ``pval_results.txt`` now carries.
+    """
+    if bins is None:
+        bins = NEIGHBOR_BINS
+    return ("" if _as_bin_ranges(bins) == _as_bin_ranges(_NEIGHBOR_BINS)
+            else "_mergedtails")
+
+
+def best_time_point_file(bins=None, trace_tag=None):
+    """Where the chosen frames are written and read back, per scheme."""
+    tag = _neighbor_trace_tag(bins) if trace_tag is None else trace_tag
+    return os.path.join(RESULTS_DIR, "pval_results%s.txt" % tag)
+
+
+def _as_bin_ranges(bins):
+    """Normalise a bin spec to a tuple of inclusive (lo, hi) float pairs."""
+    out = []
+    for b in bins:
+        if isinstance(b, (tuple, list)):
+            lo = -np.inf if b[0] is None else float(b[0])
+            hi = np.inf if b[1] is None else float(b[1])
+        else:
+            lo = hi = float(b)
+        out.append((lo, hi))
+    return tuple(out)
+
+
+def neighbor_bin_labels(bins=NEIGHBOR_BINS):
+    """Short printable label per bin: ``5``, ``<=4``, ``>=8``, ``4-6``."""
+    labels = []
+    for lo, hi in _as_bin_ranges(bins):
+        if lo == hi:
+            labels.append("%d" % int(lo))
+        elif np.isneginf(lo):
+            labels.append("<=%d" % int(hi))
+        elif np.isposinf(hi):
+            labels.append(">=%d" % int(lo))
+        else:
+            labels.append("%d-%d" % (int(lo), int(hi)))
+    return labels
+
+
+def _neighbor_fractions(counts, bins=NEIGHBOR_BINS):
+    """Fraction of cells falling in each bin.
+
+    FRACTIONS, not raw counts. The experiments hold ~1700-2500 valid cells and
+    a model array a few hundred, so raw counts would be dominated by tissue
+    size and the comparison would be meaningless.
+    """
+    counts = np.asarray(counts, dtype=float)
+    n = counts.size
+    if n == 0:
+        return np.full(len(bins), np.nan)
+    return np.array([np.sum((counts >= lo) & (counts <= hi))
+                     for lo, hi in _as_bin_ranges(bins)], dtype=float) / n
+
+
+def _experimental_neighbor_stats(stage, bins=NEIGHBOR_BINS):
+    """(mean, sem, n_experiments) of the neighbour-count fractions.
+
+    One fraction vector per EXPERIMENT, from the FIRST frame of each
+    (``load_experimental_results`` reads ``*_frame_1``), then the mean and the
+    standard error over those experiments -- the experiment is the independent
+    unit, so n = 3 and sem = std(ddof=1)/sqrt(3).
+
+    Which experimental cells enter is ``load_experimental_results``'s
+    ``interior_only`` rule: valid, not on the field-of-view border, and with no
+    invalid neighbour, so no cell carries a truncated neighbour count.
+    """
+    key = (stage, _as_bin_ranges(bins))
+    if key not in _EXPERIMENTAL_NEIGHBOR_STATS:
+        per_experiment = load_experimental_results(stage, "number of neighbors")
+        fractions = np.array([_neighbor_fractions(c, bins) for c in per_experiment])
+        n_exp = fractions.shape[0]
+        _EXPERIMENTAL_NEIGHBOR_STATS[key] = (
+            fractions.mean(axis=0),
+            fractions.std(axis=0, ddof=1) / np.sqrt(n_exp),
+            n_exp,
+        )
+    return _EXPERIMENTAL_NEIGHBOR_STATS[key]
+
+
+def _reference_fingerprint(bins=NEIGHBOR_BINS):
+    """Short hash of the experimental reference a trace was scored against.
+
+    The trace cache used to be validated on the archive alone (frame count and
+    last time stamp), so changing which experimental cells enter the reference
+    -- as the ``interior_only`` filter does -- left every stored trace looking
+    valid while it no longer meant anything. Stamping the reference into the
+    npz turns that silent staleness into an automatic recompute.
+    """
+    h = hashlib.md5()
+    h.update(repr(_as_bin_ranges(bins)).encode())
+    for stage in sorted(_STAGE_COLOUR):
+        mean, sem, n_exp = _experimental_neighbor_stats(stage, bins)
+        h.update(stage.encode())
+        h.update(np.round(mean, 9).tobytes())
+        h.update(np.round(sem, 9).tobytes())
+        h.update(str(n_exp).encode())
+    return h.hexdigest()[:16]
+
+
+def neighbor_count_z2(model_counts, stage, bins=NEIGHBOR_BINS):
+    """Sum of z^2 over the neighbour-count bins -- SMALLER IS BETTER.
+
+        z_k = (model_k - <experiment_k>) / SEM(experiment_k)
+
+    with everything expressed as a fraction of cells (see _neighbor_fractions).
+
+    A bin whose experimental SEM is zero (all three experiments landed on the
+    same fraction, which in practice means all three were empty) contributes
+    nothing: its z is either 0/0 or infinite, and neither is informative. Those
+    bins are skipped identically at every frame, so the argmin is unaffected.
+    """
+    model = _neighbor_fractions(model_counts, bins)
+    mean, sem, _n = _experimental_neighbor_stats(stage, bins)
+    usable = sem > 0
+    if not np.any(usable) or not np.all(np.isfinite(model)):
+        return np.nan
+    z = (model[usable] - mean[usable]) / sem[usable]
+    return float(np.sum(z ** 2))
+
+
+def find_best_timepoint_according_to_n_neighbors(model_name, reuse=True,
+                                                 max_number_of_neighbors=9,
+                                                 type_by='atoh_level',
+                                                 out_stem=None,
+                                                 legend=False, grid=False,
+                                                 bins=None, trace_tag=None):
+    """Score every frame of a run against both stages and pick the best one.
+
+    The score is a chi-square over the neighbour-count distribution,
+
+        z2(stage) = sum_k [ (model_k - <experiment_k>) / SEM(experiment_k) ]^2
+
+    over the ``bins`` neighbour bins (NEIGHBOR_BINS by default: <=4, 5, 6, 7,
+    >=8), and the chosen frame is the one that MINIMISES it. Everything is a
+    fraction of cells, not a raw count, because the
+    experiments hold ~1700-2500 valid cells against a model array's few
+    hundred; the experimental mean and SEM are taken over the three
+    experiments' FIRST frames, the experiment being the independent unit
+    (n = 3, so SEM = std/sqrt(3)).
+
+    This REPLACES the previous rule, which maximised the hierarchical p value
+    of the same distribution. The two disagree in general: p is a test of
+    whether the distributions are distinguishable, and it saturates once they
+    are not, whereas z^2 keeps discriminating among frames that all pass. The
+    traces are written under a different stem for that reason -- see
+    :func:`_z2_trace_path` -- so an old ``pval_vs_time`` cache can never be
+    read back as a z^2 one.
+
+    Writes three files next to the run: ``z2_vs_time.png``, ``.svg`` and
+    ``.npz``. The npz holds the trace itself, so a second call returns in
+    milliseconds instead of re-scoring every frame -- which for a 300-frame
+    archive is the whole cost of this function.
+
+    ``reuse`` reads that cache when it matches the archive; it is ignored, with
+    a printed reason, when the frame count or the last time stamp has moved
+    (a resumed run, say), since a stale trace would name a best frame that no
+    longer corresponds to the data.
+
+    ``legend`` and ``grid`` are OFF by default: the figure is meant to be
+    annotated by hand. Which curve is which, and where each best frame sits,
+    are printed to the console and returned, so nothing is lost by dropping
+    them; pass True for a self-contained version.
+    """
+    # ``bins`` defaults to the production scheme (NEIGHBOR_BINS, merged tails);
+    # _NEIGHBOR_BINS is the single-count alternative. Each scheme gets its own
+    # trace stem, so the two never overwrite or reuse one another's cache.
+    if bins is None:
+        bins = NEIGHBOR_BINS
+    if trace_tag is None:
+        trace_tag = _neighbor_trace_tag(bins)
+    stem = out_stem or _z2_trace_path(model_name, trace_tag)
     history = load_history_file(model_name)
-    pval_E17 = []
-    pval_P0 = []
-    time = get_time_points(history)
-    for time_point in time:
-        try:
-            pval_E17.append(compare_to_experimental_results(history, model_name,"E17.5", results_type="number of neighbors",
-                                                            type_by='atoh_level', threshold=None,
-                                                            max_number_of_neighbors=9, plot=False,
-                                                            time_point=time_point))
-            pval_P0.append(compare_to_experimental_results(history, model_name, "P0", results_type="number of neighbors",
-                                                           type_by='atoh_level', threshold=None,
-                                                           max_number_of_neighbors=9, plot=False, time_point=time_point))
-            print("E17 pval:%f, P0 pval:%f" % (pval_E17[-1], pval_P0[-1]))
-        except ValueError:
-            break
-    best_E17_idx = np.argmax(pval_E17)
-    best_P0_idx = np.argmax(pval_P0)
-    fig, ax = plt.subplots()
-    print("Best fit for E17.5 is time=%f with pval=%f" % (time[best_E17_idx], pval_E17[best_E17_idx]))
-    print("Best fit for P0 is time=%f with pval=%f" % (time[best_P0_idx], pval_P0[best_P0_idx]))
-    ax.plot(time, pval_E17, label="E17.5")
-    ax.plot(time, pval_P0, label="P0")
-    ax.legend()
-    return fig, ax, time[best_E17_idx], time[best_P0_idx]
+    time_points = np.asarray(get_time_points(history), dtype=float)
+
+    time = scores = None
+    cache = stem + ".npz"
+    fingerprint = _reference_fingerprint(bins)
+    if reuse and os.path.isfile(cache):
+        with np.load(cache) as z:
+            cached_t = z["time"]
+            cached = {s: z["z2_%s" % s] for s in _STAGE_COLOUR
+                      if "z2_%s" % s in z}
+            cached_ref = str(z["reference"]) if "reference" in z else None
+            has_fractions = "fractions" in z
+        if len(cached) != len(_STAGE_COLOUR):
+            print("  cache %s has no trace for every stage; recomputing" % cache)
+        elif cached_ref != fingerprint:
+            # Either a pre-fingerprint trace or one scored against a different
+            # experimental reference. Both are unusable, and silently reusing
+            # them would name a best frame chosen by the OLD reference.
+            print("  cache %s was scored against reference %s, now %s;"
+                  " recomputing" % (cache, cached_ref or "(unstamped)",
+                                    fingerprint))
+        elif not has_fractions:
+            print("  cache %s predates the stored per-frame fractions;"
+                  " recomputing" % cache)
+        elif (cached_t.size != time_points.size
+              or not np.allclose(cached_t, time_points)):
+            print("  cache %s covers %d frame(s) up to t=%.4f, the archive now"
+                  " has %d up to t=%.4f; recomputing"
+                  % (cache, cached_t.size, cached_t[-1] if cached_t.size else np.nan,
+                     time_points.size, time_points[-1]))
+        else:
+            time, scores = cached_t, cached
+            print("  reusing %s (%d frames)" % (cache, time.size))
+
+    if scores is None:
+        labels = neighbor_bin_labels(bins)
+        for s in _STAGE_COLOUR:
+            mean, sem, n_exp = _experimental_neighbor_stats(s, bins)
+            print("  %-6s experiment (n=%d), fraction per neighbour bin:" % (s, n_exp))
+            print("     k      " + "".join("%8s" % k for k in labels))
+            print("     mean   " + "".join("%8.4f" % v for v in mean))
+            print("     SEM    " + "".join("%8.4f" % v for v in sem))
+            if not np.all(sem > 0):
+                print("     NOTE bins with zero SEM are skipped: %s"
+                      % [k for k, v in zip(labels, sem) if v <= 0])
+        scored, scores = [], {s: [] for s in _STAGE_COLOUR}
+        # The per-frame fraction vector and cell count are kept alongside the
+        # scores so the second-stage ensemble comparison
+        # (:func:`ensemble_neighbor_z2`) needs no archive access at all: it
+        # reads the chosen frame's fractions straight out of this npz.
+        frame_fractions, frame_cells = [], []
+        for time_point in time_points:
+            # Retrieve the sheet ONCE and score both stages off it. Going
+            # through calc_contacts_for_time_point would re-retrieve per stage
+            # and np.save a .npy file on every call.
+            try:
+                sheet = history.retrieve(float(time_point))
+                sheet.arrange_sheet_from_history()
+                model_counts, _ = calc_contact_with_neighbors_from_type(
+                    sheet, cell_type="all", neighbor_type="all",
+                    type_by=type_by, threshold=None)
+            except Exception:
+                break
+            got = {s: neighbor_count_z2(model_counts, s, bins) for s in _STAGE_COLOUR}
+            if any(not np.isfinite(v) for v in got.values()):
+                continue
+            # append only once BOTH stages scored, so the lists stay the same
+            # length as the time axis
+            scored.append(float(time_point))
+            for s, v in got.items():
+                scores[s].append(v)
+            frame_fractions.append(_neighbor_fractions(model_counts, bins))
+            frame_cells.append(len(model_counts))
+            print("t=%7.3f  n=%4d  E17.5 z2=%10.3f   P0 z2=%10.3f"
+                  % (time_point, len(model_counts), got["E17.5"], got["P0"]))
+        time = np.asarray(scored, dtype=float)
+        scores = {s: np.asarray(v, dtype=float) for s, v in scores.items()}
+        if not time.size:
+            raise ValueError("no frame of %s could be scored" % model_name)
+        np.savez(cache, time=time,
+                 fractions=np.asarray(frame_fractions, dtype=float),
+                 n_cells=np.asarray(frame_cells, dtype=int),
+                 bin_labels=np.asarray(neighbor_bin_labels(bins)),
+                 reference=np.asarray(fingerprint),
+                 **{"z2_%s" % s: v for s, v in scores.items()})
+        print("  wrote %s" % cache)
+
+    pvals = scores                      # the plotting block below reads this
+    best = {s: int(np.argmin(v)) for s, v in scores.items()}
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    for s in ("E17.5", "P0"):
+        colour = _STAGE_COLOUR[s]
+        ax.plot(time, pvals[s], "-o", lw=1.6, markersize=_POINT_MS,
+                color=colour, label=s, zorder=3)
+        k = best[s]
+        print("Best fit for %s is time=%f with z2=%f"
+              % (s, time[k], pvals[s][k]))
+        ax.axvline(time[k], color="k", ls="--", lw=1.1, alpha=0.75, zorder=1)
+        ax.plot(time[k], pvals[s][k], marker="o", markersize=_SELECTED_MS,
+                color=_SELECTED_COLOUR[s], markeredgecolor="white",
+                markeredgewidth=0.9, linestyle="none", zorder=6,
+                label="%s best: t = %.3f, z2 = %.3g"
+                      % (s, time[k], pvals[s][k]))
+    ax.set_xlabel("time")
+    ax.set_ylabel(r"$\sum_k z_k^2$ against the experiment  (lower is better)")
+    ax.set_yscale("log")
+    if grid:
+        ax.grid(alpha=0.25)
+    if legend:
+        ax.legend(fontsize=9, loc="best")
+    fig.suptitle("Choosing the frame an initial array is taken from (%s)\n"
+                 "neighbour-count distribution, $\\sum_k z_k^2$ over bins %s"
+                 % (model_name, ", ".join(neighbor_bin_labels(bins))),
+                 fontsize=11.5, y=0.985, va="top", linespacing=1.5)
+    fig.subplots_adjust(left=0.105, right=0.98, top=0.855, bottom=0.11)
+    for ext in ("png", "svg"):
+        fig.savefig("%s.%s" % (stem, ext), dpi=200)
+        print("  wrote %s.%s" % (stem, ext))
+    return fig, ax, time[best["E17.5"]], time[best["P0"]]
+
+
+def ensemble_neighbor_z2(model_names, stage, bins=None, trace_tag=None,
+                         verbose=True):
+    """Second-stage score: the ENSEMBLE of runs against the experiment.
+
+    The frame of each run is chosen first, by
+    :func:`find_best_timepoint_according_to_n_neighbors`, against the
+    experimental SEM alone -- the model's own spread plays no part in the
+    selection, so the two stages stay independent and nothing is chosen for
+    agreeing with a noise estimate derived from it.
+
+    This function then treats those chosen frames as the model's replicates,
+    exactly as the three experiments are the experiment's:
+
+        z_k = (P_k - m_k) / sqrt( SEM_model_k^2 + SEM_exp_k^2 )
+
+    with ``P_k``, ``SEM_model_k`` the mean and standard error over the runs'
+    chosen frames and ``m_k``, ``SEM_exp_k`` the same over the three
+    experiments. Both sides are means of independent realisations, so both
+    carry a standard error; summed over bins this is the overall z^2.
+
+    Also reported, for the different question "is ONE array consistent with
+    the experiment", is ``per_run_z2``: there the model term is the standard
+    DEVIATION across runs, not its standard error, because a single array is
+    one realisation rather than an average of ten.
+
+    Reads the stored traces only -- no archive is opened -- so it is cheap and
+    safe to call while runs are being extended. Raises if a run has no trace,
+    rather than quietly scoring a smaller ensemble.
+    """
+    if bins is None:
+        bins = NEIGHBOR_BINS
+    if trace_tag is None:
+        trace_tag = _neighbor_trace_tag(bins)
+    labels = neighbor_bin_labels(bins)
+
+    chosen, times, missing = [], [], []
+    for model_name in model_names:
+        cache = _z2_trace_path(model_name, trace_tag) + ".npz"
+        if not os.path.isfile(cache):
+            missing.append(cache)
+            continue
+        with np.load(cache) as z:
+            if "fractions" not in z:
+                missing.append(cache + " (no stored fractions)")
+                continue
+            k = int(np.argmin(z["z2_%s" % stage]))
+            chosen.append(z["fractions"][k])
+            times.append(float(z["time"][k]))
+    if missing:
+        raise FileNotFoundError(
+            "no usable z^2 trace for %d run(s); run the selection first:\n  %s"
+            % (len(missing), "\n  ".join(missing)))
+    return ensemble_z2_from_fractions(chosen, stage, bins=bins, times=times,
+                                      verbose=verbose)
+
+
+def ensemble_z2_from_fractions(fractions, stage, bins=None, times=None,
+                               verbose=True):
+    """The stage-2 arithmetic, on fraction vectors supplied directly.
+
+    Split out of :func:`ensemble_neighbor_z2` so a set of frames that has no
+    stored trace -- the previously saved extracts, say, which were chosen by
+    the old p-value rule and are being re-scored here for comparison -- goes
+    through exactly the same formula as the current selection rather than a
+    re-implementation of it.
+    """
+    if bins is None:
+        bins = NEIGHBOR_BINS
+    labels = neighbor_bin_labels(bins)
+    chosen = np.asarray(fractions, dtype=float)
+    n_runs = chosen.shape[0]
+    if n_runs < 2:
+        raise ValueError("an ensemble SEM needs at least 2 runs, got %d" % n_runs)
+    times = [] if times is None else list(times)
+
+    model_mean = chosen.mean(axis=0)
+    model_sd = chosen.std(axis=0, ddof=1)
+    model_sem = model_sd / np.sqrt(n_runs)
+    exp_mean, exp_sem, n_exp = _experimental_neighbor_stats(stage, bins)
+
+    sigma = np.sqrt(model_sem ** 2 + exp_sem ** 2)
+    usable = sigma > 0
+    z = np.zeros_like(sigma)
+    z[usable] = (model_mean[usable] - exp_mean[usable]) / sigma[usable]
+    z2 = float(np.sum(z[usable] ** 2))
+
+    sigma_one = np.sqrt(model_sd ** 2 + exp_sem ** 2)
+    usable_one = sigma_one > 0
+    z_one = np.zeros_like(sigma_one)
+    z_one[usable_one] = (model_mean[usable_one] - exp_mean[usable_one]) / sigma_one[usable_one]
+
+    if verbose:
+        print("  %s: %d runs, bins %s  (experiment n=%d)"
+              % (stage, n_runs, ", ".join(labels), n_exp))
+        if times:
+            print("    chosen frames: %s"
+                  % ", ".join("%.2f" % t for t in times))
+        for title, row in (("model mean", model_mean),
+                           ("model SEM", model_sem),
+                           ("experiment", exp_mean),
+                           ("exp SEM", exp_sem),
+                           ("-> sigma", sigma),
+                           ("z", z)):
+            fmt = "%9.1f" if title == "z" else "%9.4f"
+            print("    %-12s" % title + "".join(fmt % v for v in row))
+        print("    overall z^2 = %.2f on %d dof (bins - 1)" % (z2, len(labels) - 1))
+        print("    single-array z^2 (model sd, not SEM) = %.2f"
+              % float(np.sum(z_one[usable_one] ** 2)))
+
+    return {"stage": stage, "bins": bins, "labels": labels,
+            "n_runs": n_runs, "times": np.asarray(times),
+            "model_fractions": chosen, "model_mean": model_mean,
+            "model_sd": model_sd, "model_sem": model_sem,
+            "exp_mean": exp_mean, "exp_sem": exp_sem, "n_exp": n_exp,
+            "sigma": sigma, "z": z, "z2": z2,
+            "per_run_z2": float(np.sum(z_one[usable_one] ** 2))}
 
 
 def find_best_matching_frame(history, experimental_stage="E17.5",
@@ -1099,11 +1586,86 @@ def _sim_neighbor_pair_percentages(sheet, type_by, threshold, HC_above_threshold
     return _neighbor_pair_percentages(np.isin(all_idx, hc_idx), sub)
 
 
-def _exp_neighbor_pair_percentages(cells_info, contact_matrix):
-    """(HC:HC%, HC:SC%, SC:SC%) among the valid experimental cells of a frame."""
+def experimental_cell_mask(cells_info, contact_matrix):
+    """Which segmented cells may be counted: the ones with a TRUSTWORTHY
+    neighbourhood.
+
+    Three exclusions, and the last two are what a ``valid``-only mask misses:
+
+    * INVALID cells — the segmentation itself rejected them.
+    * EDGE cells — clipped by the field of view, so their neighbour count is
+      truncated and every pair statistic they enter is biased low. ``valid``
+      does NOT imply not-edge: 55-84% of edge cells are flagged valid.
+    * NEIGHBOURS OF INVALID cells — their own segmentation is fine, but part of
+      their neighbourhood is unknown, so their pair composition is unreliable.
+      This is the criterion that does most of the work, and it is tested against
+      the ``neighbors`` column rather than the contact matrix: see
+      _neighbors_adjacency for why the two differ and why it matters.
+
+    VERIFIED against the lateral-inhibition workbook, which was built by a
+    separate pipeline on byte-identical input files: this mask reproduces its
+    experimental targets to ~1e-7 at BOTH stages, SEMs included — E17.5
+    0.6205 +- 0.0724 and 41.6665 +- 0.7996, P0 0.7916 +- 0.1709 and
+    47.6071 +- 1.2416. The older valid-only mask gave 0.6814 and 41.9869 at
+    E17.5, and 0.8659 and 48.0398 at P0.
+
+    The mask keeps 82% of E17.5 cells and 70% of P0 cells. It has no analogue on
+    the model side: a periodic sheet has no invalid cells and no border, so all
+    three criteria are vacuous there.
+    """
     valid = cells_info.valid.values.astype(bool)
-    is_HC = (cells_info.type.values == 1)[valid]
-    A = np.asarray(contact_matrix)[np.ix_(valid, valid)]
+    edge = np.zeros(valid.shape, bool)
+    if "edge_cell" in cells_info:
+        edge = (pd.to_numeric(cells_info["edge_cell"], errors="coerce")
+                .fillna(0).to_numpy() != 0)
+    touches_invalid = _neighbors_adjacency(cells_info,
+                                           contact_matrix)[:, ~valid].any(axis=1)
+    return valid & ~edge & ~touches_invalid
+
+
+def _neighbors_adjacency(cells_info, contact_matrix):
+    """Adjacency from the ``neighbors`` column, falling back to the matrix.
+
+    THE TWO ARE NOT THE SAME, and which one is used where matters. ``neighbors``
+    is a strict SUPERSET of the contact matrix — 3 to 11 extra pairs per movie,
+    contacts the segmentation recorded but gave zero length, i.e. cells meeting
+    at a corner. Every contact-matrix pair is in ``neighbors``; none of the
+    extras is in the matrix.
+
+    The reference pipeline uses THIS adjacency to decide who touches an invalid
+    cell, and the CONTACT MATRIX to count pairs. Using the matrix for both
+    reproduces E17.5 exactly but misses P0 by 1e-3; using ``neighbors`` for both
+    misses E17.5 by 2e-4. Only the split reproduces both stages, to ~1e-7. A
+    corner contact is enough to make a neighbourhood untrustworthy but not
+    enough to be a pair.
+    """
+    if "neighbors" not in cells_info or "label" not in cells_info:
+        A = np.asarray(contact_matrix) > 0
+        np.fill_diagonal(A, False)
+        return A
+    n = len(cells_info)
+    pos = {int(l): i for i, l in enumerate(cells_info["label"].to_numpy())}
+    A = np.zeros((n, n), bool)
+    for i, s in enumerate(cells_info["neighbors"].to_numpy()):
+        if not isinstance(s, (set, list, tuple, np.ndarray)):
+            continue
+        for label in s:
+            j = pos.get(int(label))
+            if j is not None:
+                A[i, j] = A[j, i] = True
+    np.fill_diagonal(A, False)
+    return A
+
+
+def _exp_neighbor_pair_percentages(cells_info, contact_matrix):
+    """(HC:HC%, HC:SC%, SC:SC%) over the trustworthy cells of a frame.
+
+    The population is experimental_cell_mask, NOT merely the valid cells — see
+    there for why, and for the check that fixes the definition.
+    """
+    keep = experimental_cell_mask(cells_info, contact_matrix)
+    is_HC = (cells_info.type.values == 1)[keep]
+    A = np.asarray(contact_matrix)[np.ix_(keep, keep)]
     return _neighbor_pair_percentages(is_HC, A)
 
 
@@ -1293,30 +1855,39 @@ def compare_full_model_differentiation_to_experiments(
     return {"score1": sc1, "score2": sc2, "score3": sc3, "total": total}
 
 
-def find_best_timepoint_for_random_arrays(model_names=None, indices=None):
+def find_best_timepoint_for_random_arrays(model_names=None, indices=None,
+                                          bins=None):
     """Find each raw random array's best-matching E17.5 / P0 time point.
 
     Pass explicit ``model_names`` or, equivalently, the integer ``indices`` of
     the arrays (``indices=[7]`` addresses ``random_periodic_array7``) — the
     latter is what an Azure Batch fan-out task uses to handle one array.
+
+    The chosen frames are APPENDED to the scheme's own file (see
+    :func:`best_time_point_file`), which is what
+    :func:`store_best_time_point_for_random_arrays` reads back.
     """
     if model_names is None:
         if indices is None:
             raise ValueError("Provide either model_names or indices")
         model_names = [random_array_name(i) for i in indices]
-    out_file = os.path.join(RESULTS_DIR, "pval_results.txt")
+    out_file = best_time_point_file(bins)
     for model_name in model_names:
-        fig, ax, bestE17, bestP0 = find_best_timepoint_according_to_n_neighbors(model_name)
-        plt.savefig(os.path.join(RESULTS_DIR, model_name + "pval_results.png"))
+        # the figure (png AND svg) and the reusable trace are written by
+        # find_best_timepoint_according_to_n_neighbors itself, next to the run
+        fig, ax, bestE17, bestP0 = find_best_timepoint_according_to_n_neighbors(
+            model_name, bins=bins)
         plt.close(fig)
         with open(out_file, "a") as f:
             f.write("Best time point for " + model_name + " E17.5: %f, P0: %f\n" % (bestE17, bestP0))
 
-def store_best_time_point_for_random_arrays(only_for=None):
-    # ``only_for`` may be a model name or an integer array index.
+def store_best_time_point_for_random_arrays(only_for=None, bins=None):
+    # ``only_for`` may be a model name or an integer array index. ``bins``
+    # selects which scheme's chosen frames are stored; the default is the
+    # production one, so this reads pval_results_mergedtails.txt.
     if isinstance(only_for, int):
         only_for = random_array_name(only_for)
-    time_point_file = os.path.join(RESULTS_DIR, "pval_results.txt")
+    time_point_file = best_time_point_file(bins)
     model_names = []
     E17_times = []
     P0_times = []
@@ -1334,13 +1905,29 @@ def store_best_time_point_for_random_arrays(only_for=None):
                 model_names.append(splitted[0])
                 E17_times.append(float(splitted[1]))
                 P0_times.append(float(splitted[2]))
+    folded = []
     for model_name, E17_time, P0_time in zip(model_names, E17_times, P0_times):
         if only_for is None or only_for == model_name:
             history = load_history_file(model_name)
-            output_name = model_name + _STAGE_SHEET_SUFFIX["E17.5"]
-            save_data_of_a_given_time_point(history, E17_time, output_name)
-            output_name = model_name + _STAGE_SHEET_SUFFIX["P0"]
-            save_data_of_a_given_time_point(history, P0_time, output_name)
+            for stage, time_point in (("E17.5", E17_time), ("P0", P0_time)):
+                output_name = model_name + _STAGE_SHEET_SUFFIX[stage]
+                save_data_of_a_given_time_point(history, time_point, output_name)
+                # A self-intersecting extract is unusable as an initial
+                # condition -- it is what CORRUPTED_EXTRACTS records and what
+                # extract_fold_free_best_timepoints exists to repair -- and the
+                # selection knows nothing about folds, so say so now rather
+                # than let a run start from one.
+                if not _frame_is_fold_free(history, time_point):
+                    folded.append((model_name, stage, time_point))
+                print("  stored %-40s t=%9.4f%s"
+                      % (output_name, time_point,
+                         "   *** FOLDED ***" if folded and folded[-1][:2]
+                         == (model_name, stage) else ""))
+    if folded:
+        print("  WARNING: %d stored extract(s) self-intersect and need"
+              " re-extraction (see extract_fold_free_best_timepoints):" % len(folded))
+        for model_name, stage, time_point in folded:
+            print("    %s %s at t=%.4f" % (model_name, stage, time_point))
     return 0
 
 
@@ -1948,3 +2535,5 @@ if __name__ == "__main__":
     #     res = load_experimental_results(stage, "lonely SC percentage")
     #     print(res)
     # plt.show()
+    fig, ax, tE17, tP0 = find_best_timepoint_according_to_n_neighbors("random_periodic_array98")
+    plt.show()

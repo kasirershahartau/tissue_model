@@ -216,7 +216,8 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
                            quasi_static_threshold=_DEFAULT_QUASI_STATIC_THRESHOLD,
                            line_tension=None,
                            hc_shape_index=None, sc_shape_index=None,
-                           bending=None, preferred_area=None, stress_shift=0.0):
+                           bending=None, preferred_area=None, stress_shift=0.0,
+                           l0_ratio=1.0):
     """Build a SHORT, deterministic, collision-resistant results-folder name.
 
     The previous scheme embedded the full ``initial_sheet_name`` verbatim::
@@ -310,6 +311,12 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     # get its own folder (K=0 keeps the historical names).
     if stress_shift:
         canonical += "|ks=%.4f" % stress_shift
+    # L0 / <perimeter>. This rescales the whole lateral-inhibition coupling, so
+    # two runs differing only in l0_ratio produce different patterns and must
+    # never collide or be reused for one another. 1.0 is the historical
+    # assumption (L0 == average perimeter) and keeps the existing folder names.
+    if abs(l0_ratio - 1.0) > 1e-9:
+        canonical += "|l0r=%.4g" % l0_ratio
     digest = hashlib.md5(canonical.encode("utf-8")).hexdigest()[:10]
     name = "fit_gSC%.4f_gHC%.2f_aHC%.2f_ps%.2f" % (
         gammaSC, gammaHC_ratio, alphaHC_ratio, psigma,
@@ -330,6 +337,10 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
         name += "_pa%.3f" % preferred_area
     if stress_shift:
         name += "_ks%.3f" % stress_shift
+    # Surface a non-default L0/<perimeter> ratio in the readable prefix too, so
+    # an l0_ratio sweep is self-describing on disk. %g keeps 1e5 short.
+    if abs(l0_ratio - 1.0) > 1e-9:
+        name += "_l0r%.4g" % l0_ratio
     # Self-describing tag for the type-dependent shape index (HC/SC split).
     if hc_shape_index is not None or sc_shape_index is not None:
         name += "_p0hc%.2f_p0sc%.2f" % (
@@ -341,6 +352,89 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
         # actual cell ids live in the hash above).
         name += "_abl"
     return name
+
+
+# The per-cell columns InnerEarModel.set_random_parameters draws, i.e. the
+# state a ``random_forces`` run carries that its parameters cannot rebuild.
+# A resume restores these from the archive; see where they are captured in run().
+# ``area_elasticity`` joined the list when set_random_parameters started drawing
+# alpha as well; leaving it out would let a resume silently fall back to the
+# uniform per-type stiffness while A0 and gamma stayed randomised.
+_RANDOMISED_FACE_COLUMNS = ("prefered_area", "prefered_vol", "contractility",
+                            "area_elasticity")
+
+# L0, the lateral-inhibition length_normalization_factor, written beside every
+# run so a fork can INHERIT it instead of re-measuring.
+_L0_FILE = "l0.txt"
+_L0_MAX_DEPTH = 8                 # a chain deeper than this is a loop
+
+
+def _recorded_L0(run_name, results_dir=None, depth=0):
+    """The L0 a run used, following forks back to the run that measured it.
+
+    L0 is the mean cell perimeter of the sheet the model was built on, and it
+    sets the strength of the lateral-inhibition coupling. Re-measuring it on a
+    FORK is wrong: the tissue has settled by then, so a run forked from a
+    steady state gets a ~9% larger L0 than the initial array it descends from
+    and silently differs from its own source (see ablate_single_hc). So each
+    run records the value it used, and a fork reads its source's.
+
+    Order: this run's own record, then -- for an archive written before that
+    record existed -- the source it was forked from, recursively, and finally
+    None, which leaves the caller to measure.
+    """
+    results_dir = RESULTS_DIR if results_dir is None else results_dir
+    if depth > _L0_MAX_DEPTH or not run_name:
+        return None
+    folder = os.path.join(results_dir, run_name)
+    path = os.path.join(folder, _L0_FILE)
+    if os.path.isfile(path):
+        try:
+            with open(path) as fh:
+                return float(fh.read().strip())
+        except (OSError, ValueError):
+            pass
+    # No record: walk to whatever this run was forked from. parameters.txt
+    # dumps the locals BEFORE initial_sheet_name is joined to RESULTS_DIR, so
+    # the name stored there is bare.
+    params = os.path.join(folder, "parameters.txt")
+    if not os.path.isfile(params):
+        return None
+    src, forked = None, False
+    try:
+        with open(params) as fh:
+            for line in fh:
+                if line.startswith("initial_sheet_name:"):
+                    src = line.split(":", 1)[1].strip().strip("'\"")
+                elif line.startswith("continue_from_time:"):
+                    forked = line.split(":", 1)[1].strip() not in ("None", "")
+    except OSError:
+        return None
+    if forked and src and src != run_name:
+        return _recorded_L0(src, results_dir, depth + 1)
+    # Not a fork, and no record: this is the run that STARTED the chain, so
+    # its own first frame is the initial array. Measuring it here rather than
+    # at the caller is what makes the inheritance transitive on archives
+    # written before l0.txt existed -- an ablation resolves through its strict
+    # steady state all the way back to the array.
+    try:
+        hist = HistoryHdf5.from_archive(os.path.join(folder, "history.hf5"),
+                                        eptm_class=VirtualSheet)
+        sheet = hist.retrieve(float(np.min(hist.time_stamps)))
+        sheet.arrange_sheet_from_history()
+        sheet.geom.update_all(sheet)
+        return float(np.mean(sheet.face_df["perimeter"].to_numpy(float)))
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _write_L0(folder, value):
+    """Record the L0 this run used, for any fork taken from it later."""
+    try:
+        with open(os.path.join(folder, _L0_FILE), "w") as fh:
+            fh.write("%.12g\n" % float(value))
+    except OSError:
+        pass                      # a missing record only costs a re-measure
 
 
 def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, ablated_cells=None,
@@ -357,7 +451,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         hc_shape_index=None, sc_shape_index=None, bending=None,
         notch_sensitivity=0.2, repressor_sensitivity=0.45, stress_hill_exponent=None,
         initial_notch_delta_level=None, preferred_area_override=None,
-        save_interval=None, stress_shift=0.0, notch_inhibition=False):
+        save_interval=None, stress_shift=0.0, notch_inhibition=False,
+        l0_ratio=1.0, inherit_length_unit=True, random_area_stage=None,
+        uniform_delta_level=None, division_area=1.2, division_rule="area",
+        division_interval=None, division_start=None):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -428,6 +525,66 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         Zero the repressor production term, reproducing the experimental
         Notch/repressor block: every cell differentiates. Used to calibrate
         the simulation time unit (all-HC <-> 48 h).
+    l0_ratio : float, default 1.0
+        L0 / <perimeter>, where L0 = kappa*beta_D/gamma_R^2 is the physical
+        lateral-inhibition length scale and <perimeter> is the mean perimeter
+        of the initial array. A plain multiplier on the contact coupling.
+
+        1.0 asserts L0 == the average perimeter, is inherited from Shaya et al.
+        2017, and is what every PHASE 1 run uses -- it is an exact IEEE no-op,
+        so those runs are bit-identical to the archived ones. Published rates
+        instead put the ratio at 10^1-10^5 (see
+        lateral_inhibition_parameters.md); exploring that, together with
+        measuring every length in units of the mean perimeter, is PHASE 2. A
+        non-default value gets its own folder (tag ``_l0r<value>``) and so can
+        never be confused with, or reused for, a run at a different ratio.
+    division_area : float, default 1.2
+        With ``division_rule="area"``, the area a cell must reach to divide.
+        Lowering it divides cells sooner and leaves a more disordered tiling.
+    division_rule : {"area", "random"}, default "area"
+        How the dividing cell is chosen. ``"area"`` divides every cell above
+        ``division_area``, so division is perfectly correlated with size and is
+        itself an ORDERING mechanism: the largest cell is the one most likely
+        to be over-coordinated, and halving it removes that outlier.
+        ``"random"`` instead divides one uniformly chosen cell every
+        ``division_interval`` time units, independent of geometry, which lets
+        over-coordinated cells persist.
+    division_interval : float, optional
+        Required by ``division_rule="random"``: the mean time between
+        divisions, so the division RATE is 1/interval per unit time regardless
+        of tissue size or ``dt``.
+    division_start : float, optional
+        When the first random division fires (default: one interval). Set it to
+        5.0 to match when a threshold run starts dividing -- the per-cell
+        parameter re-draw period, which is what first pushes a cell over the
+        area threshold -- so both rules branch from the same state.
+    uniform_delta_level : float, optional
+        Seed EVERY cell's ``delta_level`` with this one value instead of a
+        random draw. **Only for building the random arrays.** Rejected unless
+        ``no_differentiation=True`` AND the run starts from a fresh lattice
+        (no ``initial_sheet_name``, no explicit ``delta_levels``) -- note
+        ``no_differentiation`` alone is not enough to tell array creation from
+        the mechanical fit, which also sets it and which classifies cells by
+        their loaded delta. ``_create_one_random_array`` passes 0.0; nothing
+        else should set it. For a near-zero random start use
+        ``initial_notch_delta_level``.
+
+        Mind the value, not just the flatness: cell type is derived from atoh,
+        a Hill function of delta, and the division handler only divides
+        ``type == 0``. Any uniform delta above the atoh threshold (~0.38) makes
+        every cell type 1 and silently stops array growth altogether.
+
+        Note this does not leak into later runs that START from a created
+        array: the full-model path passes ``randomize_notch_delta_levels=True``,
+        which forces a fresh seed and discards whatever LI state the loaded
+        morphology carried.
+    inherit_length_unit : bool, default True
+        On a resume or a fork, take the length unit from the run this one
+        descends from rather than re-measuring it here. Leave this True: by
+        the time a fork is taken the tissue has settled and its mean perimeter
+        is ~9% larger than the initial array's, so re-measuring silently
+        changes the LI coupling relative to the source run. False is for the
+        deliberate case where the new run is meant to define its own unit.
     rerun_stalled_runs : bool, default False
         Only relevant when ``reuse_existing_run`` is True and the existing
         run classifies as ``stalled``. False (the default) keeps the
@@ -479,6 +636,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             quasi_static_threshold, line_tension,
             hc_shape_index, sc_shape_index, bending,
             preferred_area=preferred_area_override, stress_shift=stress_shift,
+            l0_ratio=l0_ratio,
         )
     elif ablated_cells is not None and len(ablated_cells) > 0:
         # Caller supplied an explicit ``name`` AND an ablation list: keep the
@@ -525,6 +683,39 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     delaminations = True
     if ablated_cells is None:
         ablated_cells = []
+    # A flat delta is ONLY meaningful while BUILDING a random array: a fresh
+    # lattice, nothing differentiating, no delta worth preserving. Every other
+    # run is wrong in one of two ways, and the guard covers both because
+    # ``no_differentiation`` alone does NOT separate them -- the mechanics fit
+    # also passes no_differentiation=True.
+    #
+    #  * differentiation ON  -> a uniform delta is a symmetry lateral inhibition
+    #    has nothing to break, so no salt-and-pepper pattern can form.
+    #  * a sheet is LOADED (initial_sheet_name) or delta is supplied explicitly
+    #    (delta_levels) -> the caller wants THAT delta. The mechanics fit in
+    #    particular classifies cells by their loaded delta to set the per-type
+    #    mechanics, so flattening it would make every cell one type and the fit
+    #    meaningless. uniform_delta_level is applied LAST and would silently
+    #    override both.
+    if uniform_delta_level is not None:
+        if not no_differentiation:
+            raise ValueError(
+                "uniform_delta_level is for building random arrays only (it "
+                "needs no_differentiation=True). A uniform delta leaves lateral "
+                "inhibition no asymmetry to amplify, so no pattern can form; "
+                "pass initial_notch_delta_level for a near-zero random seed.")
+        # Truthiness, not ``is not None``: by this point run() has normalised a
+        # missing initial_sheet_name to "" (see above), which IS the fresh
+        # lattice case -- testing for None rejected array creation itself.
+        if initial_sheet_name or delta_levels is not None:
+            raise ValueError(
+                "uniform_delta_level is for building random arrays only, which "
+                "start from a FRESH lattice. This run loads %s and would have "
+                "its per-cell delta flattened -- and a run that classifies "
+                "cells by delta (the mechanical fit does) would then see a "
+                "single cell type."
+                % ("delta_levels" if delta_levels is not None
+                   else "initial_sheet_name=%r" % (initial_sheet_name,)))
     quasi_static = True
     # quasi_static_threshold is now a run() parameter (default
     # _DEFAULT_QUASI_STATIC_THRESHOLD) so the mechanics fit can relax base and
@@ -574,8 +765,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     elasticity = {'HC': alphaHC_ratio,
                   'SC': 1.}
 
-    # Topological events related parameters
-    division_area = 1.2
+    # Topological events related parameters. ``division_area`` is the area a
+    # cell must reach to divide; it is a run() parameter (default 1.2, what
+    # every array so far was built with) because lowering it divides cells
+    # sooner and leaves a more disordered tiling.
     intercalation_length = 0.04
     # Interior-angle threshold (radians) for collapsing an incipient fold: a
     # face pinched by two non-adjacent vertices drifting together has a small
@@ -730,8 +923,14 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     else:
         run_log.info("Debug log started at %s", debug_log_path)
 
+    source_run_name = initial_sheet_name      # bare name, before the join below
     initial_sheet_name = os.path.join(RESULTS_DIR, initial_sheet_name)
     name = os.path.join(RESULTS_DIR, name)
+    # A RESUME continues this run's own archive; a FORK starts from a named
+    # time in someone else's. Both inherit L0; a fresh run off an initial
+    # array (no continue_from_time) measures it, which is the same thing.
+    loaded_from_archive = bool(continue_existing_run
+                               or continue_from_time is not None)
     try:
         # Load or initialize sheet
         if continue_existing_run:
@@ -805,6 +1004,47 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # than trusting the caller's flag.
         if continue_existing_run:
             randomize_notch_delta_levels = False
+        # ... and for the same reason a RESUME of a random-forces run must keep
+        # the archive's PER-CELL mechanical state. ``random_forces`` appends
+        # ``get_random_initializer``, which re-draws prefered_area (and
+        # prefered_vol, contractility) per cell every wait_time units; those
+        # draws are the run's state, not something the parameters can rebuild.
+        # InnerEarModel.__init__ calls ``update_specs(..., reset=True)``, which
+        # resets the whole column to the uniform by-type default, so without
+        # this the resumed tissue relaxes toward one target area, no cell ever
+        # reaches ``division_area`` again, and the run FREEZES: a 25->30 resume
+        # of random_periodic_array99 produced 533 faces at every frame and 4
+        # topology changes, against ~33 per 5 time units before it.
+        # Only for random_forces: elsewhere these columns ARE reproducible from
+        # the parameters, and restoring them would silently ignore a resume
+        # that deliberately changes them.
+        # L0 must come from the run this one descends from, not from the frame
+        # it starts at. Both a resume and a fork load someone's archive, so
+        # both inherit; a genuinely fresh sheet measures its own.
+        # ``inherit_length_unit=False`` re-measures the unit on the frame this
+        # run starts from instead. Only do that deliberately: on a settled sheet
+        # the mean perimeter is ~9% larger than the initial array's, so the run
+        # would silently use a different unit from its own source.
+        inherited_L0 = None
+        if loaded_from_archive and inherit_length_unit:
+            inherited_L0 = _recorded_L0(source_run_name)
+            if inherited_L0 is None:
+                run_log.warning("could not resolve the length unit through %s;"
+                                " this frame's own mean perimeter will be used,"
+                                " which on a settled sheet is ~9%% too large",
+                                source_run_name)
+            else:
+                run_log.info("length unit inherited through %s: %.6g",
+                             source_run_name, inherited_L0)
+        elif loaded_from_archive:
+            run_log.info("inherit_length_unit=False: re-measuring the length"
+                         " unit on this frame rather than inheriting it")
+
+        resumed_face_state = None
+        if continue_existing_run and random_forces:
+            keep = [c for c in _RANDOMISED_FACE_COLUMNS if c in sheet.face_df.columns]
+            if keep:
+                resumed_face_state = sheet.face_df[keep].copy()
         inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
                               repulsion_exp=repulsion_exponent, preferred_area=preferred_area,
                               preferred_area_override=preferred_area_override, contractility=contractility,
@@ -835,7 +1075,25 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                               notch_levels=(None if continue_existing_run else notch_levels),
                               delta_levels=(None if continue_existing_run else delta_levels),
                               repressor_levels=(None if continue_existing_run else repressor_levels),
-                              initial_notch_delta_level=initial_notch_delta_level)
+                              initial_notch_delta_level=initial_notch_delta_level,
+                              length_normalization_factor=inherited_L0,
+                              l0_ratio=l0_ratio,
+                              random_area_stage=random_area_stage,
+                              uniform_delta_level=uniform_delta_level)
+        # record what was used, so anything forked from THIS run inherits it
+        _write_L0(name, inner.length_normalization_factor)
+        run_log.info("length unit (mean initial perimeter) in use: %.6g",
+                     inner.length_normalization_factor)
+        run_log.info("l0_ratio = L0/<perimeter> = %.6g  ->  L0 = %.6g",
+                     inner.l0_ratio,
+                     inner.l0_ratio * inner.length_normalization_factor)
+        if resumed_face_state is not None:
+            # put the archive's draws back over what __init__ reset them to
+            shared = inner.sheet.face_df.index.intersection(resumed_face_state.index)
+            inner.sheet.face_df.loc[shared, resumed_face_state.columns] = \
+                resumed_face_state.loc[shared]
+            run_log.info("resume: restored %s for %d face(s) from the archive",
+                         ", ".join(resumed_face_state.columns), len(shared))
         draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
                                                 color_by="atoh")
         fig1, ax1 = draw_func(inner.sheet)
@@ -859,7 +1117,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                                  contact_dependent_differentiation=contact_dependent_differentiation, divisions=divisions,
                                  intercalations=intercalations, delaminations=delaminations, ablated_cells=ablated_cells,
                                  sensitivity_aging_rate=sensitivity_aging_rate,
-                                 division_area=division_area, intercalation_length=intercalation_length,
+                                 division_area=division_area, division_rule=division_rule,
+                                 division_interval=division_interval,
+                                 division_start=division_start,
+                                 intercalation_length=intercalation_length,
                                  sharp_angle_threshold=sharp_angle_threshold, verbose_log=verbose_log,
                                  delamination_area=delamination_area, delamination_rate=delamination_rate,
                                  viscosity=viscosity, effectors=effectors, quasi_static=quasi_static,
@@ -912,19 +1173,43 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     # run from a corrupt state. With the return out here, a crash propagates.
     return name
 
-def _create_one_random_array(index):
+def _create_one_random_array(index, division_area=1.2, name=None,
+                             division_rule="area", division_interval=None,
+                             division_start=None, t_end=25):
     """Build the random array with the given integer ``index`` (independent
-    unit of ``create_random_arrays``). Module-level + single-argument so it is
-    picklable for ``ProcessPoolExecutor`` — and so a single Azure Batch task
-    can build exactly one array."""
-    print("Running random array %d" % index)
+    unit of ``create_random_arrays``). Module-level and picklable for
+    ``ProcessPoolExecutor`` — and so a single Azure Batch task can build
+    exactly one array.
+
+    ``division_area`` is the area at which a cell divides; 1.2 built every
+    array of the production set. ``name`` overrides the folder, which is what
+    a variant built at a different ``division_area`` needs so it cannot be
+    mistaken for one of them (see :func:`random_array_variant_name`)."""
+    print("Running random array %d (%s)"
+          % (index, "division_area=%g" % division_area if division_rule == "area"
+             else "random division every %g" % division_interval))
     gammaSC = 0.01
     gammaHC_ratio = 10
     alphaHC_ratio = 1
     psigma = 1
-    name = run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, name=random_array_name(index),
-               random_forces=True, end_on_steady_state=False, t_end=25, dt=0.01, divisions=True,
-               no_differentiation=True)
+    name = run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma,
+               name=name or random_array_name(index),
+               division_area=division_area, division_rule=division_rule,
+               division_interval=division_interval, division_start=division_start,
+               random_forces=True, end_on_steady_state=False, t_end=t_end, dt=0.01, divisions=True,
+               no_differentiation=True,
+               # Nothing differentiates while an array is being built, so a flat
+               # delta is a neutral starting state; the random seed would only
+               # be noise that no lateral inhibition ever acts on.
+               #
+               # ZERO, specifically. Cell type is derived from atoh, which is a
+               # Hill function of delta, and the division handler only divides
+               # `type == 0`. A flat delta of 0.5 puts atoh at 0.70 -- above the
+               # 0.5 differentiation threshold -- so EVERY cell came out type 1
+               # and not one division fired in 25 time units, even with 69 cells
+               # over the area threshold. delta = 0 gives atoh = 0, so every
+               # cell stays an undifferentiated SC and is eligible to divide.
+               uniform_delta_level=0.0)
     print("Finished %s" % name)
     return name
 
@@ -962,26 +1247,78 @@ def restore_array_run(index, continue_from_time, t_end=None):
                divisions=True, no_differentiation=True)
 
 
-def create_random_arrays(n=None, indices=None, n_workers=None):
+def random_array_variant_name(index, division_area=None, division_interval=None):
+    """Folder name for a random array built under NON-default division rules.
+
+    Kept out of the ``random_periodic_array{index}`` namespace on purpose: the
+    production ten are addressed by index all through the pipeline
+    (``store_best_time_point_for_random_arrays``, the mechanical fit, the
+    tables), and a variant built under different topology rules must not be
+    picked up by any of them by accident.
+
+    ``division_interval`` names a RANDOM-rule variant (``_divrand<x>``) and
+    takes precedence; ``division_area`` names a threshold variant (``_da<a>``).
+    """
+    def tag(value):
+        return ("%g" % value).replace(".", "p")
+
+    if division_interval is not None:
+        return "%s_divrand%s" % (random_array_name(index), tag(division_interval))
+    if division_area is None:
+        raise ValueError("pass division_area or division_interval")
+    return "%s_da%s" % (random_array_name(index), tag(division_area))
+
+
+def create_random_arrays(n=None, indices=None, n_workers=None,
+                         division_area=1.2, names=None,
+                         division_rule="area", division_interval=None,
+                         division_start=None, t_end=25):
     """Build random arrays by integer index. Pass ``indices`` (e.g. ``[7]`` for
-    a single Batch task, or ``range(10)``) or a count ``n`` (shorthand for
+    a single Batch task, or ``range(n)``) or a count ``n`` (shorthand for
     ``range(n)``). The arrays are independent, so they run in parallel across
     ``n_workers`` processes (default ``min(#arrays, cpu_count)``); pass
-    ``n_workers=1`` to force serial."""
+    ``n_workers=1`` to force serial.
+
+    ``division_area`` (default 1.2), ``division_rule``, ``division_interval``
+    and ``division_start`` are passed to every array built here. ``names``,
+    when given, is one folder name per index — use
+    :func:`random_array_variant_name` for any non-default division rule so the
+    result cannot be confused with the production set."""
     if indices is None:
         if n is None:
             raise ValueError("Provide either n or indices")
         indices = range(n)
     indices = list(indices)
+    if names is not None:
+        names = list(names)
+        if len(names) != len(indices):
+            raise ValueError("names has %d entries for %d indices"
+                             % (len(names), len(indices)))
+    args = [{"index": i, "division_area": division_area,
+             "name": None if names is None else names[k],
+             "division_rule": division_rule,
+             "division_interval": division_interval,
+             "division_start": division_start,
+             "t_end": t_end}
+            for k, i in enumerate(indices)]
     if n_workers is None:
         n_workers = min(len(indices), os.cpu_count() or 1)
     if n_workers > 1 and len(indices) > 1:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            names = list(executor.map(_create_one_random_array, indices))
+            built = list(executor.map(_create_one_random_array_star, args))
     else:
-        names = [_create_one_random_array(i) for i in indices]
-    return names
+        built = [_create_one_random_array(*a) for a in args]
+    return built
+
+
+def _create_one_random_array_star(args):
+    """Unpacking wrapper: ``ProcessPoolExecutor.map``/``submit`` passes one
+    argument per task. A dict is passed as keywords, anything else as
+    positional arguments."""
+    if isinstance(args, dict):
+        return _create_one_random_array(**args)
+    return _create_one_random_array(*args)
 
 
 def _initialize_one_differentiated_array(args):
@@ -1017,7 +1354,7 @@ def _run_full_model_one(args):
      line_tension, quasi_static_threshold, t_end, dt, initial_notch_delta_level,
      psigma, preferred_area, save_interval, stress_shift,
      stress_hill_exponent, reuse_existing_run, continue_existing_run,
-     name_prefix) = args
+     name_prefix, l0_ratio) = args
     # psigma (mechanosensitivity) gates delta production by mechanical stress and
     # only matters with stress_dependent=True. psigma=0 -> identical to the
     # no-stress baseline, so it KEEPS the plain ``fullmodel_<array>`` folder name
@@ -1032,9 +1369,14 @@ def _run_full_model_one(args):
     # reused as) an earlier one. The v2 fit changed the model - contractility
     # instead of perimeter elasticity, no bending, a new A0 - so it must not
     # share "fullmodel_<array>" with the pre-v2 runs already on disk.
-    name = ("%s_ps%s_ks%.3f%s_%s"
-            % (name_prefix, _psigma_tag(psigma), stress_shift, _mtag, initial)
-            if stress_dependent else "%s_%s" % (name_prefix, initial))
+    # This name is built by hand rather than by _short_run_folder_name, so the
+    # L0/<perimeter> ratio has to be tagged here too -- without it, runs at
+    # different l0_ratio would collide and reuse_existing_run would hand back a
+    # run made at the wrong coupling. 1.0 keeps the historical names.
+    _l0tag = "" if abs(float(l0_ratio) - 1.0) < 1e-9 else "_l0r%.4g" % l0_ratio
+    name = ("%s_ps%s_ks%.3f%s%s_%s"
+            % (name_prefix, _psigma_tag(psigma), stress_shift, _mtag, _l0tag, initial)
+            if stress_dependent else "%s%s_%s" % (name_prefix, _l0tag, initial))
     print("[full model] %s  (gammaSC=%.4g alphaHC=%.4g hc_p0=%.4g sc_p0=%.4g | "
           "pS=%.4g pR=%.4g atoh=%.6g psigma=%.4g)"
           % (name, gammaSC, alphaHC_ratio, hc_shape_index, sc_shape_index,
@@ -1059,7 +1401,8 @@ def _run_full_model_one(args):
                randomize_notch_delta_levels=(not continue_existing_run),
                initial_notch_delta_level=initial_notch_delta_level,
                reuse_existing_run=(reuse_existing_run or continue_existing_run),
-               continue_existing_run=continue_existing_run)
+               continue_existing_run=continue_existing_run,
+               l0_ratio=l0_ratio)
 
 
 
@@ -1101,12 +1444,21 @@ def _history_fingerprint(model_names):
 
 
 def _score_cache_key(stage, psigma, stress_shift, stress_hill_exponent,
-                     type_by, threshold, max_number_of_neighbors):
-    """Everything that changes the score but is NOT captured by the fingerprint."""
-    return ("%s|ps=%.5f|ks=%.4f|m=%s|by=%s|thr=%.6f|nb=%d"
+                     type_by, threshold, max_number_of_neighbors,
+                     grouping="arrays"):
+    """Everything that changes the score but is NOT captured by the fingerprint.
+
+    ``grouping`` is in the key because it changes the SCORE SCALE, not just the
+    runs: scoring a point's repeats as independent points shrinks SEM_sim by
+    ~sqrt(n_repeats) and inflates every chi^2. A cache written under one
+    grouping must never be served to the other -- the fingerprint cannot tell
+    them apart, since the set of runs is identical.
+    """
+    return ("%s|ps=%.5f|ks=%.4f|m=%s|by=%s|thr=%.6f|nb=%d|grp=%s"
             % (stage, float(psigma), float(stress_shift),
                "default" if stress_hill_exponent is None else stress_hill_exponent,
-               type_by, float(threshold), int(max_number_of_neighbors)))
+               type_by, float(threshold), int(max_number_of_neighbors),
+               grouping))
 
 
 def _load_score_cache():

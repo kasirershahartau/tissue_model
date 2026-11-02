@@ -56,6 +56,10 @@ SOURCES = [("E17.5", "model", "model\nE17.5"),
 # an experimental group this size or larger is drawn as a violin rather than a
 # bar: below it the kernel density would be drawing a curve through noise
 VIOLIN_MIN_N = 10
+# Extra headroom above the data, as a fraction of the already padded range.
+# _tight_limits pads both ends equally, which with hspace=0 leaves the tallest
+# point of a panel almost touching the frame it shares with the panel above.
+TOP_PAD = 0.15
 
 
 def best_point(points, stage):
@@ -149,6 +153,9 @@ def main():
     ap.add_argument("--exp-no-bar", dest="exp_no_bar", action="store_true",
                     help="draw the experiment as star + SEM + points only, with no bar behind them")
     ap.add_argument("--mean-markersize", type=float, default=MEAN_MARKERSIZE)
+    ap.add_argument("--top-pad", type=float, default=TOP_PAD,
+                    help="extra space above the data in each panel, as a"
+                         " fraction of its range (default %g)" % TOP_PAD)
     ap.add_argument("--out", default=None,
                     help="output path; the extension is ignored, both .png and"
                          " .svg are written")
@@ -189,6 +196,7 @@ def main():
         # whatever resolution matplotlib picked for their very different ranges
         ax.yaxis.set_major_locator(MultipleLocator(step))
         lo, hi = _tight_limits(data, term)
+        hi += a.top_pad * (hi - lo)
         ax.set_ylim(0 if a.zero_baseline else lo, hi)
     for ax in axes[:-1]:
         ax.tick_params(axis="x", bottom=False)

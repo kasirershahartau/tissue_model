@@ -196,7 +196,7 @@ def plot(df, out, m=M_DEFAULT, min_cells=20):
                 ax.set_ylabel("Delta-production gate\n(1 = untouched, 0 = shut off)")
             ax.legend(fontsize=6.5, ncol=2, framealpha=0.9, loc="lower left")
 
-    fig.suptitle("Delta-production Hill gate vs $p_\\sigma$   (m = %d)\n"
+    fig.suptitle("Delta-production Hill gate vs $p_T$   (m = %d)\n"
                  "solid = gate at group-mean stress (vertical line = its half-max)"
                  "   |   dotted = mean of per-cell gates" % m, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.94))

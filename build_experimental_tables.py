@@ -35,6 +35,7 @@ import pandas as pd
 from post_processing import (RESULTS_DIR, experimental_results_folder,
                              load_experimental_results,
                              _exp_neighbor_pair_percentages,
+                             experimental_cell_mask,
                              _experimental_late_cells_info_path)
 
 # (pickle base name, sheet name) for the tables this script adds to a workbook.
@@ -61,18 +62,20 @@ def _row(stage, term, used_by, unit, value, n, n_units):
 
 
 def _isolated_sc(cells_info, contact_matrix):
-    """(isolated SCs, valid SCs, valid cells) in one segmented frame.
+    """(isolated SCs, SCs, cells) in one segmented frame, over the kept cells.
 
     An isolated SC is a support cell with no hair cell touching it — a hole in
-    the pattern. Same valid-cell mask and type column as the neighbour-pair
-    percentages, so the counts refer to the same population.
+    the pattern. Uses experimental_cell_mask, the same population as the
+    neighbour-pair percentages, so the two statistics still refer to the same
+    cells. That matters doubly here: a cell next to an invalid one may have an
+    unseen HC neighbour, which would make it look isolated when it is not.
     """
-    valid = cells_info.valid.values.astype(bool)
-    is_hc = (cells_info.type.values == 1)[valid]
-    A = np.asarray(contact_matrix)[np.ix_(valid, valid)] > 0
+    keep = experimental_cell_mask(cells_info, contact_matrix)
+    is_hc = (cells_info.type.values == 1)[keep]
+    A = np.asarray(contact_matrix)[np.ix_(keep, keep)] > 0
     np.fill_diagonal(A, False)
     iso = int(((~is_hc) & (A[:, is_hc].sum(axis=1) == 0)).sum())
-    return iso, int((~is_hc).sum()), int(valid.sum())
+    return iso, int((~is_hc).sum()), int(keep.sum())
 
 
 # ------------------------------------------------------------- full model ----

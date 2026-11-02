@@ -65,7 +65,11 @@ def source_state(stage, i, psigma, repeat):
 def names_for(stage, i, psigma, repeat, label, control):
     """(name passed to run(), resulting folder) — psigma and repeat both tagged
     so nothing collides with the psigma=0 single-repeat set already on disk."""
-    tag = "ps%.3f_r%d" % (psigma, repeat)
+    # _psigma_tag, not %.3f: the latter writes the fitted 0.08667 as ps0.087,
+    # which every psigma in 0.0865-0.0874 would share -- a silent collision
+    # between two parameter points' run folders.
+    from run_model import _psigma_tag
+    tag = "ps%s_r%d" % (_psigma_tag(psigma), repeat)
     suffix = "E17" if stage == "E17.5" else "P0"
     if control:
         base = "ctrlhc_%s_array%d_for_%s" % (tag, i, suffix)

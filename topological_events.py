@@ -191,6 +191,130 @@ class TopologicalEventsHandler:
 
 
 
+    def _divide_one_cell(self, sheet, cell_id):
+        """Divide ``cell_id`` and restore every derived invariant.
+
+        The whole body of the division behaviour below, lifted out so the
+        area-threshold rule and the random rule cannot drift apart: the
+        bookkeeping here (fresh ``unique_id``, index/order/opposite resync,
+        the inverted-polygon check) is what makes a division safe, and a
+        second copy of it would be a second place to get it wrong.
+
+        Returns the daughter's face label, or None when the cell's geometry
+        admits no valid split (``get_division_edges`` returned None).
+        """
+        cell_uid = (int(sheet.face_df.at[cell_id, "id"])
+                    if "id" in sheet.face_df.columns else cell_id)
+        daughter = index_preserving_cell_division(sheet, cell_id, sheet.geom)
+        if daughter is None:
+            log_topo_event(logger, sheet, False,
+                           "division: cell (uid %d) found no valid "
+                           "split; skipping", cell_uid)
+            return None
+        sheet.face_df.at[daughter, "id"] = daughter
+        # Give the daughter a fresh unique_id. The default ``pd.concat`` in
+        # ``index_preserving_face_division`` copies mother's row wholesale, so
+        # without this mother and daughter share unique_id, which (a) collapses
+        # them into a single node in ``sheet.lineage`` and (b) makes downstream
+        # id-based bookkeeping ambiguous. Mirrors tyssue's stock division.
+        if "unique_id" in sheet.face_df.columns:
+            if "face" in sheet.specs and "unique_id_max" in sheet.specs["face"]:
+                new_uid = sheet.specs["face"]["unique_id_max"] + 1
+                sheet.specs["face"]["unique_id_max"] = new_uid
+            else:
+                # Fallback: max existing + 1 (test/stub sheets may not carry
+                # specs['face']['unique_id_max']).
+                try:
+                    new_uid = int(sheet.face_df["unique_id"].max()) + 1
+                except (TypeError, ValueError):
+                    new_uid = daughter
+            sheet.face_df.at[daughter, "unique_id"] = new_uid
+        sheet.reset_index(order=False)
+        sheet.order_all_edges()
+        sheet.edge_df.sort_values(["face", "order"], inplace=True)
+        sheet.get_opposite()
+        sheet.geom.update_all(sheet)
+        log_topo_event(logger, sheet, True,
+                       "division: cell (uid %d) divided into a new "
+                       "daughter", cell_uid)
+        # Sanity check: a successful division should leave BOTH mother and
+        # daughter with strictly positive area. If the perimeter walk in
+        # ``index_preserving_face_division`` picked the wrong continuation edge
+        # (or some upstream invariant was violated) the resulting polygons
+        # cross themselves and we get a negative signed area. Surface it
+        # immediately rather than waiting for the solver to explode several
+        # steps later with a confusing message.
+        m_area = float(sheet.face_df.at[cell_id, "area"]) if cell_id in sheet.face_df.index else None
+        d_area = float(sheet.face_df.at[daughter, "area"]) if daughter in sheet.face_df.index else None
+        if (m_area is not None and m_area <= 0) or (d_area is not None and d_area <= 0):
+            log.error(
+                "Division of cell %d produced inverted polygon(s): "
+                "mother area=%s, daughter area=%s. "
+                "This indicates wrong edge→face attribution in "
+                "index_preserving_face_division.",
+                cell_id, m_area, d_area,
+            )
+        return daughter
+
+    def get_random_division_function(self, interval, dt, start=None, rng=None):
+        """Divide ONE uniformly chosen cell every ``interval`` time units.
+
+        The alternative to the area threshold: there, division is perfectly
+        correlated with cell size, and dividing the biggest cells is itself an
+        ordering mechanism — it keeps the tiling uniform. Here the choice is
+        independent of geometry, so division adds disorder instead of removing
+        it.
+
+        ``start`` is when the first division fires (default: ``interval``).
+        Passing the ``random_forces`` re-draw period (5 time units, see
+        ``InnerEarModel.get_random_initializer``) makes a random-division run
+        branch from exactly the state a threshold run is in when ITS first
+        division happens, so the two are comparable from a common point.
+
+        The countdown is driven by SIMULATION TIME, read per step from
+        ``sheet.settings["dt"]`` — the step the solver actually accepted, which
+        it writes there immediately before running the manager. The nominal
+        ``dt`` is only the fallback for a sheet that carries no settings.
+
+        That distinction is not cosmetic. The solver's step is ADAPTIVE: it
+        shrinks when a step is rejected. A countdown that decremented by the
+        nominal dt once per step would then fire faster per unit of simulation
+        time exactly when the tissue is struggling — and here that is a runaway,
+        because every extra division densifies the tissue further and shrinks
+        the step again. Measured before the fix: 881 cells at t=16.8 where
+        20 divisions/time predicts 636, and a 13x slowdown with it.
+        """
+        self.time_to_division = interval if start is None else start
+        rng = np.random.default_rng() if rng is None else rng
+
+        def random_division(sheet, manager):
+            step = float(getattr(sheet, "settings", {}).get("dt", dt) or dt)
+            self.time_to_division -= step
+            if self.time_to_division > 0:
+                manager.append(random_division)
+                return
+            # One division per interval. A long step could owe several; carry
+            # the remainder so the LONG-RUN rate is 1/interval whatever the
+            # step size is, rather than silently capping at one per step.
+            while self.time_to_division <= 0:
+                candidates = sheet.face_df.query("type == 0 & is_alive == 1")
+                if not len(candidates):
+                    break
+                # A handful of attempts, not a scan: a cell that admits no
+                # valid split is rare, and retrying forever would stall the
+                # step. Drawing without replacement avoids re-picking it.
+                order = rng.permutation(candidates.index.to_numpy())
+                for cell_id in order[:8]:
+                    if self._divide_one_cell(sheet, int(cell_id)) is not None:
+                        break
+                self.time_to_division += interval
+            # Keep num_sides in sync — some downstream operations (notably
+            # remove_virtual_vertices) read it.
+            sheet.face_df["num_sides"] = sheet.edge_df.groupby("face").size()
+            manager.append(random_division)
+
+        return random_division
+
     def get_division_function(self, crit_area):
         def division(sheet, manager):
             """Defines a division behavior.
@@ -225,62 +349,11 @@ class TopologicalEventsHandler:
                 cell_id = int(candidates.index[0])
                 cell_uid = (int(sheet.face_df.at[cell_id, "id"])
                             if "id" in sheet.face_df.columns else cell_id)
-                daughter = index_preserving_cell_division(
-                    sheet, cell_id, sheet.geom,
-                )
-                if daughter is None:
-                    log_topo_event(logger, sheet, False,
-                                   "division: cell (uid %d) found no valid "
-                                   "split; skipping", cell_uid)
+                # The division itself, and every invariant it has to restore,
+                # live in _divide_one_cell so the random rule shares them.
+                if self._divide_one_cell(sheet, cell_id) is None:
                     tried_ids.add(cell_uid)
                     continue
-                sheet.face_df.at[daughter, "id"] = daughter
-                # Give the daughter a fresh unique_id. The default
-                # ``pd.concat`` in ``index_preserving_face_division``
-                # copies mother's row wholesale, so without this fix
-                # mother and daughter share unique_id, which (a) collapses
-                # them into a single node in ``sheet.lineage`` and (b)
-                # makes downstream id-based bookkeeping ambiguous. We
-                # mirror tyssue's stock division (basic_events.py) and
-                # bump ``specs['face']['unique_id_max']``.
-                if "unique_id" in sheet.face_df.columns:
-                    if "face" in sheet.specs and "unique_id_max" in sheet.specs["face"]:
-                        new_uid = sheet.specs["face"]["unique_id_max"] + 1
-                        sheet.specs["face"]["unique_id_max"] = new_uid
-                    else:
-                        # Fallback: max existing + 1 (test/stub sheets
-                        # may not carry specs['face']['unique_id_max']).
-                        try:
-                            new_uid = int(sheet.face_df["unique_id"].max()) + 1
-                        except (TypeError, ValueError):
-                            new_uid = daughter
-                    sheet.face_df.at[daughter, "unique_id"] = new_uid
-                sheet.reset_index(order=False)
-                sheet.order_all_edges()
-                sheet.edge_df.sort_values(["face", "order"], inplace=True)
-                sheet.get_opposite()
-                sheet.geom.update_all(sheet)
-                log_topo_event(logger, sheet, True,
-                               "division: cell (uid %d) divided into a new "
-                               "daughter", cell_uid)
-                # Sanity check: a successful division should leave BOTH
-                # mother and daughter with strictly positive area. If
-                # the perimeter walk in ``index_preserving_face_division``
-                # picked the wrong continuation edge (or some upstream
-                # invariant was violated) the resulting polygons cross
-                # themselves and we get a negative signed area. Surface
-                # this immediately rather than waiting for the solver to
-                # explode several steps later with a confusing message.
-                m_area = float(sheet.face_df.at[cell_id, "area"]) if cell_id in sheet.face_df.index else None
-                d_area = float(sheet.face_df.at[daughter, "area"]) if daughter in sheet.face_df.index else None
-                if (m_area is not None and m_area <= 0) or (d_area is not None and d_area <= 0):
-                    log.error(
-                        "Division of cell %d produced inverted polygon(s): "
-                        "mother area=%s, daughter area=%s. "
-                        "This indicates wrong edge→face attribution in "
-                        "index_preserving_face_division.",
-                        cell_id, m_area, d_area,
-                    )
             # Keep num_sides in sync — some downstream operations (notably
             # remove_virtual_vertices) read it.
             sheet.face_df["num_sides"] = sheet.edge_df.groupby("face").size()

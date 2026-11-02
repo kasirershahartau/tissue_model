@@ -8,16 +8,22 @@ A practical, step-by-step guide for running `create_random_arrays`,
 
 ## 0. Which setup? (decision in one line)
 
-- **Single Spot VM** — recommended for everything. Simplest, works for all four
-  methods, uses the existing `ProcessPoolExecutor` parallelism. **Start here.**
-- **Azure Batch (many Spot nodes)** — only worth it when you need to generate
+- **Single pay-as-you-go VM** — recommended for everything. Simplest, works for
+  all four methods, uses the existing `ProcessPoolExecutor` parallelism.
+  **Start here.**
+- **Azure Batch (many nodes)** — only worth it when you need to generate
   *hundreds* of arrays (`create_random_arrays` / `initialize_differentiated_arrays`),
   which are pure fan-out. The adaptive fitters (`find_mechanical_parameters`,
   `find_psigma`) interleave compute with decisions and belong on one multi-core VM.
 
 The simulations are **single-threaded, CPU-bound, low-memory, GPU-free** → use a
-**compute-optimized Fsv2 VM** as a **Spot** instance (70–90 % cheaper; runs are
-independent and resumable, so eviction is safe).
+**compute-optimized Fsv2 VM**, pay-as-you-go.
+
+> **Why not Spot?** It is 70–90 % cheaper and the runs are resumable, so on
+> paper eviction is harmless. In practice our Spot VMs were deallocated
+> repeatedly and the babysitting cost far more than the compute saved — a whole
+> fit is tens of dollars either way. Use PAYG; `--priority Spot` is a knowing
+> trade of your time for a few dollars.
 
 ### ⚠️ Do not over-size the VM for `find-mech`
 
@@ -49,7 +55,7 @@ For the current job (`n_calls=60`, `n_sheets=10`, ablation on):
 |---|---|
 | total CPU work | **~390 core-hours** |
 | wall-clock on any VM with ≥10 usable cores | **~80 h (3.4 days)** |
-| compute cost | ~$55 PAYG / **~$11 Spot** |
+| compute cost | **~$55 PAYG** (~$11 on Spot, not recommended — see §0) |
 
 **So moving this fit to the cloud as-is buys ≈1× speedup** — only the per-core
 clock differs. See [§12](#12-how-much-speedup-should-i-expect) for what actually
@@ -75,8 +81,11 @@ python azure_run.py estimate random-arrays --n 10 --hours-per-sim 0.32
 ```
 
 It prints the simulation count, total core-hours, single-VM wall-clock,
-**core utilisation**, and **PAYG vs Spot** cost. A full fitting campaign is
-**tens of dollars on Spot**. Omit `--hours-per-sim` for a scaling table.
+**core utilisation**, and cost. A full fitting campaign is **tens of dollars**
+PAYG. It always prints a PAYG line and a Spot line — read the PAYG one; the
+Spot line assumes an 80 % saving we no longer take (`--spot-discount 0`
+collapses it onto PAYG if you would rather not see it). Omit `--hours-per-sim`
+for a scaling table.
 
 The estimator models each method's *real* parallel structure, including the
 sequential Bayesian loop and the straggler penalty — for `find-mech` it also
@@ -86,12 +95,33 @@ warns when the chosen VM has more cores than the job can ever use, and prints a
 
 ---
 
+> **Which shell each block is for.** `bat` blocks run **locally, in Windows
+> Command Prompt** (`az`, `scp`, `ssh`). `bash` blocks run **on the VM**, which
+> is Ubuntu — paste those after `ssh`.
+>
+> Mixing them up is the usual first stumble: `RG=Simulations` in cmd fails with
+> *"'RG' is not recognized as an internal or external command"*, because the
+> syntax differs on every axis that matters here.
+>
+> | | set a variable | use it | line continuation | comment |
+> |---|---|---|---|---|
+> | cmd.exe (local) | `set RG=Simulations` (no spaces around `=`) | `%RG%` | `^` | `rem` |
+> | bash (on the VM) | `RG=Simulations` | `$RG` | `\` | `#` |
+>
+> The local blocks keep each `az` call on one line so there are no
+> continuations to get wrong, and they use `%IP%` rather than a literal
+> `<IP>` — cmd reads `<` and `>` as redirection, so a pasted `<IP>` errors
+> rather than prompting you to substitute it.
+>
+> From **PowerShell** instead: `$RG = "Simulations"`, used as `$RG`, with a
+> backtick for continuation.
+
 ## 2. Prerequisites
 
 - An Azure subscription with permission to create VMs (your lab account).
-- **Spot quota** for the Fsv2 family in your region (Portal → *Quotas* →
-  "Total Regional Spot vCPUs" and "Standard FSv2 Family vCPUs"; request an
-  increase if it's 0).
+- **vCPU quota** for the Fsv2 family in your region (Portal → *Quotas* →
+  "Standard FSv2 Family vCPUs"; request an increase if it is below the core
+  count you plan to rent — 48 for the pT re-fit in §9).
 - The **Azure CLI** installed locally and `az login` done.
 - An **SSH** client.
 - A region close to the lab for latency / data residency, e.g. `israelcentral`
@@ -99,31 +129,31 @@ warns when the chosen VM has more cores than the job can ever use, and prints a
 
 ---
 
-## 3. Provision a Spot VM
+## 3. Provision a VM
 
-```bash
-RG=Simulations          # resource group
-LOC=israelcentral            # or israelcentral
-VM=SimulationsVM
-# 16 vCPU is ENOUGH for find-mech with n_sheets=10 (see §0 -- concurrency is
-# capped at n_sheets, so a bigger VM is pure cost). Go bigger only for the
-# fan-out generators, or to run E17.5 and P0 on one machine.
-SIZE=Standard_F16s_v2       # 16 vCPU / 32 GB
+```bat
+rem 16 vCPU is ENOUGH for find-mech with n_sheets=10 (see section 0 --
+rem concurrency is capped at n_sheets, so a bigger VM is pure cost). Go
+rem bigger only for the fan-out generators, or to run both stages at once.
+set RG=Simulations
+set LOC=israelcentral
+set VM=SimulationsVM
+set SIZE=Standard_F16s_v2
 
-az group create -n $RG -l $LOC
+az group create -n %RG% -l %LOC%
 
-# Spot VM, Deallocate on eviction so it can be restarted and the run resumed.
-# Larger OS disk because results (HDF5 histories + gifs) accumulate.
-az vm create -g $RG -n $VM \
-  --image Ubuntu2204 --size $SIZE \
-  --priority Spot --eviction-policy Deallocate --max-price -1 \
-  --os-disk-size-gb 128 \
-  --admin-username azureuser --generate-ssh-keys
+rem Pay-as-you-go (see section 0 on Spot). Larger OS disk because results
+rem (HDF5 histories + gifs) accumulate. For the pT re-fit, put them on a
+rem data disk instead -- 9.2.
+az vm create -g %RG% -n %VM% --image Ubuntu2204 --size %SIZE% --os-disk-size-gb 128 --admin-username azureuser --generate-ssh-keys
 
-# Safety net: auto-shutdown at 02:00 UTC so a forgotten VM can't bill overnight.
-az vm auto-shutdown -g $RG -n $VM --time 0200
+rem Safety net so a forgotten VM cannot bill overnight. NOTE: auto-shutdown is
+rem a DevTest Labs feature and is missing in some regions (israelcentral among
+rem them) -- if this errors, use the self-deallocating setup in 9.1 / 9.6.
+az vm auto-shutdown -g %RG% -n %VM% --time 0200
 
-# Note the public IP that `az vm create` prints (IP=...).
+rem Keep the publicIpAddress it prints; later steps use %IP%.
+set IP=20.0.0.1
 ```
 
 > **Linux vs Windows VM.** Ubuntu is ~40 % cheaper (no Windows licence) and is
@@ -137,7 +167,7 @@ az vm auto-shutdown -g $RG -n $VM --time 0200
 
 ## 4. Base setup on the VM (needed for ALL methods)
 
-SSH in (`ssh azureuser@<IP>`), then:
+SSH in (`ssh azureuser@%IP%`), then:
 
 ```bash
 # 4a. System tools. ImageMagick is needed by run()'s final gif step.
@@ -155,16 +185,40 @@ conda config --add channels conda-forge
 conda env create -f environment.yml          # creates the `tyssue` env
 # --- or build it explicitly if you don't have the yml: ---
 # conda create -n tyssue -c conda-forge python=3.10 tyssue numpy scipy pandas \
-#     matplotlib statsmodels scikit-posthocs h5py odfpy
+#     matplotlib pytables openpyxl pytest \
+#     vispy ipyvolume scikit-image networkx quantities tqdm requests ipywidgets
+# plus, ONLY if you also want the hierarchical p-value tooling on the VM
+# (statistical_analysis, §5 -- the pT sweep does not use it):
+#     statsmodels scikit-posthocs odfpy
 ```
 
 Get the simulation code onto the VM (from your machine):
 
-```bash
-# from your LOCAL machine, in the tissue_model folder.
-# The VENDORED tyssue in ./tyssue/src MUST come along -- see 4d.
-scp -r .  azureuser@<IP>:~/tissue_model
+```bat
+rem From your LOCAL machine, in the tissue_model folder. Stage a filtered copy
+rem first -- do NOT `scp -r .` the folder as it stands (see the warning below).
+rem The VENDORED tyssue in .\tyssue\src MUST come along -- see 4d.
+set IP=20.0.0.1
+robocopy . %TEMP%\tm_upload /E /XD .git __pycache__ .idea .pytest_cache /XF *.pem /NFL /NDL /NJH /NJS
+scp -r %TEMP%\tm_upload azureuser@%IP%:~/tissue_model
+rd /s /q %TEMP%\tm_upload
 ```
+
+> **Why not plain `scp -r .`?** Two reasons, one of them a security one.
+>
+> * It copies **`SimulationsVM_key.pem`** — a private SSH key — onto the VM,
+>   where it would also survive into any snapshot or image of that machine.
+>   That key is gitignored precisely because it should not travel, and nothing
+>   on the VM needs it.
+> * It is 187 MB / 1233 files, of which **110 MB is `.git`**, plus test
+>   fixtures (`*.hf5`), figures and `__pycache__`. The filtered copy above is
+>   **74 MB / 476 files** and carries everything the sweep and the §9.5 tests
+>   need, the vendored `tyssue/src` included.
+>
+> **Do not reach for `git archive` instead.** It ships the last *commit*, so
+> any uncommitted fix — the edge-tension correction and the `find_psigma`
+> changes among them — would be silently left behind, and the VM would run the
+> old model while looking perfectly healthy.
 
 ```bash
 # 4d. TWO MANDATORY ENV VARS. Add both to ~/.bashrc.
@@ -175,12 +229,61 @@ cd ~/tissue_model
 #     bitten us for real; it is not optional.
 export PYTHONPATH="$PWD/tyssue/src"
 
-# (ii) Results directory. The default is the WINDOWS path D:\Kasirer\results,
+# (ii) Results directory. The default is the WINDOWS path D:\kasirer\model_results,
 #      which is meaningless on Linux, so every read/write would land somewhere
 #      wrong or fail.
 export TISSUE_RESULTS_DIR="$HOME/results"
 mkdir -p "$TISSUE_RESULTS_DIR"
 ```
+
+> **If you are following §9, do NOT use this value.** §9.3 sets
+> `/data/results` — the data disk — and there must be exactly **one**
+> `TISSUE_RESULTS_DIR` line in `~/.bashrc`, or whichever comes last silently
+> wins and everything lands on the 128 GB OS disk. Check with
+> `grep -n TISSUE_RESULTS_DIR ~/.bashrc`, and remember that an `export` typed
+> into a live shell beats `~/.bashrc` for that shell no matter what the file
+> says.
+
+> **`pytables`, not `h5py`.** Every history archive is read and written through
+> `pandas.HDFStore`, which is backed by **PyTables** — nothing in this codebase
+> imports `h5py` at all. The list used to name `h5py`; if conda happens not to
+> pull PyTables in as a `tyssue` dependency, every run dies at its first save.
+> `openpyxl` is for the `.xlsx` the post-processing writes (§9.7), and `pytest`
+> for the §9.5 checks — the test file needs nothing else beyond the packages
+> above.
+>
+> If the env is already built, add what is missing with one solve rather than
+> several: `conda install -n tyssue -c conda-forge pytables openpyxl pytest`.
+> Set `conda config --set solver libmamba` first — the classic solver can spin
+> for 30+ minutes on this env and does not always respond to Ctrl-C (kill it
+> from a second session with `pkill -f "conda.*install"`).
+>
+> `statsmodels` / `scikit-posthocs` / `odfpy` are only needed by
+> `statistical_analysis` (the hierarchical p-value compare, §5). The pT sweep
+> and `build_run_table` run without them — verified by importing the whole
+> find-psigma path on a machine that has none of the three.
+>
+> Measured on a fresh israelcentral VM (2026-10-29): `conda create` with the
+> first line alone left **`vispy` and `tqdm`** missing; everything else on the
+> second line came in as a `tyssue` dependency. Which ones the solver happens
+> to pull is not worth relying on — name them all.
+>
+> **The visualisation stack is NOT optional**, even headless. `post_processing`
+> does `from tyssue.draw.plt_draw import sheet_view`, and importing a submodule
+> runs the package `__init__` first — which imports `ipv_draw` (ipyvolume) and
+> `vispy_draw`. tyssue guards the latter with `except OSError`, so a missing
+> *display* is handled but a missing *module* is not: without vispy installed
+> the import dies with `ModuleNotFoundError`. Hence the second line above.
+>
+> To find everything missing in one pass rather than one `ModuleNotFoundError`
+> at a time:
+>
+> ```bash
+> python -c "import importlib.util; pkg={'vispy':'vispy','ipyvolume':'ipyvolume','skimage':'scikit-image','networkx':'networkx','quantities':'quantities','tqdm':'tqdm','requests':'requests','IPython':'ipython','ipywidgets':'ipywidgets','bqplot':'bqplot','pythreejs':'pythreejs','traittypes':'traittypes','numexpr':'numexpr','PIL':'pillow','tables':'pytables','openpyxl':'openpyxl','pytest':'pytest'}; m=sorted({n for k,n in pkg.items() if not importlib.util.find_spec(k)}); print('conda install -n tyssue -c conda-forge '+' '.join(m)+' -y' if m else 'nothing missing')"
+> ```
+>
+> then the check that settles it:
+> `python -c "import post_processing, full_model, azure_run, build_run_table; print('ok')"`.
 
 **Sanity check** the env on the VM. This verifies the LAPACK/`svd` backend *and*
 that the vendored tyssue is the one being imported:
@@ -190,6 +293,10 @@ conda activate tyssue
 cd ~/tissue_model
 python -c "import numpy as np, tyssue, scipy; print('svd', np.linalg.svd(np.random.rand(6,3))[1].shape, 'ok'); print('tyssue from', tyssue.__file__)"
 # ^ 'tyssue from' MUST print a path under ~/tissue_model/tyssue/src/
+
+# And the HDF5 backend, which is how EVERY run saves its history. Without
+# PyTables this raises here, in a second, instead of after the first run.
+python -c "import pandas as pd, numpy as np, tempfile, os; p=os.path.join(tempfile.mkdtemp(),'t.h5'); pd.DataFrame({'a':np.arange(3.0)}).to_hdf(p,key='x'); print('HDFStore ok', pd.read_hdf(p,key='x').shape)"
 ```
 
 `azure_run.py find-mech` also checks both of these at startup and prints a loud
@@ -217,10 +324,10 @@ data** and imports the **`statistical_analysis`** module from the sibling
 variables (they default to the local Windows checkout), so on the VM you just
 copy the folders up and point two env vars at them — **no file editing**:
 
-```bash
-# 5a. Copy the experimental data and the analyzer repo up (from your machine):
-scp -r "/path/to/Experimental Data"  azureuser@<IP>:~/experimental_data
-scp -r "/path/to/tissue_image_processing/tissue_analyzing_tool"  azureuser@<IP>:~/tissue_analyzing_tool
+```bat
+rem 5a. Copy the experimental data and the analyzer repo up (from your machine):
+scp -r "C:\path\to\Experimental Data" azureuser@%IP%:~/experimental_data
+scp -r "C:\path\to\tissue_image_processing\tissue_analyzing_tool" azureuser@%IP%:~/tissue_analyzing_tool
 ```
 
 ```bash
@@ -289,6 +396,13 @@ pp.find_best_timepoint_for_random_arrays(indices=range(10)); \
 pp.store_best_time_point_for_random_arrays()"
 ```
 
+Both steps use the production binning scheme, `post_processing.NEIGHBOR_BINS`
+(merged tails: `<=4, 5, 6, 7, >=8`), and talk to each other through that
+scheme's own chosen-frame file, `pval_results_mergedtails.txt`. Pass
+`bins=pp._NEIGHBOR_BINS` to both calls for the single-count 3–9 alternative;
+it has its own file (`pval_results.txt`) and its own per-run traces, so the two
+can coexist without either reading the other's frames.
+
 ---
 
 ## 7. Recommended end-to-end pipeline order
@@ -323,14 +437,14 @@ ls -d $TISSUE_RESULTS_DIR/fit_* | wc -l
 
 ## 9. Retrieve results and STOP billing
 
-```bash
-# from your LOCAL machine ($TISSUE_RESULTS_DIR on the VM, ~/results by default):
-azcopy copy "azureuser@<IP>:~/results" "." --recursive   # or scp -r
+```bat
+rem from your LOCAL machine (TISSUE_RESULTS_DIR on the VM, ~/results by default):
+scp -r azureuser@%IP%:~/results .
 
-# then, on Azure (compute billing stops on deallocate; disk is kept):
-az vm deallocate -g $RG -n $VM
-# fully tear down when done:
-az group delete -n $RG --yes
+rem compute billing stops on deallocate; the disk is kept:
+az vm deallocate -g %RG% -n %VM%
+rem fully tear down when done:
+az group delete -n %RG% --yes
 ```
 
 Results can be large (HDF5 histories + gifs); `tar czf results.tgz results`
@@ -343,7 +457,7 @@ before downloading if bandwidth matters.
 For *hundreds* of arrays, fan out one Batch task per index instead of one VM.
 `azure_run.py` includes a template `submit_batch_fanout(method, indices, ...)`
 that emits, per index `i`, a task running e.g.
-`python azure_run.py random-arrays --indices i --workers 1` on a pool of Spot
+`python azure_run.py random-arrays --indices i --workers 1` on a pool of
 nodes. It needs `pip install azure-batch azure-storage-blob azure-identity`, a
 Batch + Storage account, and a node start-task that recreates the `tyssue` env
 and stages the code. It's a template (not run against a live account) — fill in
@@ -357,13 +471,13 @@ start-task. Keep the fitters (`find-mech`, `find-psigma`) on a single VM.
 | Symptom | Cause & fix |
 |---|---|
 | `ValueError: change of datatype in edge table` | The **stock PyPI tyssue** is being imported instead of the vendored one. `export PYTHONPATH=$PWD/tyssue/src` (Step 4d-i). This is the single most common setup failure. |
-| Results written to a strange path, or `FileNotFoundError` on `D:\Kasirer\results` | `TISSUE_RESULTS_DIR` not set on Linux — the default is a Windows path (Step 4d-ii). |
+| Results written to a strange path, or `FileNotFoundError` on `D:\kasirer\model_results` | `TISSUE_RESULTS_DIR` not set on Linux — the default is a Windows path (Step 4d-ii). |
 | Fit dies with `not enough values to unpack (expected N, got M)` | **`run_model.py` was edited while the fit was running.** The parent keeps the old task-builder while newly spawned workers import the new unpack signature. Never edit the tree during a run — copy it and edit the copy. Completed run folders are reused, so restarting is cheap. |
 | Fit found the same best point as a previous run and did almost no work | Working as intended: run folders are content-hashed, so matching parameter points are reused. Change a parameter that is folded into the hash (or delete the folders) to force fresh runs. |
 | `numpy.linalg`/`statsmodels` hard-crash (e.g. `0xc06d007f` on Windows) | Running a bare `python` without env activation. **Always** `conda activate tyssue` / `conda run -n tyssue`. The Step-4 `svd` check verifies the backend. |
 | `FileNotFoundError` on `...Experimental Data` or `ImportError: statistical_analysis` | The Step-5 env vars aren't set on the VM. `export EXPERIMENTAL_DATA_DIR=...` and `export TISSUE_ANALYZER_PATH=...` (point them at the copied folders). Affects the analysis steps: morphology fit (7.2), `find-mech`, `find-psigma` — not the generators. |
 | Run finishes but no `movie.gif` / a gif error in the log | ImageMagick missing. `sudo apt-get install -y imagemagick` (Step 4a). The history is still saved regardless. |
-| VM disappears mid-run (Spot eviction) | Expected. Restart with `az vm start -g $RG -n $VM`; reruns reuse existing result folders, and `run(continue_existing_run=True, ...)` resumes a partial archive. |
+| VM disappears mid-run | Should not happen on PAYG; it is what drove us off Spot. Either way, restart with `az vm start -g $RG -n $VM`: reruns reuse existing result folders, and `run(continue_existing_run=True, ...)` resumes a partial archive. |
 | `psigma` seems to have no effect | `psigma` only matters with stress-dependent differentiation. `find-psigma`'s worker already passes `stress_dependent=True`; if you call `run()` directly, set it too. |
 | SSH drops kill the job | Launch inside `tmux` (Step 6). |
 
@@ -406,13 +520,13 @@ them. They flatten past K≈6 because the straggler penalty grows with batch siz
 ### Recommendation
 
 - **Right now:** let the local fit finish, and put the *other* stage on one
-  16-vCPU Spot VM (~$11). That is the whole 2× with zero code risk.
+  16-vCPU VM (~$55 PAYG). That is the whole 2× with zero code risk.
 - **Before the next fitting campaign:** add batch proposals to
   `bayesian_optimization.minimize`. That is the only change that turns money
   into wall-clock here — and given that both previous fits found their best
   point during the *random* initial phase, batching should cost little or
   nothing in fit quality.
-- **Cost is never the constraint:** the entire fit is ~$11 on Spot. Do not
+- **Cost is never the constraint:** the entire fit is ~$55 PAYG. Do not
   optimise for it; optimise for wall-clock and for not corrupting a run.
 
 Re-running after restart:
@@ -428,15 +542,15 @@ tmux new -s p0
 Monitor: tmux attach -t e17, tail -f ~/mech_fit_E17.5.log, or ls -d ~/results/fit_*pa0.466* | wc -l.
 
 -----When done — retrieve and stop billing-----
-scp azureuser@<IP>:"~/results/*_optimization_*" "D:\Kasirer\results\"
+scp azureuser@%IP%:"~/results/*_optimization_*" "D:\Kasirer\results\"
 az vm deallocate -g Simulations -n SimFit
 
-scp azureuser@<IP>:/home/azureuser/results/grid_fit_mechanics_v2_E17.5.json D:/Kasirer/results/
+scp azureuser@%IP%:/home/azureuser/results/grid_fit_mechanics_v2_E17.5.json D:/Kasirer/results/
 
 -----P0 step-5 scans (v2 fit) — launch in tmux-----
 Upload (from the local tissue_model folder):
-scp -i SimulationsVM_key.pem p0_rgamma_scan.py p0_gamma_scan.py p0_from_e17_stiffness.py post_processing.py run_p0_scan.sh azureuser@<IP>:~/tissue_v2/
-ssh azureuser@<IP> chmod +x ~/tissue_v2/run_p0_scan.sh
+scp -i SimulationsVM_key.pem p0_rgamma_scan.py p0_gamma_scan.py p0_from_e17_stiffness.py post_processing.py run_p0_scan.sh azureuser@%IP%:~/tissue_v2/
+ssh azureuser@%IP% chmod +x ~/tissue_v2/run_p0_scan.sh
 
 THE TREE MATTERS: the v2 work lives in ~/tissue_v2 (~/tissue_model and
 ~/tissue_full are older checkouts and have no grid_fit_mechanics_v2.py).
@@ -457,4 +571,344 @@ Detach with Ctrl-b d. Reattach: tmux attach -t p0scan
 
 Monitor: tmux attach -t p0scan, or tail -f ~/p0_rgamma_scan.log
 Retrieve:
-scp azureuser@<IP>:/home/azureuser/results/p0_rgamma_scan.json D:/Kasirer/results/
+scp azureuser@%IP%:/home/azureuser/results/p0_rgamma_scan.json D:/Kasirer/results/
+
+---
+
+## 9. The pT re-fit (phase 1) — step by step
+
+The psigma sweep differs from `find-mech` in two ways that change the recipe:
+it is **storage-heavy** (~0.9 GB per run against 15 MB) and, since the pass is
+now batched, it **actually uses all the cores you rent**. A dedicated data disk
+and a bigger VM are both justified here; §0's "16 vCPU is enough" does not
+apply.
+
+Budget: **~8 h, ~$30** (F48s_v2 PAYG + a 2 TiB disk for two days).
+
+### 9.1 Provision — non-Spot, with a data disk
+
+```bat
+set RG=Simulations
+set LOC=israelcentral
+set VM=PsigmaVM
+set SIZE=Standard_F48s_v2
+
+az group create -n %RG% -l %LOC%
+
+rem NO --priority Spot: an 8-hour run gets evicted repeatedly, and the
+rem compute is only ~$16. A 2 TiB P40 data disk comes up as LUN 0.
+az vm create -g %RG% -n %VM% --image Ubuntu2204 --size %SIZE% --os-disk-size-gb 128 --data-disk-sizes-gb 2048 --admin-username azureuser --generate-ssh-keys
+
+rem Keep the publicIpAddress it prints -- every later step needs it.
+rem Substitute the real address; do NOT type angle brackets, cmd reads
+rem < and > as redirection.
+set IP=20.0.0.1
+```
+
+**Then give the VM permission to stop itself.** `az vm auto-shutdown` is a
+DevTest Labs feature and does not exist in every region (israelcentral is one
+of the gaps), so instead of a wall-clock shutdown the VM deallocates itself the
+moment the sweep ends — better anyway, since it stops billing when the work
+stops rather than at a guessed hour. A system-assigned identity, scoped to this
+one VM:
+
+```bat
+rem Capture the identity's object id and the VM's resource id into variables.
+rem Typed at the prompt this is %i; inside a .bat file it must be %%i.
+for /f "usebackq delims=" %i in (`az vm identity assign -g %RG% -n %VM% --query systemAssignedIdentity -o tsv`) do set OID=%i
+for /f "usebackq delims=" %i in (`az vm show -g %RG% -n %VM% --query id -o tsv`) do set VMID=%i
+
+echo %OID%
+echo %VMID%
+
+az role assignment create --assignee-object-id %OID% --assignee-principal-type ServicePrincipal --role "Virtual Machine Contributor" --scope %VMID%
+```
+
+Both `echo`s must print a value before you run the role assignment. An empty
+`%OID%` means the identity was assigned on an earlier attempt, in which case
+read it back with
+`az vm show -g %RG% -n %VM% --query identity.principalId -o tsv`.
+
+**Careful:** shutting the guest down (`sudo poweroff`) leaves the VM *Stopped*,
+not *Stopped (deallocated)*, and Azure keeps billing compute. Only
+`az vm deallocate` stops the meter — which is what §9.6 chains to the sweep.
+
+### 9.2 Format and mount the data disk
+
+```bash
+ssh azureuser@%IP%
+lsblk                                   # the 2 TiB disk is usually /dev/sdc
+sudo mkfs.ext4 -F /dev/sdc
+sudo mkdir -p /data && sudo mount /dev/sdc /data
+sudo chown -R azureuser:azureuser /data
+# Create the results directory HERE, after the mount. Making it earlier puts
+# it on the OS disk, where the mount then hides it -- and the §9.4 uploads
+# fail with "scp: realpath /data/results/: No such file".
+mkdir -p /data/results
+# survive a reboot
+echo "UUID=$(sudo blkid -s UUID -o value /dev/sdc) /data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+df -h /data                             # must show ~2.0T available
+ls -ld /data/results                    # must be owned by azureuser
+```
+
+### 9.3 Base setup
+
+Follow **§4** (apt packages, Miniconda, the `tyssue` env, `scp` the repo). Then
+set **three** environment variables instead of two — add all three to
+`~/.bashrc`:
+
+```bash
+cd ~/tissue_model
+mkdir -p /data/results                           # no-op if §9.2 made it
+
+# WRITE them to ~/.bashrc, do not just export them in this shell. A tmux pane
+# is a fresh shell: without this it has no `conda activate`, and -- worse --
+# no TISSUE_RESULTS_DIR, so the sweep silently writes to a RELATIVE directory
+# literally named "D:\kasirer\model_results" under the repo, on the OS disk.
+cat >> ~/.bashrc <<'EOF'
+source ~/miniconda/etc/profile.d/conda.sh
+export PYTHONPATH="$HOME/tissue_model:$HOME/tissue_model/tyssue/src"
+export TISSUE_RESULTS_DIR=/data/results          # the DATA DISK, not $HOME
+export EXPERIMENTAL_DATA_DIR=$HOME/experimental  # scoring reads this
+EOF
+
+# apply to the CURRENT shell as well, and check
+source ~/.bashrc
+echo "$PYTHONPATH" && echo "$TISSUE_RESULTS_DIR" && echo "$EXPERIMENTAL_DATA_DIR"
+```
+
+Note `$HOME/...` rather than `$PWD/...`: `.bashrc` is sourced from whatever
+directory the shell starts in, so `$PWD` there would point somewhere else.
+
+`$HOME/results` would fill the 128 GB OS disk after ~130 runs. The sweep needs
+~1.1 TB.
+
+### 9.4 Upload the inputs (~1.2 GB total)
+
+From your local machine:
+
+```bat
+rem The 20 fitted initial morphologies the runs start from (0.2 GB).
+rem cmd does NOT expand wildcards for scp, so loop over the folders. At the
+rem prompt this is %d; inside a .bat file it must be %%d.
+for /d %d in (D:\Kasirer\results\random_periodic_array*_for_E17) do scp -r "%d" azureuser@%IP%:/data/results/
+for /d %d in (D:\Kasirer\results\random_periodic_array*_for_P0) do scp -r "%d" azureuser@%IP%:/data/results/
+
+rem the experimental measurements the scoring compares against (0.9 GB)
+scp -r "C:\Users\Kasirer\Phd\mouse_ear_project\papers\Dynamic lateral inhibition in the utricle\Experimental Data" azureuser@%IP%:~/experimental
+```
+
+Confirm all twenty landed before going on:
+
+```bat
+ssh azureuser@%IP% "ls -d /data/results/*_for_* | wc -l"
+```
+
+Do **not** upload the pT = 0 baseline runs (54 GB). pT = 0 is excluded from the
+sweep and merged locally afterwards — which is also why `--psigma-bounds`
+starts at 0.06: the refinement window is clamped to the lower bound, so no pass
+can wander onto zero and re-simulate a baseline that is not there.
+
+### 9.5 Verify before spending anything
+
+```bash
+conda activate tyssue
+cd ~/tissue_model
+
+# (a) the vendored tyssue is the one imported (§4)
+python -c "import tyssue; print(tyssue.__file__)"
+
+# (b) the parts of the fit we changed
+python -m pytest test_periodic.py -k "FindPsigma or EdgeTension" -q
+
+# (c) end-to-end plumbing on a THROWAWAY results dir, so a deliberately
+#     truncated run can never be reused by the real sweep (the folder name
+#     does not encode t_end).
+#
+#     Make the directory first -- run() creates each run folder with os.mkdir,
+#     which does NOT create parents, so a missing /data/smoke fails with the
+#     whole output path in the message. And link in the ONE array the smoke
+#     test uses (--n-sheets 1 means array 0), because the run loads its
+#     initial sheet from TISSUE_RESULTS_DIR too; the links are read-only here,
+#     and `rm -rf /data/smoke` later removes the links, not the extracts.
+mkdir -p /data/smoke
+ln -s /data/results/random_periodic_array0_for_E17 /data/smoke/
+ln -s /data/results/random_periodic_array0_for_P0  /data/smoke/
+
+TISSUE_RESULTS_DIR=/data/smoke python azure_run.py find-psigma \
+  --mechanical-params '{"E17.5":{"gamma_sc":0.0105,"R_gamma":6.746124660721616,"R_alpha":3.5,"A0":0.741812389049632},"P0":{"gamma_sc":0.0105,"R_gamma":3.850521945713907,"R_alpha":1.757,"A0":0.7585423232230211}}' \
+  --psigma-bounds 0.09 0.09 --n-grid 1 --n-refine 0 \
+  --n-sheets 1 --n-repeats 1 --t-end 2 --save-interval 0.5 --workers 2
+```
+
+(c) must print the resolved mechanics per stage (`gammaHC_ratio=6.74612` for
+E17.5, `3.85052` for P0 — if it says 1.0, the mechanical-params JSON did not
+parse), run 2 simulations, score them, and write `psigma_scores_*.json`. The
+SCORE is meaningless at `t_end 2`; only the plumbing is being tested. Then:
+
+```bash
+rm -rf /data/smoke          # nothing in it is reusable
+```
+
+### 9.6 The real sweep
+
+```bash
+tmux new -s psigma            # survives the ssh session dropping
+
+# A tmux pane is a FRESH shell: source conda's hook before activating, or
+# `conda activate` is "command not found". Harmless if ~/.bashrc already does
+# it (§9.3). Check the three exports survived too -- they must, or the run
+# writes to the OS disk and imports the wrong tyssue.
+source ~/miniconda/etc/profile.d/conda.sh
+conda activate tyssue && cd ~/tissue_model
+echo "$PYTHONPATH" && echo "$TISSUE_RESULTS_DIR" && echo "$EXPERIMENTAL_DATA_DIR"
+
+{ python azure_run.py find-psigma \
+    --mechanical-params '{"E17.5":{"gamma_sc":0.0105,"R_gamma":6.746124660721616,"R_alpha":3.5,"A0":0.741812389049632},"P0":{"gamma_sc":0.0105,"R_gamma":3.850521945713907,"R_alpha":1.757,"A0":0.7585423232230211}}' \
+    --psigma-bounds 0.06 0.12 --n-grid 7 --n-refine 2 \
+    --n-sheets 10 --n-repeats 3 --workers 46 \
+    2>&1 | tee /data/psigma_sweep.log ; } ; \
+  az vm deallocate -g Simulations -n PsigmaVM --no-wait
+```
+
+`--workers 46`, not 48: two cores are left for the OS, the HDF5 writes and the
+scoring parent. Detach with `ctrl-b d`, reattach with `tmux attach -t psigma`.
+
+The trailing `az vm deallocate` runs **however the sweep exits** — finished,
+crashed or killed — so compute billing stops with the work rather than at a
+guessed hour. Nothing is lost if it fires early: the log and every result sit
+on the data disk, which survives deallocation, and `az vm start` plus the same
+command resumes from the completed folders. Note the `;` before it rather than
+`&&`: `&&` would skip the deallocate exactly when the sweep failed and you most
+want the machine off. Run §9.7 first if you want the tables built on the VM, or
+simply start it again afterwards — that part is a minute's work.
+
+Watch, from a second shell:
+
+```bash
+tail -f /data/psigma_sweep.log | grep -E "^\[find_psigma\]"
+df -h /data                   # the number to watch; ~1.1 TB expected
+```
+
+Each pass prints `pass: N psigma x 2 stage(s) x 10 array(s) x 3 repeat(s)`, and
+scores are written to `/data/results/psigma_scores_*.json` after **every**
+point — so an interruption costs only the point in flight, and re-running the
+same command resumes (completed folders are reused, and the score cache skips
+re-scoring points whose runs have not changed).
+
+### 9.7 Post-process ON the VM, then download only the small files
+
+```bash
+python build_run_table.py --pattern 'fullmodel_v2*_ps*' --workers 46
+```
+
+(`--pattern`, not `--prefix`; the glob keeps it to the swept points, since the
+pT = 0 baseline is not on this machine.)
+
+Then bring back the tables, not the histories (1.1 TB of egress would cost more
+than the whole campaign):
+
+```bat
+rem from your local machine. The * is expanded by the REMOTE shell, so it
+rem works from cmd even though cmd itself does not glob.
+scp azureuser@%IP%:/data/results/psigma_scores_*.json .
+scp azureuser@%IP%:/data/results/fullmodel_runs.csv .
+scp azureuser@%IP%:/data/psigma_sweep.log .
+```
+
+The pT = 0 baseline is merged here, locally, where its 60 runs already live. It
+is 3 repeats too, so it joins the sweep on equal footing — do not merge a
+baseline scored on a different repeat count.
+
+### 9.8 The single-HC ablation pipeline (run BEFORE tearing down)
+
+Ten strict steady states — one per array, forked from the **first** repeat — then
+five ablations each, every one removing a different HC.
+
+**First, two files the sweep never needed.** `ablate_single_hc.py` builds `MECH`
+**at import time** by reading the self-consistent mechanical fit out of
+`$TISSUE_RESULTS_DIR`, so without them `strict_steady_state.py` and
+`ablate_from_strict.py` both die on the import — even `--dry-run`, which is how
+this was found. They are 3 KB each; the sweep got its mechanics from the command
+line instead, which is why §9.4 never asked for them.
+
+```bat
+rem from your LOCAL machine
+scp "D:\Kasirer\results\e17_selfconsistent_scan.json" azureuser@%IP%:/data/results/
+scp "D:\Kasirer\results\p0_selfconsistent_scan.json"  azureuser@%IP%:/data/results/
+
+rem and the two scripts, both fixed after the §9.4 upload: the psigma folder tag
+rem was a bare %%.3f, which writes the fitted 0.08667 as "ps0.087" -- and so
+rem would every psigma in 0.0865-0.0874, sharing one folder.
+scp strict_steady_state.py ablate_from_strict.py azureuser@%IP%:~/tissue_model/
+```
+
+Check the mechanics resolve to the v2 fit before running anything. **Confirm the
+results dir first** — `RESULTS_DIR` is read from the environment at *import*
+time, so if the shell still carries §4d-ii's `$HOME/results` the scan files are
+looked for on the OS disk and the import fails however correctly you uploaded
+them:
+
+```bash
+cd ~/tissue_model
+export TISSUE_RESULTS_DIR=/data/results
+python -c "from history_io import RESULTS_DIR; print(RESULTS_DIR)"   # /data/results
+ls -l /data/results/*_selfconsistent_scan.json
+
+python -c "from ablate_single_hc import MECH; [print(k, v) for k, v in MECH.items()]"
+# E17.5 (0.0105, 6.746124660721616, 3.5, 0.741812389049632)
+# P0    (0.0105, 3.850521945713907, 1.757, 0.7585423232230211)
+```
+
+If `RESULTS_DIR` printed anything else, fix `~/.bashrc` before the real run —
+the ablations write ~22 GB and the OS disk is 128 GB:
+
+```bash
+grep -n TISSUE_RESULTS_DIR ~/.bashrc
+sed -i 's#^export TISSUE_RESULTS_DIR=.*#export TISSUE_RESULTS_DIR=/data/results#' ~/.bashrc
+```
+
+Then, in `tmux`:
+
+```bash
+# 1. ten forks of 100 time units, scanned for a 5-unit window with zero
+#    differentiation events.  --dry-run first: it prints the source run and the
+#    fork time for each array and runs nothing.
+python strict_steady_state.py --psigma 0.08667 --stage P0 --dry-run
+python strict_steady_state.py --psigma 0.08667 --stage P0 --workers 10
+
+# 2. five distinct-HC ablations per array.  Existing ablations count towards the
+#    target and already-ablated cells are excluded, so a rerun tops up.
+python ablate_from_strict.py --repeats 5 --workers 46
+```
+
+`--workers 10` for step 1, not 46: there are only ten tasks, and each is a
+single-threaded 100-unit run. Expect ~22 GB on `/data` (10 x ~950 MB of strict
+state plus 50 x ~250 MB of ablation).
+
+An array that finds no event-free window is **flagged, not ablated** — check the
+verdict table before step 2, because `ablate_from_strict.py` silently skips
+those arrays and you would get fewer than 50 runs.
+
+Download the two small records; the histories stay on the VM:
+
+```bat
+scp azureuser@%IP%:/data/results/strict_steady_state.json "D:\Kasirer\results\strict_steady_state_ps0.08667.json"
+scp azureuser@%IP%:/data/results/ablate_from_strict.json  "D:\Kasirer\results\ablate_from_strict_ps0.08667.json"
+```
+
+Rename on arrival, as above: the pT = 0 pipeline runs locally and writes the
+same two filenames.
+
+### 9.9 Tear down (the disk bills while the VM is off)
+
+```bat
+rem deallocate stops COMPUTE only -- the disk keeps billing
+az vm deallocate -g %RG% -n %VM%
+rem this removes the VM AND the disk
+az group delete -n %RG% --yes
+```
+
+A 2 TiB disk left behind is ~$6.5/day whether or not the VM runs — more than
+the sweep itself if forgotten for a week. Snapshot first if you want the
+histories kept.
