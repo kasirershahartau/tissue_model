@@ -10,13 +10,13 @@ prediction and the 1 and 2+ buckets are its failures.
 Two figures, each a single panel holding both stages:
 
     li     lateral-inhibition-only model against the experiment   (4 bars/bucket)
-    full   the full model at pT = 0 and pT = 0.162 against the
+    full   the full model at pT = 0 and the fitted pT against the
            experiment                                             (6 bars/bucket)
 
 COLOUR CARRIES THE STAGE, POSITION CARRIES THE MODEL. The palette is the one the
 other manuscript figures use — turquoise/green for a model at E17.5,
 orange/orangered at P0, cyan/blue for the experiment at E17.5, pink/red at P0.
-So in the full-model figure pT = 0 and pT = 0.162 share a colour within a stage
+So in the full-model figure pT = 0 and the fitted pT share a colour within a stage
 and are told apart by their x label, exactly as in the neighbour-pair figure.
 
 Within a bucket every bar touches its neighbour; buckets are separated by
@@ -59,6 +59,7 @@ from build_experimental_tables import read_table, experimental_results_folder
 from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_COLOUR, POINT_SIZE,
                                  STAT_COLOUR, ERROR_CAPSIZE, ERROR_LINEWIDTH,
                                  BAR_W, _mean_sem)
+from best_pt import BEST_PT, BEST_PT_LABEL
 
 # The LI tables briefly lived in old/ and new/ subfolders holding DIFFERENT
 # datasets of identical size (same 100 runs over 10 arrays, different numbers).
@@ -77,9 +78,11 @@ BUCKETS = ("0", "1")                  # HC neighbours at differentiation
 BUCKET_LABEL = {"0": "0", "1": "1", "2+": "2 or more"}
 BUCKET_GAP = 0.8                      # between buckets; bars inside one touch
 STAGE_GAP = BUCKET_GAP                # the stage blocks are spaced like buckets
-# pT = 0.162 shares its stage's colour with pT = 0, so it is hatched to tell the
-# two apart without leaving the one-colour-per-stage palette
-HATCH = {"pt162": "/"}
+# the fitted pT shares its stage's colour with pT = 0, so it is hatched to tell
+# the two apart without leaving the one-colour-per-stage palette.
+# The key is "ptbest", not the value: it used to be "pt162", so the re-fit would
+# have needed the string changed in four places or the series would vanish.
+HATCH = {"ptbest": "/"}
 
 # (key, x-axis label) in the order they are drawn WITHIN one stage
 FIGURES = {
@@ -90,7 +93,8 @@ FIGURES = {
     "full": dict(stem="hc_neighbors_fullmodel_vs_exp",
                  title="HC neighbours at differentiation: "
                        "the full model against the experiment",
-                 sources=[("pt0", "$p_T$=0"), ("pt162", "$p_T$=0.162"),
+                 sources=[("pt0", "$p_T$=0"),
+                          ("ptbest", "$p_T$=%s" % BEST_PT_LABEL),
                           ("exp", "exp")]),
 }
 
@@ -171,7 +175,7 @@ def gather(which, results_dir=RESULTS_DIR, li_dir=LI_DIR):
                                & np.isclose(li["pS"].astype(float), p["pS"])
                                & np.isclose(li["pR"].astype(float), p["pR"])]
                     else:
-                        pt = 0.0 if key == "pt0" else 0.162
+                        pt = 0.0 if key == "pt0" else BEST_PT
                         g = full[(full["stage"] == stage)
                                  & np.isclose(full["psigma"].astype(float), pt)]
                     if not len(g):
@@ -338,8 +342,8 @@ def draw(rows, which, rng, out_dir, scores=False):
         # outside it and render blank, so the key is drawn denser than the bars
         handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="white",
                                      edgecolor="0.25", linewidth=1.6,
-                                     hatch=HATCH["pt162"] * 3))
-        names.append(r"full model, $p_T$ = 0.162")
+                                     hatch=HATCH["ptbest"] * 3))
+        names.append(r"full model, $p_T$ = %s" % BEST_PT_LABEL)
     handles.append(plt.Line2D([], [], marker=".", linestyle="none",
                               color=POINT_COLOUR, alpha=0.8, markersize=9))
     names.append("one initial array (model) / one repeat (experiment)")

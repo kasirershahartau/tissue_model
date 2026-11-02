@@ -27,7 +27,7 @@ are the numbers to quote and the violin is the shape behind them.
 Only the contractility effector set is drawn, the one run_model.stress_effectors
 gates on. Only the model appears: the experiment has no stress measurement.
 
-HC:HC IS NOT DRAWN. It exists (269 pairs at E17.5, 470 at P0 for pT = 0.162) but
+HC:HC IS NOT DRAWN. It exists (a few hundred pairs per stage at the fitted pT) but
 was left out at request; the tables still carry it.
 
 WHY --frame initial DROPS THE HC:SC VIOLINS. At t = 0 no cell is above the delta
@@ -50,15 +50,16 @@ from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_SIZE, POINT_COLOUR,
                                  MEAN_MARKERSIZE, STAT_COLOUR, ERROR_CAPSIZE,
                                  ERROR_LINEWIDTH, VIOLIN_W, BLOCK_GAP,
                                  _mean_sem, _x)
+from best_pt import BEST_PT
 
-PANELS = (0.0, 0.162)          # one panel per pT value
+PANELS = (0.0, BEST_PT)        # one panel per pT value
 # (stage, class) left to right within a panel; the P0 block is pushed right by _x
 SOURCES = [("E17.5", "HC:SC"), ("E17.5", "SC:SC"),
            ("P0", "HC:SC"), ("P0", "SC:SC")]
 EFFECTORS = "contractility"
 # --layout single puts all eight distributions in one row, in this block order;
 # within each block HC:SC comes first, then SC:SC
-SINGLE_ORDER = [(0.0, "E17.5"), (0.162, "E17.5"), (0.0, "P0"), (0.162, "P0")]
+SINGLE_ORDER = [(0.0, "E17.5"), (BEST_PT, "E17.5"), (0.0, "P0"), (BEST_PT, "P0")]
 MAX_POINTS = 400        # per violin; the full set is tens of thousands
 # smaller than the shared model size: these clouds are dense enough that the
 # standard dot fills the violin and hides its shape
@@ -68,7 +69,7 @@ Y_TICK_STEP = 0.1
 # since colour here already says which stage — the same convention as
 # plot_neighbor_pair_bars and plot_isolated_sc_violin.
 HATCH = "/"
-HATCH_PT = 0.162
+HATCH_PT = BEST_PT
 
 
 # The three ways to build an interface's stress from its mesh edges, and what

@@ -44,6 +44,7 @@ import pandas as pd
 
 from post_processing import RESULTS_DIR
 from build_experimental_tables import read_table
+from best_pt import BEST_PT, BEST_PT_LABEL
 
 LI_DIR = r"D:\Kasirer\results\lateral inhibition only results"
 # (stage, kind, label, selector) in the order they are plotted. The stage blocks
@@ -53,11 +54,11 @@ LI_DIR = r"D:\Kasirer\results\lateral inhibition only results"
 SOURCES = [
     ("E17.5", "li", "lateral inhibition\nonly\npS=0.1, pR=0.3", dict(pS=0.1, pR=0.3)),
     ("E17.5", "full", "full model\n" r"$p_T$=0", dict(psigma=0.0)),
-    ("E17.5", "full", "full model\n" r"$p_T$=0.162", dict(psigma=0.162)),
+    ("E17.5", "full", "full model\n" r"$p_T$=%s" % BEST_PT_LABEL, dict(psigma=BEST_PT)),
     ("E17.5", "exp", "experiment", {}),
     ("P0", "li", "lateral inhibition\nonly\npS=0.15, pR=0.25", dict(pS=0.15, pR=0.25)),
     ("P0", "full", "full model\n" r"$p_T$=0", dict(psigma=0.0)),
-    ("P0", "full", "full model\n" r"$p_T$=0.162", dict(psigma=0.162)),
+    ("P0", "full", "full model\n" r"$p_T$=%s" % BEST_PT_LABEL, dict(psigma=BEST_PT)),
     ("P0", "exp", "experiment", {}),
 ]
 # (panel title, model/LI column, experimental term)

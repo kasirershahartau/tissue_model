@@ -11,12 +11,12 @@ apart, so touching HCs are the pattern's failures.
 TWO figures, split by model family the same way plot_hc_neighbors_bars is:
 
     li      lateral inhibition only against the experiment
-    full    the full model at pT = 0 and 0.162 against it
+    full    the full model at pT = 0 and the fitted pT against it
 
 Each holds BOTH pair types side by side — HC:HC left, HC:SC right, with a y axis
 each, because HC:HC sits below 2% and HC:SC near 45% and one scale would flatten
 HC:HC. Each panel holds both stages: one block per stage, the family's bars then
-the experiment inside it, colour carrying the stage. pT = 0.162 is hatched, since
+the experiment inside it, colour carrying the stage. The fitted pT is hatched, since
 it shares its stage's colour with pT = 0.
 
 WHICH EXPERIMENTAL TARGET. The two tables used to disagree — about 10% on HC:HC
@@ -53,19 +53,20 @@ import plot_neighbor_pairs as P
 from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_COLOUR, POINT_SIZE,
                                  STAT_COLOUR, ERROR_CAPSIZE, ERROR_LINEWIDTH,
                                  BAR_W, LI_DIR)
+from best_pt import BEST_PT, BEST_PT_LABEL
 
 STAGES = ("E17.5", "P0")
 STAGE_GAP = 0.8                  # bars inside a stage touch; the blocks do not
-# pT = 0.162 shares its stage's colour with pT = 0, so it is hatched to tell the
-# two apart without leaving the one-colour-per-stage palette
-HATCHED_PSIGMA = 0.162
+# the fitted pT shares its stage's colour with pT = 0, so it is hatched to tell
+# the two apart without leaving the one-colour-per-stage palette
+HATCHED_PSIGMA = BEST_PT
 HATCH = "/"
 # blank space, in bar widths, left at the right-hand end of every panel but the
 # last, so the next panel's y tick labels have somewhere to sit
 LABEL_ROOM = 1.9
 LI_WORKBOOK = "lateral_inhibition_tables.xlsx"
 def hatch_for(index):
-    """'/' for the pT = 0.162 full model, None otherwise."""
+    """'/' for the fitted-pT full model, None otherwise."""
     _stage, kind, _label, sel = P.SOURCES[index]
     if kind == "full" and np.isclose(float(sel["psigma"]), HATCHED_PSIGMA):
         return HATCH
@@ -294,7 +295,7 @@ def draw(rows, which, exp_source, rng, out_dir, scores=False, bare=False):
         handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="white",
                                      edgecolor="0.25", linewidth=1.6,
                                      hatch=HATCH * 3))
-        names.append(r"full model, $p_T$ = 0.162")
+        names.append(r"full model, $p_T$ = %s" % BEST_PT_LABEL)
     handles.append(plt.Line2D([], [], marker=".", linestyle="none",
                               color=POINT_COLOUR, alpha=0.8, markersize=9))
     names.append("one initial array"

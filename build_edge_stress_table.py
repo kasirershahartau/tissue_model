@@ -3,7 +3,7 @@
     python build_edge_stress_table.py --workers 4
     python build_edge_stress_table.py --limit 4          # quick check
 
-Every neighbour pair in the pT = 0 and pT = 0.162 runs, at two moments,
+Every neighbour pair in the pT = 0 and fitted-pT runs (best_pt.BEST_PT), at two moments,
 classified as HC:HC, HC:SC or SC:SC by the types of the two cells.
 
 THE TWO MOMENTS ARE NOT 0 AND 0. ``initial`` is the first recorded frame, t = 0.
@@ -56,8 +56,9 @@ from post_processing import RESULTS_DIR, load_history_file, get_time_points
 from build_experimental_tables import read_table, to_output_names, add_sheets
 from face_stress_over_time import _Shim, EFFECTOR_SETS
 from count_reverse_differentiation import TYPE_BY, THRESHOLD, T0_TOL
+from best_pt import BEST_PT
 
-PT = (0.0, 0.162)
+PT = (0.0, BEST_PT)
 CLASSES = ("HC:HC", "HC:SC", "SC:SC")
 # contractility only: that is the set run_model.stress_effectors gates on, so
 # the one pT is compared against. The all-effectors total is dominated by the
@@ -197,7 +198,7 @@ def main():
     if a.limit:
         sel = sel.head(a.limit)
     print("pT %s: %d run(s) on %d worker(s)"
-          % (", ".join("%.3f" % v for v in a.pT), len(sel), a.workers))
+          % (", ".join("%g" % v for v in a.pT), len(sel), a.workers))
 
     parts, failed = [], []
     todo = [(r["model_name"], r["t0"], a.threshold) for _i, r in sel.iterrows()]

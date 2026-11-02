@@ -39,8 +39,9 @@ import pandas as pd
 from post_processing import RESULTS_DIR
 from build_experimental_tables import add_sheets
 from face_stress_ps0_groups import GROUPS, COLOUR, base_name
+from best_pt import BEST_PT
 
-PSIGMAS = (0.0, 0.162)
+PSIGMAS = (0.0, BEST_PT)
 STAGES = ("E17.5", "P0")
 SHEET = "face_stress"
 PKL = "fullmodel_face_stress"
@@ -134,7 +135,7 @@ def main():
                             color=COLOUR[label], alpha=0.30, zorder=3)
             if ps > 0 and a.effectors == "contractility":
                 ax.axhline(ps, color="k", lw=1.4, ls="--", zorder=4,
-                           label=r"$p_T$ = %.3f (gate half-max)" % ps)
+                           label=r"$p_T$ = %g (gate half-max)" % ps)
             ax.set_ylim(lo - pad, hi + pad)
             # Which panel is which is left to the caption: no titles. The shared
             # scale means only the left column needs an axis.
