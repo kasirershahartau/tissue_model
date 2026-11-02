@@ -285,7 +285,14 @@ class TopologicalEventsHandler:
         20 divisions/time predicts 636, and a 13x slowdown with it.
         """
         self.time_to_division = interval if start is None else start
-        rng = np.random.default_rng() if rng is None else rng
+        # Derived from the GLOBAL numpy RNG, not from OS entropy. A bare
+        # default_rng() is seeded from the OS however the caller seeded numpy,
+        # so run(seed=...) would leave this one stream stochastic and the run
+        # irreproducible for no visible reason. Drawing the seed from the
+        # global stream ties it to run()'s seed, and leaves behaviour unchanged
+        # when nothing seeded the global.
+        rng = (np.random.default_rng(int(np.random.randint(0, 2 ** 32)))
+               if rng is None else rng)
 
         def random_division(sheet, manager):
             step = float(getattr(sheet, "settings", {}).get("dt", dt) or dt)

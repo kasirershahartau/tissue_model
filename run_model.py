@@ -454,7 +454,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         save_interval=None, stress_shift=0.0, notch_inhibition=False,
         l0_ratio=1.0, inherit_length_unit=True, random_area_stage=None,
         uniform_delta_level=None, division_area=1.2, division_rule="area",
-        division_interval=None, division_start=None):
+        division_interval=None, division_start=None, seed=None):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -900,6 +900,24 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             if not var_name.startswith("__") and not callable(var_value) and not isinstance(var_value, type(os)):
                 f.write(f"{var_name}: {repr(var_value)}\n")
 
+    # Seed AFTER the parameters dump, so the seed is recorded in the file, and
+    # BEFORE any model is built, so every draw the run makes is covered.
+    #
+    # One global seed is enough because every stochastic channel here goes
+    # through the GLOBAL numpy RNG: the per-cell prefered_area / contractility /
+    # area_elasticity draws that ``random_forces`` re-runs every wait_time
+    # units, and the uniform LI seeding in InnerEarModel. The one exception was
+    # the random-division rule, which built its own ``default_rng()`` from OS
+    # entropy; it now derives its seed from this stream (topological_events).
+    #
+    # WHY IT MATTERS. Without it a random array cannot be rebuilt. The arrays
+    # are not a resumable trajectory either -- random_forces keeps drawing
+    # throughout -- so there is no frame-0 record that could stand in, the way
+    # the LI seed arrays do for a full-model run. An array that is lost, or a
+    # division rule whose comparison one wants to repeat, is simply gone.
+    if seed is not None:
+        np.random.seed(int(seed) % (2 ** 32))
+
     # Enable debug logging IMMEDIATELY after the parameters dump
     # (so the dump above isn't polluted with the log-handler local)
     # but BEFORE any heavy work — that way every sheet build /
@@ -1175,7 +1193,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
 
 def _create_one_random_array(index, division_area=1.2, name=None,
                              division_rule="area", division_interval=None,
-                             division_start=None, t_end=25):
+                             division_start=None, t_end=25, seed=None):
     """Build the random array with the given integer ``index`` (independent
     unit of ``create_random_arrays``). Module-level and picklable for
     ``ProcessPoolExecutor`` — and so a single Azure Batch task can build
@@ -1196,6 +1214,7 @@ def _create_one_random_array(index, division_area=1.2, name=None,
                name=name or random_array_name(index),
                division_area=division_area, division_rule=division_rule,
                division_interval=division_interval, division_start=division_start,
+               seed=seed,
                random_forces=True, end_on_steady_state=False, t_end=t_end, dt=0.01, divisions=True,
                no_differentiation=True,
                # Nothing differentiates while an array is being built, so a flat
@@ -1269,10 +1288,33 @@ def random_array_variant_name(index, division_area=None, division_interval=None)
     return "%s_da%s" % (random_array_name(index), tag(division_area))
 
 
+#: Base seed for random-array generation. Every array's own seed is derived
+#: from this and its index, so the set is reproducible as a whole and each
+#: member is reproducible on its own -- rebuild array 7 alone and it is the
+#: same array 7, which matters because arrays are built one per Azure Batch
+#: task. Pass ``seed=None`` to create_random_arrays for the old unseeded
+#: behaviour; pass a different base for an independent set.
+DEFAULT_ARRAY_SEED = 20261102
+
+
+def array_seed(index, base=DEFAULT_ARRAY_SEED):
+    """The seed for random array ``index``, or None when ``base`` is None.
+
+    Through SeedSequence rather than ``base + index``: consecutive seeds give
+    MT19937 states that are fine in practice but correlated in principle, and
+    the arrays are meant to be ten INDEPENDENT samples of the same process.
+    """
+    if base is None:
+        return None
+    return int(np.random.SeedSequence([int(base), int(index)])
+               .generate_state(1)[0])
+
+
 def create_random_arrays(n=None, indices=None, n_workers=None,
                          division_area=1.2, names=None,
                          division_rule="area", division_interval=None,
-                         division_start=None, t_end=25):
+                         division_start=None, t_end=25,
+                         seed=DEFAULT_ARRAY_SEED):
     """Build random arrays by integer index. Pass ``indices`` (e.g. ``[7]`` for
     a single Batch task, or ``range(n)``) or a count ``n`` (shorthand for
     ``range(n)``). The arrays are independent, so they run in parallel across
@@ -1299,7 +1341,8 @@ def create_random_arrays(n=None, indices=None, n_workers=None,
              "division_rule": division_rule,
              "division_interval": division_interval,
              "division_start": division_start,
-             "t_end": t_end}
+             "t_end": t_end,
+             "seed": array_seed(i, seed)}
             for k, i in enumerate(indices)]
     if n_workers is None:
         n_workers = min(len(indices), os.cpu_count() or 1)
@@ -1308,7 +1351,12 @@ def create_random_arrays(n=None, indices=None, n_workers=None,
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             built = list(executor.map(_create_one_random_array_star, args))
     else:
-        built = [_create_one_random_array(*a) for a in args]
+        # **a, not *a: ``args`` holds dicts, and ``*`` unpacks a dict's KEYS,
+        # so the serial path used to pass the strings "index",
+        # "division_area", ... positionally. It only ever fired for
+        # n_workers=1 or a single index -- which is exactly the Azure Batch
+        # one-array-per-task case this function documents.
+        built = [_create_one_random_array(**a) for a in args]
     return built
 
 
