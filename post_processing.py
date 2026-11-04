@@ -2520,10 +2520,10 @@ if __name__ == "__main__":
     # for name in ["periodic_fromrandom_periodic_array%d_for_E17_gammaSC-0.01_gammaHC_ratio-10.00_alphaHC_ratio-1.00_psigma-0.00"% i for i in range (1,10)]:
     #     redraw(name,"movie", movie=True,
     #            color_by="delta")
-    names = ["fullmodel_v2_random_periodic_array2_for_P0"]
-    for name in names:
-        redraw(name,"delta", movie=True, maximal_number_of_frames_to_save=100,
-               color_by="delta", maximal_level=find_maximal_level_final_frame(name, "delta_level"))
+    name = "ablstrict_ps0.08556_array4_for_P0ablated_295"
+    maximal_delta = find_maximal_level_final_frame(name, "delta_level")
+    redraw(name,"delta", movie=True, maximal_number_of_frames_to_save=100,
+           color_by="delta", maximal_level=maximal_delta)
     # extract_fold_free_best_timepoints(corrupted_extracts=[("random_periodic_array6", "E17.5")])
     # compare_model_mechanics_to_experiments("fit_gSC1.63_gHC1.12_aHC2.00_ps0.00_eeca8ad8fd", "E17.5",
     #                                        type_by='delta_level', threshold=0.3350058877,
@@ -2535,5 +2535,5 @@ if __name__ == "__main__":
     #     res = load_experimental_results(stage, "lonely SC percentage")
     #     print(res)
     # plt.show()
-    fig, ax, tE17, tP0 = find_best_timepoint_according_to_n_neighbors("random_periodic_array98")
-    plt.show()
+    # fig, ax, tE17, tP0 = find_best_timepoint_according_to_n_neighbors("random_periodic_array98")
+    # plt.show()
