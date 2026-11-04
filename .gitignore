@@ -17,10 +17,17 @@ __pycache__/
 # (D:\kasirer\model_results by default), not in the tree; these patterns catch the
 # strays that land here. The tables are reproducible from the runs and are
 # submitted to the journal separately.
+#
+# *.json and *.svg joined the list for the same reason the others are here: the
+# scoring scripts write their caches (psigma_scores_*.json) relative to the
+# working directory, and the figures are saved as png AND svg, so a run from
+# the checkout leaves both in the tree. No json or svg has ever been tracked
+# here; if one ever needs to be, add it with ``git add -f``.
 *.hf5
 *.npy
 *.npz
 *.jsonl
+*.json
 *.csv
 *.xlsx
 *.ods
@@ -28,6 +35,7 @@ __pycache__/
 *.out
 *.err
 *.png
+*.svg
 *.gif
 results/
 

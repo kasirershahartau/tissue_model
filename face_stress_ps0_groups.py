@@ -74,16 +74,52 @@ def base_name(psigma):
             else "face_stress_ps%s" % pt_tag(psigma))
 
 
+def collapsed_runs():
+    """Names of runs flagged ``collapsed`` in the full-model table.
+
+    A collapsed run is one that ends with no hair cells at all. It is a
+    different outcome, not a noisy sample of this one -- the same exclusion
+    plot_hc_neighbors_bars and plot_isolated_sc_violin make.
+
+    It matters DOUBLY here, because of ``common_window``: a collapsed run dies
+    early (t ~ 3.4 at E17.5), and the window keeps only times where every array
+    still contributes, so ONE collapsed array truncates the whole stage. At
+    E17.5 pT = 0.08556 that cut the panel to t <= 3.50 of 100 sampled -- the
+    figure looked empty, with only the 0-neighbour group present, because
+    before t = 3.5 the tissue has barely begun to differentiate. pT = 0 has no
+    collapsed runs, which is why this stayed invisible until the gate was on.
+
+    Returns an empty set if the table is missing, so the builder still runs.
+    """
+    try:
+        from build_experimental_tables import read_table
+        t = read_table(os.path.join(RESULTS_DIR, "fullmodel_runs.pkl"))
+        return set(t.loc[t["collapsed"].astype(bool), "model_name"])
+    except Exception as exc:                                   # noqa: BLE001
+        print("  could not read the runs table (%s: %s); keeping every run"
+              % (type(exc).__name__, exc))
+        return set()
+
+
 def collect(stage, psigma, repeats, interval, type_by, threshold, workers):
     """Per-run group means: one row per (run, time, effector set, group)."""
-    tasks, meta = [], {}
+    bad = collapsed_runs()
+    tasks, meta, dropped = [], {}, []
     for rep in repeats:
         for i in range(N_ARRAYS):
             nm = run_name(stage, psigma, REPEAT_PREFIX[rep], i)
             if not os.path.isdir(os.path.join(RESULTS_DIR, nm)):
                 continue
+            if nm in bad:
+                dropped.append(nm)
+                continue
             tasks.append((nm, interval, type_by, threshold))
             meta[nm] = (rep, array_of(nm))
+    if dropped:
+        print("  %s: dropped %d collapsed run(s): %s"
+              % (stage, len(dropped),
+                 ", ".join(n.split("_random_periodic_")[-1] for n in dropped)),
+              flush=True)
     print("  %s: %d run(s) over repeats %s" % (stage, len(tasks), list(repeats)),
           flush=True)
     if workers > 1 and len(tasks) > 1:
