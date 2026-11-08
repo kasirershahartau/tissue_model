@@ -9,6 +9,14 @@
   3. supp_fig_neighbour_hist_<stage>.*      the ensemble's neighbour-count
                                             distribution beside the experiment
 
+EACH IS WRITTEN TWICE, labelled and BARE, as the other supplement scripts do.
+The bare figures go through ``plot_mechanical_fit_supplement.strip`` -- the same
+helper the mechanical-fit supplement uses, so "bare" means one thing in this
+project -- which leaves the data, the frame and the tick MARKS and takes every
+word off: no axis labels, no tick labels, no legend, no annotation, no grid.
+They are for setting the type by hand. The bare table is the four requested
+columns alone, without the identifier columns the labelled one carries.
+
 NOTHING IS RE-SCORED HERE. Every number comes out of the per-array
 ``z2_vs_time_mergedtails.npz`` traces that the selection itself wrote, read
 through the selection's own functions -- ``_z2_trace_path`` to find them and
@@ -54,9 +62,14 @@ from post_processing import (RESULTS_DIR, NEIGHBOR_BINS, _neighbor_trace_tag,
                              chosen_array_run_name, ensemble_neighbor_z2,
                              _STAGE_COLOUR, _SELECTED_COLOUR, _POINT_MS)
 from plot_neighbor_pairs import STYLE, STYLE_LABEL
+# the project's own definition of "bare", not a second one
+from plot_mechanical_fit_supplement import strip
 
 STAGES = ("E17.5", "P0")
 RANKS = range(10)
+# The array shown in figure 2, per stage. A fixed default rather than a random
+# draw, so re-running reproduces the manuscript's figure; --random redraws.
+FIGURE_ARRAYS = {"E17.5": 5, "P0": 5}
 SEED_FOLDER = "initial arrays seed data"
 STAR_MS = 20.0            # a star reads smaller than a disc of the same size
 # the greedy floor quoted in the caveat above, per stage: the best joint score
@@ -126,12 +139,19 @@ def build_table(results_dir=RESULTS_DIR):
 
 def write_table(rows, results_dir=RESULTS_DIR):
     # The four columns asked for come first; the rest identify the array, which
-    # a supplementary table needs if anyone is to find it again.
+    # a supplementary table needs if anyone is to find it again. The BARE table
+    # is those four alone.
     cols = ["rank", "stage", "n_cells", "score", "frame_time", "extract",
             "run", "pool_array"]
+    bare_cols = ["rank", "stage", "n_cells", "score"]
     path = os.path.join(results_dir, "supp_table_initial_arrays.csv")
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    bare_path = os.path.join(results_dir, "supp_table_initial_arrays_bare.csv")
+    with open(bare_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=bare_cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     print("\n  %-5s %-7s %7s %12s %10s  %s"
@@ -146,10 +166,12 @@ def write_table(rows, results_dir=RESULTS_DIR):
         print("  %-7s cells %d-%d (mean %.0f), score %.2f-%.2f"
               % (stage, min(c), max(c), np.mean(c), min(s), max(s)))
     print("\nwrote %s" % path)
+    print("wrote %s  (the four columns alone)" % bare_path)
     return path
 
 
-def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None):
+def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None,
+                      bare=False):
     """Score against simulation time, one array per stage on one axes."""
     fig, ax = plt.subplots(figsize=(8.0, 5.0))
     for stage in STAGES:
@@ -170,11 +192,17 @@ def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None):
         ax.set_yscale("log")
     ax.set_xlabel("simulation time")
     ax.set_ylabel(r"$\sum_k z_k^2$ against the experiment  (lower is better)")
-    ax.grid(alpha=0.25, which="both")
-    ax.legend(fontsize=9, loc="best")
+    if bare:
+        # strip() after the labels are set, so the labelled and bare figures
+        # differ in nothing but the words -- same axes, same limits, same
+        # curves, so one can be traced onto the other
+        strip(ax)
+    else:
+        ax.grid(alpha=0.25, which="both")
+        ax.legend(fontsize=9, loc="best")
     fig.subplots_adjust(left=0.105, right=0.98, top=0.97, bottom=0.11)
     stem = os.path.splitext(out or os.path.join(
-        results_dir, "supp_fig_score_vs_time"))[0]
+        results_dir, "supp_fig_score_vs_time"))[0] + ("_bare" if bare else "")
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)
         print("wrote %s.%s" % (stem, ext))
@@ -182,7 +210,8 @@ def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None):
     return stem
 
 
-def fig_neighbour_hist(stage, results_dir=RESULTS_DIR, out=None):
+def fig_neighbour_hist(stage, results_dir=RESULTS_DIR, out=None, bare=False,
+                       res=None):
     """The ensemble's neighbour-count distribution beside the experiment.
 
     Both sides are means of independent realisations -- ten arrays, three
@@ -190,8 +219,9 @@ def fig_neighbour_hist(stage, results_dir=RESULTS_DIR, out=None):
     stage-2 score uses. Computed by ``ensemble_neighbor_z2`` itself, so the
     bars and the annotated z^2 cannot disagree.
     """
-    runs = [chosen_array_run_name(r, stage) for r in RANKS]
-    res = ensemble_neighbor_z2(runs, stage, verbose=True)
+    if res is None:
+        runs = [chosen_array_run_name(r, stage) for r in RANKS]
+        res = ensemble_neighbor_z2(runs, stage, verbose=True)
     labels = res["labels"]
     x = np.arange(len(labels), dtype=float)
     w = 0.38
@@ -219,19 +249,23 @@ def fig_neighbour_hist(stage, results_dir=RESULTS_DIR, out=None):
     ax.set_xlabel("number of neighbours")
     ax.set_ylabel("cells  (%)")
     dof = len(labels) - 1
-    note = "overall $z^2$ = %.2f on %d dof" % (res["z2"], dof)
-    floor = GREEDY_FLOOR.get(stage)
-    if floor is not None:
-        note += "\n(selection floor $\\approx$ %.0f)" % floor
-    ax.annotate(note, xy=(0.98, 0.96), xycoords="axes fraction",
-                ha="right", va="top", fontsize=9.5)
-    ax.legend(fontsize=9, loc="upper left")
-    ax.grid(alpha=0.22, axis="y")
+    if bare:
+        strip(ax)
+    else:
+        note = "overall $z^2$ = %.2f on %d dof" % (res["z2"], dof)
+        floor = GREEDY_FLOOR.get(stage)
+        if floor is not None:
+            note += "\n(selection floor $\\approx$ %.0f)" % floor
+        ax.annotate(note, xy=(0.98, 0.96), xycoords="axes fraction",
+                    ha="right", va="top", fontsize=9.5)
+        ax.legend(fontsize=9, loc="upper left")
+        ax.grid(alpha=0.22, axis="y")
     fig.subplots_adjust(left=0.105, right=0.98, top=0.97, bottom=0.12)
 
     tag = "E17" if stage == "E17.5" else "P0"
-    stem = os.path.splitext(out or os.path.join(
+    stem = (os.path.splitext(out or os.path.join(
         results_dir, "supp_fig_neighbour_hist_%s" % tag))[0]
+        + ("_bare" if bare else ""))
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)
         print("wrote %s.%s" % (stem, ext))
@@ -243,12 +277,16 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--seed", type=int, default=20261108,
-                    help="picks the one array per stage shown in figure 2;"
-                         " recorded in the output so the choice is reproducible")
-    ap.add_argument("--arrays", type=int, nargs=2, default=None,
+    ap.add_argument("--arrays", type=int, nargs=2,
+                    default=[FIGURE_ARRAYS["E17.5"], FIGURE_ARRAYS["P0"]],
                     metavar=("E17_RANK", "P0_RANK"),
-                    help="show these ranks in figure 2 instead of random ones")
+                    help="the ranks shown in figure 2 (default: %d and %d)"
+                         % (FIGURE_ARRAYS["E17.5"], FIGURE_ARRAYS["P0"]))
+    ap.add_argument("--random", action="store_true",
+                    help="draw figure 2's two arrays at random instead, with"
+                         " --seed; the draw is printed so it is reproducible")
+    ap.add_argument("--seed", type=int, default=20261108,
+                    help="seed for --random")
     ap.add_argument("--linear-y", dest="linear_y", action="store_true",
                     help="linear y on figure 2; the default is log, because the"
                          " two stages' minima differ by a factor of ~50")
@@ -269,14 +307,14 @@ def main():
         print("  every row matches chosen_arrays.json (frame and score)")
 
     print("\n=== 2. score against time ===")
-    if a.arrays is not None:
-        chosen_ranks = dict(zip(STAGES, a.arrays))
-        print("  arrays given on the command line: %s" % chosen_ranks)
-    else:
+    if a.random:
         rng = np.random.default_rng(a.seed)
         chosen_ranks = {s: int(rng.integers(0, len(list(RANKS))))
                         for s in STAGES}
         print("  arrays drawn with seed %d: %s" % (a.seed, chosen_ranks))
+    else:
+        chosen_ranks = dict(zip(STAGES, a.arrays))
+        print("  arrays: %s" % chosen_ranks)
     picked = {s: (chosen_ranks[s], load_trace(chosen_ranks[s], s, a.results_dir))
               for s in STAGES}
     for s in STAGES:
@@ -287,11 +325,18 @@ def main():
               % (s, rank, tr["run"], tr["time"].size, tr["time"][0],
                  tr["time"][-1], tr["time"][k], tr["z2"][k],
                  int(tr["n_cells"][k])))
-    fig_score_vs_time(picked, log_y=not a.linear_y, results_dir=a.results_dir)
+    for bare in (False, True):
+        fig_score_vs_time(picked, log_y=not a.linear_y,
+                          results_dir=a.results_dir, bare=bare)
 
     print("\n=== 3. neighbour-count distributions ===")
     for stage in STAGES:
-        fig_neighbour_hist(stage, a.results_dir)
+        # scored once, drawn twice: the labelled and bare panels must show the
+        # same bars, not two independent calls that could diverge
+        runs = [chosen_array_run_name(r, stage) for r in RANKS]
+        res = ensemble_neighbor_z2(runs, stage, verbose=True)
+        for bare in (False, True):
+            fig_neighbour_hist(stage, a.results_dir, bare=bare, res=res)
     return 0
 
 
