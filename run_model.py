@@ -29,6 +29,22 @@ import hashlib
 import logging
 import os, shutil, sys
 from tyssue import HistoryHdf5
+# Force the non-interactive backend BEFORE pyplot is imported. The default here
+# is ``qtagg``, under which every figure gets a FigureManagerQT -- a QMainWindow
+# with a navigation toolbar (~10 QActions per figure) -- and Qt's C++ ownership,
+# together with matplotlib's strong-reference callbacks
+# (``cbook._StrongRef``), keeps the whole figure reachable after
+# ``plt.close()``. Each surviving figure holds its Axes, its LineCollection and
+# that collection's ~13,456 Path objects, one per sheet edge, so a run leaked
+# 1,427,796 Paths = 1.32 GB (102 draws: 100 gif frames plus two stills),
+# independent of t_end. Six workers then committed ~90 GB on a 32 GB box and
+# three batch builds wedged, completing 1 array/h instead of 16.
+#
+# Every other batch entry point in the tree already does this (full_model.py
+# and 20-odd plotting scripts); run_model was the one that did not, which is
+# why array BUILDING was what kept dying. Pair with the clf()+close() in run().
+import matplotlib
+matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel, ContractilityPerimeterElasticity, BoundaryBending
@@ -1115,7 +1131,35 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
                                                 color_by="atoh")
         fig1, ax1 = draw_func(inner.sheet)
-        plt.savefig(os.path.join(name, "initial.png"))
+        fig1.savefig(os.path.join(name, "initial.png"))
+        # CLEAR IT, then close it. ``plt.close`` only unregisters a figure from
+        # pyplot's global manager -- it does not dismantle it. Something else
+        # keeps these figures reachable: after one array ``plt.get_fignums()``
+        # is 0 while 102 Figures, 102 LineCollections, 13.5k MarkerStyles and
+        # 7.3k Line2Ds are still alive, and the count accumulates ACROSS
+        # arrays. Each surviving collection holds ~13,456 ``Path`` objects, one
+        # per sheet edge, so EVERY SHEET DRAW leaks ~14,000 Paths. An array
+        # draws 102 times (100 gif frames plus this still and the finale) and
+        # therefore leaks 1,427,796 Paths = 1.32 GB -- measured, and
+        # INDEPENDENT of t_end, which is how it was identified.
+        #
+        # That is what wedged three batch builds, including one where closing
+        # the figures (without clearing them) was wrongly believed to have
+        # fixed it. After ~12 arrays a worker held 15-16 GB of private commit,
+        # six workers committed ~90 GB on a 32 GB box, and the machine spent
+        # its time faulting pages off a spinning disk instead of simulating:
+        # workers alive at ~0 s CPU per 20 s sample, Modified Page List
+        # ~3.2 GB, Pages/sec ~1200, arrays completing at 1/h instead of 16/h.
+        # The solver's own stall guards cannot catch it -- they are checked at
+        # the top of the step loop, and a process starved by page faults is
+        # slow everywhere, including inside the single call it is stuck in.
+        #
+        # ``clf()`` detaches the axes and every artist on them, so a figure
+        # that is still referenced afterwards holds nothing of any size. The
+        # same pairing is applied to the finale still below and to every gif
+        # frame in history_io.create_gif_safe.
+        fig1.clf()
+        plt.close(fig1)
         # Pass the archive path so HistoryHdf5 writes each snapshot on the
         # fly; the partial file can be opened in another process while the
         # simulation is still running (useful for diagnosing hangs).
@@ -1155,7 +1199,9 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # utility for ad-hoc exports — nothing in the standard
         # run pipeline calls it any more.
         fig2, ax2 = draw_func(inner.sheet)
-        plt.savefig(os.path.join(name, "finale.png"))
+        fig2.savefig(os.path.join(name, "finale.png"))
+        fig2.clf()               # see the note on fig1 above
+        plt.close(fig2)
         inner.save_sheet_labels_to_numpy(inner.sheet, path=os.path.join(name, "labels.npy"))
         inner.save_contact_matrix_to_numpy(inner.sheet, path=os.path.join(name, "contact_matrix.npy"))
         inner.save_face_data_to_df(inner.sheet, path=os.path.join(name, "cell_info.pkl"))
@@ -1193,7 +1239,9 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
 
 def _create_one_random_array(index, division_area=1.2, name=None,
                              division_rule="area", division_interval=None,
-                             division_start=None, t_end=25, seed=None):
+                             division_start=None, t_end=25, seed=None,
+                             max_wall_seconds=None, min_progress_rate=None,
+                             progress_window_seconds=30.0):
     """Build the random array with the given integer ``index`` (independent
     unit of ``create_random_arrays``). Module-level and picklable for
     ``ProcessPoolExecutor`` — and so a single Azure Batch task can build
@@ -1202,7 +1250,16 @@ def _create_one_random_array(index, division_area=1.2, name=None,
     ``division_area`` is the area at which a cell divides; 1.2 built every
     array of the production set. ``name`` overrides the folder, which is what
     a variant built at a different ``division_area`` needs so it cannot be
-    mistaken for one of them (see :func:`random_array_variant_name`)."""
+    mistaken for one of them (see :func:`random_array_variant_name`).
+
+    ``max_wall_seconds`` / ``min_progress_rate`` are the solver's stall guards,
+    forwarded so a batch build gets the protection every other driver in the
+    tree already asks for (ablate_single_hc, ablate_from_strict,
+    find_mechanical_parameters). Without them a wedged array pins its worker
+    indefinitely: one batch of six sat 4.6 h with no solver step completing and
+    had to be killed by hand. Both guards save the history before raising, so a
+    stopped array still leaves a usable (truncated) trace rather than nothing,
+    and the per-array caller records it as a failure and carries on."""
     print("Running random array %d (%s)"
           % (index, "division_area=%g" % division_area if division_rule == "area"
              else "random division every %g" % division_interval))
@@ -1215,6 +1272,9 @@ def _create_one_random_array(index, division_area=1.2, name=None,
                division_area=division_area, division_rule=division_rule,
                division_interval=division_interval, division_start=division_start,
                seed=seed,
+               max_wall_seconds=max_wall_seconds,
+               min_progress_rate=min_progress_rate,
+               progress_window_seconds=progress_window_seconds,
                random_forces=True, end_on_steady_state=False, t_end=t_end, dt=0.01, divisions=True,
                no_differentiation=True,
                # Nothing differentiates while an array is being built, so a flat
@@ -1314,7 +1374,9 @@ def create_random_arrays(n=None, indices=None, n_workers=None,
                          division_area=1.2, names=None,
                          division_rule="area", division_interval=None,
                          division_start=None, t_end=25,
-                         seed=DEFAULT_ARRAY_SEED):
+                         seed=DEFAULT_ARRAY_SEED,
+                         max_wall_seconds=None, min_progress_rate=None,
+                         progress_window_seconds=30.0):
     """Build random arrays by integer index. Pass ``indices`` (e.g. ``[7]`` for
     a single Batch task, or ``range(n)``) or a count ``n`` (shorthand for
     ``range(n)``). The arrays are independent, so they run in parallel across
@@ -1342,7 +1404,10 @@ def create_random_arrays(n=None, indices=None, n_workers=None,
              "division_interval": division_interval,
              "division_start": division_start,
              "t_end": t_end,
-             "seed": array_seed(i, seed)}
+             "seed": array_seed(i, seed),
+             "max_wall_seconds": max_wall_seconds,
+             "min_progress_rate": min_progress_rate,
+             "progress_window_seconds": progress_window_seconds}
             for k, i in enumerate(indices)]
     if n_workers is None:
         n_workers = min(len(indices), os.cpu_count() or 1)

@@ -185,6 +185,15 @@ def create_gif_safe(history, output, num_frames=None, interval=None,
             annotate_time(ax, t)
             path = os.path.join(graph_dir, "movie_%04d.png" % i)
             fig.savefig(path)
+            # ``clf()`` before ``close()``: closing only unregisters the figure
+            # from pyplot's manager, and these figures stay reachable through
+            # something else, so without clearing them each frame's
+            # LineCollection -- and its ~13,456 Path objects, one per sheet
+            # edge -- survives for the life of the process. A 100-frame gif
+            # leaked ~1.4 million Paths (1.3 GB) per array and wedged three
+            # batch builds; see the long note in run_model.run beside
+            # initial.png.
+            fig.clf()
             plt.close(fig)
             frames.append(path)
 
