@@ -92,9 +92,12 @@ def stage_of(name):
 
 
 def array_of(name):
-    import re
-    m = re.search(r"random_periodic_array(\d+)_for_", name)
-    return int(m.group(1)) if m else np.nan
+    # Parsed by the resolver's own regex, not a copy of it: the folder name has
+    # changed once already, and a private pattern here just stopped matching
+    # instead of failing.
+    from post_processing import parse_initial_morphology_name
+    hit = parse_initial_morphology_name(name)
+    return hit[0] if hit else np.nan
 
 
 _TARGETS = {}

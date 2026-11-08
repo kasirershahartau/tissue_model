@@ -1816,11 +1816,13 @@ if __name__ == "__main__":
     STAGE = "E17.5"                       # "E17.5" or "P0"
     _CFG = {
         # x0 order = the fitted params: gammaSC, alphaHC_ratio, hc_p0, sc_p0
-        "E17.5": dict(suffix="E17", x0=[0.05, 1.03, 1.20, 1.26]),
-        "P0":    dict(suffix="P0",  x0=[0.10, 1.04, 1.28, 1.32]),
+        "E17.5": dict(x0=[0.05, 1.03, 1.20, 1.26]),
+        "P0":    dict(x0=[0.10, 1.04, 1.28, 1.32]),
     }[STAGE]
-    initial_sheets = ["random_periodic_array%d_for_%s" % (i, _CFG["suffix"])
-                      for i in range(10)]
+    # Imported here rather than at module scope: post_processing is a heavy
+    # module and nothing else in run_model needs it.
+    from post_processing import initial_morphology_name
+    initial_sheets = [initial_morphology_name(i, STAGE) for i in range(10)]
     # ---- TYPE-DEPENDENT SHAPE INDEX parameterisation -----------------------
     # Still exactly 4 fitted parameters (one per comparison term), but the
     # type-dependence moved from gamma to the shape index:

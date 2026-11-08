@@ -368,7 +368,10 @@ def _check_environment():
               "           export TISSUE_RESULTS_DIR=$HOME/results"
               % RESULTS_DIR, file=sys.stderr)
     else:
-        n = len(glob.glob(os.path.join(RESULTS_DIR, "random_periodic_array*")))
+        # the EXTRACTS, which is what a run loads -- not the raw generation
+        # runs, which live in the random_array_*/random_periodic_array*
+        # namespaces and are not what this count is reporting
+        n = len(glob.glob(os.path.join(RESULTS_DIR, "initial_array_*_for_*")))
         print("results dir: %s (%d initial-array folders)" % (RESULTS_DIR, n))
 
 
@@ -383,9 +386,9 @@ def _cmd_find_mech(args):
     from run_model import find_mechanical_parameters
     initial_sheets = args.initial_sheets
     if initial_sheets is None and args.indices is None:
-        # mirror run_model.__main__: random_periodic_array{i}_for_{E17|P0}
-        suffix = "E17" if args.stage == "E17.5" else "P0"
-        initial_sheets = ["random_periodic_array%d_for_%s" % (i, suffix)
+        # mirror run_model.__main__: the stage's chosen initial arrays, by rank
+        from post_processing import initial_morphology_name
+        initial_sheets = [initial_morphology_name(i, args.stage)
                           for i in range(args.n_sheets)]
     # The per-type shape index is the DEFAULT parameterisation, but supplying a
     # single --shape-index-bounds means the caller is reverting to the historical
@@ -558,7 +561,7 @@ def build_parser():
     fm = sub.add_parser("find-mech", help="find_mechanical_parameters (Bayesian opt)")
     fm.add_argument("--stage", required=True, choices=["E17.5", "P0"])
     fm.add_argument("--initial-sheets", dest="initial_sheets", nargs="+", default=None,
-                    help="explicit initial-sheet names (default: random_periodic_array{i}_for_<E17|P0>)")
+                    help="explicit initial-sheet names (default: initial_array_{i}_for_<E17|P0>)")
     fm.add_argument("--indices", type=int, nargs="+", default=None,
                     help="array indices for the initial sheets (default: range(--n-sheets))")
     fm.add_argument("--n-sheets", dest="n_sheets", type=int, default=10)

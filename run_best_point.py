@@ -36,8 +36,8 @@ SAVE_INTERVAL = 0.01                      # dense; see the size warning above
 
 
 def one(index):
-    suffix = "E17" if STAGE == "E17.5" else "P0"
-    initial = "random_periodic_array%d_for_%s" % (index, suffix)
+    from post_processing import initial_morphology_name
+    initial = initial_morphology_name(index, STAGE)
     li = rm._li_levels_kwargs_for_initial_sheet(initial)
     threshold = float(rm._load_saved_threshold(initial))
     common = dict(shape_index=0.0, hc_shape_index=HC_SHAPE_INDEX,

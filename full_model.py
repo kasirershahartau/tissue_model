@@ -32,7 +32,7 @@ from run_model import (run, _run_full_model_one, _initialize_one_differentiated_
                        _score_cache_key, _history_fingerprint,
                        _load_score_cache, _store_score_cache,
                        _reached_steady_state)
-from post_processing import (initial_morphology_name, random_array_name,
+from post_processing import (initial_morphology_name,
                              compare_full_model_differentiation_to_experiments)
 
 

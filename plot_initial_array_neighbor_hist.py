@@ -56,10 +56,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from post_processing import (RESULTS_DIR, _nsigma_and_chi2,
-                             load_experimental_results)
+                             load_experimental_results,
+                             initial_morphology_name)
 from run_model import load_sheet_from_file
 from ablate_single_hc import BOX
-from plot_initial_array_neighbors import (STAGES, SUFFIX, ARRAYS, EXPERIMENTS,
+from plot_initial_array_neighbors import (STAGES, ARRAYS, EXPERIMENTS,
                                           experimental_mean_neighbours)
 from plot_array_selection_score import BUCKETS, bucket_shares
 from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_COLOUR, POINT_SIZE,
@@ -237,7 +238,7 @@ def main():
                          " included — the population the original selection"
                          " and its p values used")
     ap.add_argument("--results-dir", dest="results_dir", default=RESULTS_DIR,
-                    help="where the random_periodic_array<n>_for_<stage>"
+                    help="where the initial_array_<n>_for_<stage>"
                          " folders live (default %(default)s)")
     ap.add_argument("--out-dir", default=None,
                     help="where to write the figures (default: --results-dir)")
@@ -258,7 +259,7 @@ def main():
                  float(np.mean([c.mean() for c in exp_cells]))))
         print("  %-7s %7s %10s %12s" % ("array", "cells", "chi^2", "p"))
         for k in a.arrays:
-            folder = "random_periodic_array%d_for_%s" % (k, SUFFIX[stage])
+            folder = initial_morphology_name(k, stage)
             if not os.path.isdir(os.path.join(a.results_dir, folder)):
                 # NOT silent: an empty table with no explanation is what a
                 # bare `continue` here used to produce
@@ -279,8 +280,7 @@ def main():
                   % (len(missing), a.results_dir, ", ".join(missing)))
             missing = []
         if not panels:
-            want = ["random_periodic_array%d_for_%s" % (k, SUFFIX[stage])
-                    for k in a.arrays]
+            want = [initial_morphology_name(k, stage) for k in a.arrays]
             raise SystemExit(
                 "no initial-array folder found for %s under\n    %s\n"
                 "  looked for: %s%s\n"

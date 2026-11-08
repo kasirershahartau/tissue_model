@@ -118,7 +118,7 @@ def collect(stage, psigma, repeats, interval, type_by, threshold, workers):
     if dropped:
         print("  %s: dropped %d collapsed run(s): %s"
               % (stage, len(dropped),
-                 ", ".join(n.split("_random_periodic_")[-1] for n in dropped)),
+                 ", ".join(n.split("_initial_")[-1] for n in dropped)),
               flush=True)
     print("  %s: %d run(s) over repeats %s" % (stage, len(tasks), list(repeats)),
           flush=True)

@@ -34,12 +34,20 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 from post_processing import (RESULTS_DIR, initial_morphology_name,
+                             INITIAL_MORPHOLOGY_PATTERN,
                              compare_full_model_differentiation_to_experiments)
 from run_model import _psigma_tag
 from full_model import REPEAT_PREFIX, DEFAULT_OBJECTIVE_TERMS
 
 STAGES = ("E17.5", "P0")
 DEFAULT_THRESHOLD = 0.355079
+
+# An untagged pT = 0 baseline folder: "fullmodel_v2[r<n>]_<initial array>".
+# Built from the resolver's own pattern so it cannot go stale the way the
+# previous hand-written copy of the array name did -- that one simply stopped
+# matching when the arrays were renamed, which made discover_psigma quietly
+# report no baseline rather than fail.
+_BASELINE_RE = re.compile(r"^fullmodel_v2(r\d+)?_" + INITIAL_MORPHOLOGY_PATTERN)
 
 
 def run_name(stage, psigma, prefix, i, stress_shift=0.0):
@@ -59,8 +67,7 @@ def discover_psigma(stress_shift=0.0):
         m = pat.search(name)
         if m:
             found.add(round(float(m.group(1)), 5))
-        elif re.match(r"^fullmodel_v2(r\d+)?_random_periodic_array\d+_for_",
-                      name):
+        elif _BASELINE_RE.match(name):
             found.add(0.0)
     return sorted(found)
 

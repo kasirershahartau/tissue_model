@@ -387,14 +387,29 @@ python azure_run.py find-psigma \
 ```
 
 The intermediate **initial-morphology fitting** step (matching number-of-neighbors
-per cell, which produces the `*_for_E17` / `*_for_P0` folders) lives in
-`post_processing.py` and has no CLI subcommand; run it inline:
+per cell, which produces the `initial_array_<rank>_for_E17` /
+`initial_array_<rank>_for_P0` folders) lives in `post_processing.py` and has no
+CLI subcommand.
+
+It is a **selection across a pool**, not a per-array step: every array is
+scored against the experimental neighbour-number distribution over its whole
+trace by `find_best_timepoint_according_to_n_neighbors`, which writes that
+array's `z2_vs_time_mergedtails.npz` trace next to the run, and the best ten
+arrays per stage are then kept and renumbered 0–9 in score order. The rank is
+what names the extract, so it only exists once the whole pool has been compared
+— which is why `store_best_time_point_for_random_arrays` requires a
+`ranks={run_name: rank}` mapping and will not guess a folder name:
 
 ```bash
 python -c "import post_processing as pp; \
 pp.find_best_timepoint_for_random_arrays(indices=range(10)); \
-pp.store_best_time_point_for_random_arrays()"
+pp.store_best_time_point_for_random_arrays(ranks={pp.random_array_name(i): i for i in range(10)})"
 ```
+
+That command treats the ten arrays as already ranked by index, which is only
+right if ten is all there are. The 468-array pool behind the current twenty was
+selected by a separate driver; `initial arrays seed data/chosen_arrays.json`
+records the resulting rank → pool-array mapping and every array's score.
 
 Both steps use the production binning scheme, `post_processing.NEIGHBOR_BINS`
 (merged tails: `<=4, 5, 6, 7, >=8`), and talk to each other through that
@@ -410,7 +425,8 @@ can coexist without either reading the other's frames.
 ```
 1. random-arrays                      # generate raw random arrays
 2. find_best_timepoint_for_random_arrays + store_best_time_point_for_random_arrays
-                                       # fit initial MORPHOLOGY -> *_for_E17 / *_for_P0
+                                       # score every array, keep the best ten
+                                       # per stage -> initial_array_<rank>_for_*
 3. find-mech  --stage E17.5            # fit MECHANICS per stage
    find-mech  --stage P0
 4. find-psigma --mechanical-params ... # fit the single SHARED psigma
@@ -691,8 +707,8 @@ From your local machine:
 rem The 20 fitted initial morphologies the runs start from (0.2 GB).
 rem cmd does NOT expand wildcards for scp, so loop over the folders. At the
 rem prompt this is %d; inside a .bat file it must be %%d.
-for /d %d in (D:\Kasirer\results\random_periodic_array*_for_E17) do scp -r "%d" azureuser@%IP%:/data/results/
-for /d %d in (D:\Kasirer\results\random_periodic_array*_for_P0) do scp -r "%d" azureuser@%IP%:/data/results/
+for /d %d in (D:\Kasirer\model_results\initial_array_*_for_E17) do scp -r "%d" azureuser@%IP%:/data/results/
+for /d %d in (D:\Kasirer\model_results\initial_array_*_for_P0) do scp -r "%d" azureuser@%IP%:/data/results/
 
 rem the experimental measurements the scoring compares against (0.9 GB)
 scp -r "C:\Users\Kasirer\Phd\mouse_ear_project\papers\Dynamic lateral inhibition in the utricle\Experimental Data" azureuser@%IP%:~/experimental
@@ -732,8 +748,8 @@ python -m pytest test_periodic.py -k "FindPsigma or EdgeTension" -q
 #     initial sheet from TISSUE_RESULTS_DIR too; the links are read-only here,
 #     and `rm -rf /data/smoke` later removes the links, not the extracts.
 mkdir -p /data/smoke
-ln -s /data/results/random_periodic_array0_for_E17 /data/smoke/
-ln -s /data/results/random_periodic_array0_for_P0  /data/smoke/
+ln -s /data/results/initial_array_0_for_E17 /data/smoke/
+ln -s /data/results/initial_array_0_for_P0  /data/smoke/
 
 TISSUE_RESULTS_DIR=/data/smoke python azure_run.py find-psigma \
   --mechanical-params '{"E17.5":{"gamma_sc":0.0105,"R_gamma":6.746124660721616,"R_alpha":3.5,"A0":0.741812389049632},"P0":{"gamma_sc":0.0105,"R_gamma":3.850521945713907,"R_alpha":1.757,"A0":0.7585423232230211}}' \

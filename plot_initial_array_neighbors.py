@@ -35,7 +35,8 @@ import numpy as np
 import pandas as pd
 
 from post_processing import (RESULTS_DIR, experimental_results_folder,
-                             experimental_cell_mask, _nsigma_and_chi2)
+                             experimental_cell_mask, _nsigma_and_chi2,
+                             initial_morphology_name)
 from run_model import load_sheet_from_file
 from ablate_single_hc import BOX
 from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_SIZE, POINT_COLOUR,
@@ -44,8 +45,7 @@ from plot_neighbor_pairs import (STYLE, STYLE_LABEL, POINT_SIZE, POINT_COLOUR,
                                  _x)
 
 STAGES = ("E17.5", "P0")
-SUFFIX = {"E17.5": "E17", "P0": "P0"}       # the folder name's stage tag
-ARRAYS = range(10)                          # random_periodic_array0..9
+ARRAYS = range(10)                          # ranks 0-9 of the chosen arrays
 EXPERIMENTS = (1, 2, 3)                     # ..._experiment<N>_..._frame_1
 
 
@@ -86,7 +86,7 @@ def gather(arrays=ARRAYS, results_dir=RESULTS_DIR):
     for i, stage in enumerate(STAGES):
         model, missing = [], []
         for k in arrays:
-            folder = "random_periodic_array%d_for_%s" % (k, SUFFIX[stage])
+            folder = initial_morphology_name(k, stage)
             if not os.path.isdir(os.path.join(results_dir, folder)):
                 missing.append(folder)
                 continue
@@ -118,7 +118,7 @@ def per_array(stage, arrays=ARRAYS, results_dir=RESULTS_DIR):
     exp_vals = [experimental_mean_neighbours(stage, e)[0] for e in EXPERIMENTS]
     rows = []
     for k in arrays:
-        folder = "random_periodic_array%d_for_%s" % (k, SUFFIX[stage])
+        folder = initial_morphology_name(k, stage)
         if not os.path.isdir(os.path.join(results_dir, folder)):
             continue
         m, per_cell = model_mean_neighbours(folder, results_dir)

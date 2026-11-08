@@ -90,11 +90,12 @@ def experimental_initial_target(stage):
 
 def calib_name(stage, i, psigma=0.0, stress_shift=-0.080):
     """psigma=0 keeps the original (untagged) name so the first runs are reused."""
-    suffix = "E17" if stage == "E17.5" else "P0"
+    from post_processing import initial_morphology_name
+    init = initial_morphology_name(i, stage)
     if float(psigma) == 0.0:
-        return "notchinhib_random_periodic_array%d_for_%s" % (i, suffix)
-    return "notchinhib_ps%s_ks%.3f_random_periodic_array%d_for_%s" % (
-        _psigma_tag(float(psigma)), stress_shift, i, suffix)
+        return "notchinhib_%s" % init
+    return "notchinhib_ps%s_ks%.3f_%s" % (
+        _psigma_tag(float(psigma)), stress_shift, init)
 
 
 def hc_fraction_curve(name):

@@ -33,7 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from post_processing import RESULTS_DIR
+from post_processing import RESULTS_DIR, initial_morphology_name
 from run_model import load_sheet_from_file
 from inner_ear_model import InnerEarModel
 from history_io import annotate_time
@@ -51,7 +51,9 @@ def parse(path):
         return None
     d = m.groupdict()
     d["path"] = path
-    d["initial_array"] = "random_periodic_array%s_for_%s" % (d["array"], d["stage"])
+    # d["stage"] is the bare "E17" / "P0" the LI file names carry, which
+    # initial_morphology_name accepts; d["array"] is the array's RANK.
+    d["initial_array"] = initial_morphology_name(int(d["array"]), d["stage"])
     return d
 
 

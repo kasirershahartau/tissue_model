@@ -48,8 +48,8 @@ def main():
     hc = a.hc if a.hc is not None else d["hc"]
     sc = a.sc if a.sc is not None else d["sc"]
 
-    suffix = "E17" if a.stage == "E17.5" else "P0"
-    sheets = ["random_periodic_array%d_for_%s" % (i, suffix) for i in range(a.n_sheets)]
+    from post_processing import initial_morphology_name
+    sheets = [initial_morphology_name(i, a.stage) for i in range(a.n_sheets)]
     print("scoring %s | gammaSC=%.4f alphaHC=%.4f hc_p0=%.4f sc_p0=%.4f | A0=%.4f"
           % (a.stage, gammaSC, alphaHC, hc, sc, PREFERRED_AREA), flush=True)
 

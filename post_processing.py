@@ -116,6 +116,14 @@ percentage_of_differentiating_cells_file_name = r"percentage_of_differentiating_
 # lets a single Azure Batch task address one array by its index.
 _STAGE_SHEET_SUFFIX = {"E17.5": "_for_E17", "P0": "_for_P0"}
 
+# A stage is spelled two ways in this project: "E17.5" in code and on plots,
+# and the bare "E17" that goes into folder names and that the per-array
+# lateral-inhibition records use as their ``dev_stage``. Both are accepted
+# wherever a stage is taken, so a caller holding either one does not have to
+# convert, and the folder-name resolvers below cannot be handed "E17" and
+# silently build a folder nobody writes.
+_STAGE_ALIASES = {"E17.5": "E17.5", "E17": "E17.5", "P0": "P0"}
+
 
 
 
@@ -142,7 +150,7 @@ def save_li_levels_from_best_pval_jsonl(jsonl_path, results_dir=RESULTS_DIR,
         repressor_levels.npy  <- R_final
         threshold.npy         <- D_threshold_mean   (when write_threshold)
 
-    are written into ``<results_dir>/random_periodic_array{k}_for_{s}/`` — the
+    are written into ``<results_dir>/initial_array{k}_for_{s}/`` — the
     same folder that holds that model's ``history.hf5`` — so that ``run`` /
     ``find_mechanical_parameters`` pick them up automatically. ``threshold.npy``
     is a 0-d float array; ``find_mechanical_parameters(use_saved_threshold=True)``
@@ -168,14 +176,19 @@ def _save_li_levels_records(records, results_dir=RESULTS_DIR, overwrite=True,
     field names: ``array_index``, ``dev_stage``, ``N_final`` / ``D_final`` /
     ``R_final`` (per cell, entry ``i`` -> cell with ``unique_id == i``) and an
     optional ``D_threshold_mean``. Writes the four sidecar files into each
-    ``<results_dir>/random_periodic_array{array_index}_for_{dev_stage}/`` folder
-    (see :func:`save_li_levels_from_best_pval_jsonl`). Returns folders written."""
+    record's :func:`initial_morphology_name` folder (see
+    :func:`save_li_levels_from_best_pval_jsonl`). Returns folders written.
+
+    ``array_index`` is therefore a RANK, 0-9 within the record's stage, matching
+    the twenty chosen arrays -- not a pool index and not an index into any
+    earlier set of arrays. ``dev_stage`` arrives as the bare ``"E17"`` / ``"P0"``
+    these records have always used, which the resolver accepts."""
     written = []
     for rec in records:
         array_index = rec["array_index"]
         dev_stage = rec["dev_stage"]
-        folder = os.path.join(
-            results_dir, "%s_for_%s" % (random_array_name(array_index), dev_stage))
+        folder = os.path.join(results_dir,
+                              initial_morphology_name(array_index, dev_stage))
         if not os.path.isdir(folder):
             print("  [skip] %s: folder does not exist" % folder)
             continue
@@ -249,6 +262,44 @@ def save_li_levels_from_best_row_json(json_path, results_dir=RESULTS_DIR,
                                    overwrite=overwrite, write_threshold=write_threshold)
 
 
+def canonical_stage(stage):
+    """``"E17"`` or ``"E17.5"`` -> ``"E17.5"``; ``"P0"`` -> ``"P0"``.
+
+    Lets every function that takes a stage accept either spelling. Raises on
+    anything else rather than returning None, because the callers use the
+    result to build a folder name and a silent None would become a folder that
+    does not exist, found only when something fails to load much later.
+    """
+    try:
+        return _STAGE_ALIASES[stage]
+    except KeyError:
+        raise ValueError("unknown stage %r; expected one of %s"
+                         % (stage, sorted(_STAGE_ALIASES))) from None
+
+
+# One regex for the initial-array folder name, so the places that PARSE a run
+# name (build_run_table.array_of, rescore_psigma.discover_psigma) cannot drift
+# from initial_morphology_name, which BUILDS it. They did drift once: the name
+# changed and their patterns, which matched on the old one, silently stopped
+# finding anything instead of failing.
+INITIAL_MORPHOLOGY_PATTERN = r"initial_array_(\d+)_for_(E17|P0)"
+_INITIAL_MORPHOLOGY_RE = re.compile(INITIAL_MORPHOLOGY_PATTERN)
+
+
+def parse_initial_morphology_name(name):
+    """``(rank, stage)`` of the initial array embedded in ``name``, or ``None``.
+
+    The inverse of :func:`initial_morphology_name`, and it also works on a run
+    name that merely CONTAINS one (``fullmodel_v2r2_initial_array_3_for_P0``
+    -> ``(3, "P0")``), which is how run folders are named. ``stage`` comes back
+    canonical, so ``_for_E17`` yields ``"E17.5"``.
+    """
+    m = _INITIAL_MORPHOLOGY_RE.search(name)
+    if m is None:
+        return None
+    return int(m.group(1)), canonical_stage(m.group(2))
+
+
 def initial_morphology_name(index, stage):
     """Folder name of the fitted initial-morphology array: the array chosen for
     ``stage`` at rank ``index`` (0-9), snapped to its best-matching time point
@@ -270,8 +321,12 @@ def initial_morphology_name(index, stage):
 
     This is ONE FRAME. The whole array-generation run that frame was taken from
     is kept too, under ``chosen_array_run_name(index, stage)``.
+
+    ``stage`` may be spelled either way (see :func:`canonical_stage`), and
+    :func:`parse_initial_morphology_name` takes the result back apart.
     """
-    return "initial_array_%d%s" % (index, _STAGE_SHEET_SUFFIX[stage])
+    return "initial_array_%d%s" % (index,
+                                   _STAGE_SHEET_SUFFIX[canonical_stage(stage)])
 
 
 def chosen_array_run_name(index, stage):
@@ -294,8 +349,8 @@ def chosen_array_run_name(index, stage):
     (``run_folder`` / ``pool_folder``) and in that folder's ``arrays.csv``
     (``kept_as``).
     """
-    return "random_array_%d_%s" % (index,
-                                   _STAGE_SHEET_SUFFIX[stage][len("_for_"):])
+    suffix = _STAGE_SHEET_SUFFIX[canonical_stage(stage)]
+    return "random_array_%d_%s" % (index, suffix[len("_for_"):])
 
 
 
@@ -1754,10 +1809,9 @@ def full_model_run_names(experimental_stage, indices=None, n_arrays=10,
     (perimeter elasticity, bending, A0=0.4657) and the v2 runs (contractility,
     no bending, self-consistent A0) would otherwise share names. v2 runs are
     written under ``fullmodel_v2`` — see run_fitted_full_model.py."""
-    prefix = "E17" if experimental_stage == "E17.5" else "P0"
     if indices is None:
         indices = range(n_arrays)
-    return ["%s_random_periodic_array%d_for_%s" % (run_prefix, i, prefix)
+    return ["%s_%s" % (run_prefix, initial_morphology_name(i, experimental_stage))
             for i in indices]
 
 
@@ -1923,10 +1977,22 @@ def find_best_timepoint_for_random_arrays(model_names=None, indices=None,
         with open(out_file, "a") as f:
             f.write("Best time point for " + model_name + " E17.5: %f, P0: %f\n" % (bestE17, bestP0))
 
-def store_best_time_point_for_random_arrays(only_for=None, bins=None):
-    # ``only_for`` may be a model name or an integer array index. ``bins``
-    # selects which scheme's chosen frames are stored; the default is the
-    # production one, so this reads pval_results_mergedtails.txt.
+def store_best_time_point_for_random_arrays(only_for=None, bins=None, ranks=None):
+    """Write each recorded best time point out as an extract folder.
+
+    ``only_for`` may be a model name or an integer array index. ``bins``
+    selects which scheme's chosen frames are stored; the default is the
+    production one, so this reads pval_results_mergedtails.txt.
+
+    ``ranks`` maps generation-run name -> the 0-9 RANK that array holds within
+    its stage, and it is REQUIRED for every array processed. The extract's name
+    is no longer derived from the run's: the arrays are chosen from a large pool
+    by comparing them against each other, so a run name carries no rank, and
+    this function used to build ``<run>_for_<stage>`` -- a folder that nothing
+    resolves to any more. Selecting and extracting a whole pool is the selection
+    script's job, since that is what assigns the ranks; this function is for
+    re-storing a frame for an array whose rank is already known.
+    """
     if isinstance(only_for, int):
         only_for = random_array_name(only_for)
     time_point_file = best_time_point_file(bins)
@@ -1951,8 +2017,14 @@ def store_best_time_point_for_random_arrays(only_for=None, bins=None):
     for model_name, E17_time, P0_time in zip(model_names, E17_times, P0_times):
         if only_for is None or only_for == model_name:
             history = load_history_file(model_name)
+            if not ranks or model_name not in ranks:
+                raise ValueError(
+                    "no rank for %r: pass ranks={run_name: rank} so each "
+                    "extract can be named initial_array_<rank>_for_<stage>. "
+                    "The extract name is no longer derived from the run name."
+                    % model_name)
             for stage, time_point in (("E17.5", E17_time), ("P0", P0_time)):
-                output_name = model_name + _STAGE_SHEET_SUFFIX[stage]
+                output_name = initial_morphology_name(ranks[model_name], stage)
                 save_data_of_a_given_time_point(history, time_point, output_name)
                 # A self-intersecting extract is unusable as an initial
                 # condition -- it is what CORRUPTED_EXTRACTS records and what
@@ -1973,17 +2045,17 @@ def store_best_time_point_for_random_arrays(only_for=None, bins=None):
     return 0
 
 
-# Arrays whose stored best-matching frame is self-intersecting (folded). The
-# E17.5 extracts of arrays 2/7/8 are already fold-free, so only their P0 frame
-# needs replacing.
-CORRUPTED_EXTRACTS = [
-    ("random_periodic_array1", "E17.5"), ("random_periodic_array1", "P0"),
-    ("random_periodic_array2", "P0"),
-    ("random_periodic_array3", "E17.5"), ("random_periodic_array3", "P0"),
-    ("random_periodic_array5", "E17.5"), ("random_periodic_array5", "P0"),
-    ("random_periodic_array7", "P0"),
-    ("random_periodic_array8", "P0"),
-]
+# Arrays whose stored best-matching frame is self-intersecting (folded), as
+# (rank, stage) pairs for extract_fold_free_best_timepoints.
+#
+# EMPTY, and that is the current state rather than an oversight: the nine
+# entries here named arrays of the ten-array set this project used before the
+# initial arrays were chosen from a 468-array pool. Those runs and their
+# extracts are gone, so the list could only have made the default call fail.
+# Every one of the twenty arrays now in use was checked when its frame was
+# extracted and all twenty are fold-free, so there is nothing to re-extract.
+# Add pairs here if a future selection turns one up.
+CORRUPTED_EXTRACTS = []
 
 
 def _count_self_intersecting_faces(sheet):
@@ -2055,14 +2127,22 @@ def extract_fold_free_best_timepoints(corrupted_extracts=None, output_suffix="_f
                                       max_number_of_neighbors=9, type_by='atoh_level'):
     """Re-extract each corrupted (folded) best-time-point as a FOLD-FREE frame.
 
+    ``corrupted_extracts`` is a list of ``(rank, stage)`` pairs, ``rank`` being
+    the 0-9 index of a chosen array within its stage. Both folders are
+    RESOLVED from it -- the generation run through
+    :func:`chosen_array_run_name` and the stored frame through
+    :func:`initial_morphology_name` -- because the extract's name is no longer
+    derived from the run's. It used to be ``<run>_for_<stage>``, and this
+    function built both names that way.
+
     Strategy (the p-value-vs-time curve has a single maximum, so the best frame
-    sits on the peak): for each corrupted ``(model, stage)`` whose stored best
-    frame self-intersects, find the closest fold-free frame BEFORE and AFTER it,
+    sits on the peak): for each corrupted array whose stored best frame
+    self-intersects, find the closest fold-free frame BEFORE and AFTER it,
     compute each one's p-value against the experiment with the SAME metric used
     to pick the original best frame
     (``compare_to_experimental_results(..., "number of neighbors")``), take the
     higher-p-value fold-free frame, and save its artifacts to a NEW folder
-    ``<model>_for_<stage><output_suffix>`` via
+    ``initial_array_<rank>_for_<stage><output_suffix>`` via
     :func:`save_data_of_a_given_time_point`. The original (folded) extract is
     left untouched.
 
@@ -2073,12 +2153,14 @@ def extract_fold_free_best_timepoints(corrupted_extracts=None, output_suffix="_f
         corrupted_extracts = CORRUPTED_EXTRACTS
 
     report = []
-    for model_name, stage in corrupted_extracts:
+    for rank, stage in corrupted_extracts:
+        stage = canonical_stage(stage)
+        model_name = chosen_array_run_name(rank, stage)
+        extract_name = initial_morphology_name(rank, stage)
         history = load_history_file(model_name)
-        suffix = _STAGE_SHEET_SUFFIX[stage]
         # The time of the existing (folded) extract is the original best time.
         extract_hist = HistoryHdf5.from_archive(
-            os.path.join(RESULTS_DIR, model_name + suffix, "history.hf5"),
+            os.path.join(RESULTS_DIR, extract_name, "history.hf5"),
             eptm_class=VirtualSheet)
         t_best = float(np.max(extract_hist.time_stamps))
 
@@ -2099,7 +2181,7 @@ def extract_fold_free_best_timepoints(corrupted_extracts=None, output_suffix="_f
             continue
         t_clean, p_clean = max(candidates, key=lambda x: x[1])
 
-        output_name = model_name + suffix + output_suffix
+        output_name = extract_name + output_suffix
         save_data_of_a_given_time_point(history, t_clean, output_name)
 
         reduction = p_best - p_clean
@@ -2575,5 +2657,6 @@ if __name__ == "__main__":
     #     res = load_experimental_results(stage, "lonely SC percentage")
     #     print(res)
     # plt.show()
-    fig, ax, tE17, tP0 = find_best_timepoint_according_to_n_neighbors("random_periodic_array98")
+    fig, ax, tE17, tP0 = find_best_timepoint_according_to_n_neighbors(
+        chosen_array_run_name(9, "E17.5"))
     plt.show()
