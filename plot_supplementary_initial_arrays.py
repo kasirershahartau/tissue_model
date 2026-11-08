@@ -70,6 +70,10 @@ RANKS = range(10)
 # The array shown in figure 2, per stage. A fixed default rather than a random
 # draw, so re-running reproduces the manuscript's figure; --random redraws.
 FIGURE_ARRAYS = {"E17.5": 5, "P0": 5}
+# Figure 2's x limit. The two stages' arrays were not all built to the same
+# length (pool arrays 0-217 ran to t=25, the rest to 15), so the panel is
+# clipped to the shorter one; see fig_score_vs_time.
+X_MAX = 15.0
 SEED_FOLDER = "initial arrays seed data"
 STAR_MS = 20.0            # a star reads smaller than a disc of the same size
 # the greedy floor quoted in the caveat above, per stage: the best joint score
@@ -171,8 +175,17 @@ def write_table(rows, results_dir=RESULTS_DIR):
 
 
 def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None,
-                      bare=False):
-    """Score against simulation time, one array per stage on one axes."""
+                      bare=False, x_max=X_MAX):
+    """Score against simulation time, one array per stage on one axes.
+
+    ``x_max`` CLIPS THE VIEW, it does not truncate the data: a curve that runs
+    past it is drawn to the frame edge and simply continues out of sight. The
+    default exists because the two stages' arrays were not built to the same
+    length -- pool arrays 0-217 ran to t=25 and the rest to 15 -- so without it
+    one curve stops in mid-panel and the asymmetry reads as a property of the
+    tissue rather than of the build. Every chosen frame sits near t=10, well
+    inside the window, so nothing the figure is about is cut off.
+    """
     fig, ax = plt.subplots(figsize=(8.0, 5.0))
     for stage in STAGES:
         rank, tr = picked[stage]
@@ -190,6 +203,8 @@ def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None,
                       % (tr["time"][k], tr["z2"][k]))
     if log_y:
         ax.set_yscale("log")
+    if x_max:
+        ax.set_xlim(-0.02 * x_max, 1.02 * x_max)
     ax.set_xlabel("simulation time")
     ax.set_ylabel(r"$\sum_k z_k^2$ against the experiment  (lower is better)")
     if bare:
@@ -287,6 +302,9 @@ def main():
                          " --seed; the draw is printed so it is reproducible")
     ap.add_argument("--seed", type=int, default=20261108,
                     help="seed for --random")
+    ap.add_argument("--x-max", dest="x_max", type=float, default=X_MAX,
+                    help="clip figure 2's time axis here (default %g); 0 shows"
+                         " each curve to its own end" % X_MAX)
     ap.add_argument("--linear-y", dest="linear_y", action="store_true",
                     help="linear y on figure 2; the default is log, because the"
                          " two stages' minima differ by a factor of ~50")
@@ -325,9 +343,15 @@ def main():
               % (s, rank, tr["run"], tr["time"].size, tr["time"][0],
                  tr["time"][-1], tr["time"][k], tr["z2"][k],
                  int(tr["n_cells"][k])))
+    if a.x_max:
+        past = {s: int(np.sum(tr["time"] > a.x_max))
+                for s, (_r, tr) in picked.items()}
+        print("    x axis clipped at t=%g; frames out of view: %s"
+              % (a.x_max, past))
     for bare in (False, True):
         fig_score_vs_time(picked, log_y=not a.linear_y,
-                          results_dir=a.results_dir, bare=bare)
+                          results_dir=a.results_dir, bare=bare,
+                          x_max=a.x_max)
 
     print("\n=== 3. neighbour-count distributions ===")
     for stage in STAGES:
