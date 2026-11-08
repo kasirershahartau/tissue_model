@@ -250,10 +250,52 @@ def save_li_levels_from_best_row_json(json_path, results_dir=RESULTS_DIR,
 
 
 def initial_morphology_name(index, stage):
-    """Folder name of the fitted initial-morphology array: raw random array
-    ``index`` snapped to ``stage``'s best-matching time point (the input handed
-    to a differentiation run)."""
-    return "%s%s" % (random_array_name(index), _STAGE_SHEET_SUFFIX[stage])
+    """Folder name of the fitted initial-morphology array: the array chosen for
+    ``stage`` at rank ``index`` (0-9), snapped to its best-matching time point
+    -- the input handed to a differentiation run.
+
+    ``initial_array_<index>_for_<stage>``, NOT
+    ``random_array_name(index) + suffix``. The two parted company when the
+    winners started coming from a large pool: 468 arrays were scored and the
+    best ten per stage kept, the two stages chose DISJOINT arrays, and those
+    twenty were renumbered 0-9 per stage. So ``index`` here is a RANK, and it
+    no longer has anything to do with the pool index of the raw array it came
+    from -- ``random_array_name`` still names those. The mapping from rank back
+    to pool array, with the frame taken from each, is recorded in
+    ``<results>/initial arrays seed data/chosen_arrays.json``.
+
+    The ``_for_E17`` / ``_for_P0`` suffix is unchanged, so code that classifies
+    a run by ``name.endswith("_for_P0")`` (build_run_table, build_mechanics_table)
+    still works.
+
+    This is ONE FRAME. The whole array-generation run that frame was taken from
+    is kept too, under ``chosen_array_run_name(index, stage)``.
+    """
+    return "initial_array_%d%s" % (index, _STAGE_SHEET_SUFFIX[stage])
+
+
+def chosen_array_run_name(index, stage):
+    """Folder name of the FULL array-generation run behind the chosen array at
+    rank ``index`` for ``stage``: ``random_array_<index>_<E17|P0>``.
+
+    Not to be confused with ``initial_morphology_name``, which is one frame of
+    this run -- the frame whose neighbour-number distribution best matched the
+    experiment -- and is the thing a differentiation run actually loads. This
+    name is the run itself: the full ``history.hf5`` from t=0, its
+    ``parameters.txt`` and ``debug.log``, and its z^2-vs-time trace. Reach for
+    it to re-extract a different frame, to re-plot the selection, or to check
+    how a chosen tissue got to the state it was taken in.
+
+    The twenty of these were renamed out of the 468-array pool namespace on
+    2026-11-08, so the folder name no longer records the pool index it was
+    built as, and the files INSIDE it still carry the old name because they are
+    the verbatim record of the run() call that made it. The mapping both ways is
+    in ``<results>/initial arrays seed data/chosen_arrays.json``
+    (``run_folder`` / ``pool_folder``) and in that folder's ``arrays.csv``
+    (``kept_as``).
+    """
+    return "random_array_%d_%s" % (index,
+                                   _STAGE_SHEET_SUFFIX[stage][len("_for_"):])
 
 
 

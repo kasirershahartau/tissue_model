@@ -5925,8 +5925,19 @@ class TestFindPsigmaBatchesAPassIntoOnePool:
         for stage, psigma, names in seen:
             assert len(names) == 12, "%d runs pooled, expected 4x3" % len(names)
             assert len(set(names)) == 12, "a repeat reused another's folder"
-            prefixes = {n.split("_random_periodic")[0] for n in names}
-            assert prefixes == {fm.REPEAT_PREFIX[r] for r in (1, 2, 3)}, prefixes
+            # Match the prefix rather than splitting on the array name: a run
+            # folder is "<repeat prefix>_<initial sheet>...", and the initial
+            # sheet name has already changed once (random_periodic_array<i>_for_
+            # -> initial_array_<rank>_for_), which silently turned the old
+            # split into a no-op. Requiring exactly one match also catches
+            # fullmodel_v2 being a string prefix of fullmodel_v2r2.
+            want = {fm.REPEAT_PREFIX[r] for r in (1, 2, 3)}
+            prefixes = set()
+            for n in names:
+                hit = [p for p in want if n.startswith(p + "_")]
+                assert len(hit) == 1, "%r matches %d repeat prefixes" % (n, len(hit))
+                prefixes.add(hit[0])
+            assert prefixes == want, prefixes
 
     def test_the_fit_never_visits_psigma_zero_when_bounds_exclude_it(self, monkeypatch):
         """pT = 0 is scored locally from the archived baseline, not on the VM.
@@ -6070,10 +6081,16 @@ class TestFindPsigmaBatchesAPassIntoOnePool:
                 == {0.06, 0.09, 0.12})
 
         # --- PER STAGE: the initial arrays ----------------------------------
-        assert {t[0] for t in e17} == {
-            "random_periodic_array0_for_E17", "random_periodic_array1_for_E17"}
-        assert {t[0] for t in p0} == {
-            "random_periodic_array0_for_P0", "random_periodic_array1_for_P0"}
+        # Resolved, not spelled out: the point of the assertion is that each
+        # stage gets ITS OWN arrays by index, not what the folders are called,
+        # and the folder names have already changed once (they became
+        # initial_array_<rank>_for_<stage> when the winners started being
+        # chosen from a 468-array pool).
+        from post_processing import initial_morphology_name
+        assert {t[0] for t in e17} == {initial_morphology_name(i, "E17.5")
+                                       for i in (0, 1)}
+        assert {t[0] for t in p0} == {initial_morphology_name(i, "P0")
+                                      for i in (0, 1)}
 
         # --- PER STAGE: the mechanics (gammaHC_ratio 2, alphaHC 3, A0 16) ---
         assert {(t[2], t[3], t[16]) for t in e17} == {
@@ -6211,13 +6228,24 @@ class TestRepeatsAreScoredAsGroupsNotIndependentPoints:
         assert len(groups) == 4, "one group per ARRAY, got %d" % len(groups)
         for grp in groups:
             assert len(grp) == 3, "each group holds that array's 3 repeats"
+            # Split each name by MATCHING its repeat prefix, rather than by
+            # splitting on the array name: a run folder is
+            # "<repeat prefix>_<initial sheet>", and the initial sheet name has
+            # already changed once (random_periodic_array<i>_for_ ->
+            # initial_array_<rank>_for_), which silently turned the old split
+            # into a no-op. Requiring exactly one match also catches
+            # fullmodel_v2 being a string prefix of fullmodel_v2r2.
+            want = {fm.REPEAT_PREFIX[r] for r in (1, 2, 3)}
+            prefixes, arrays = set(), set()
+            for n in grp:
+                hit = [p for p in want if n.startswith(p + "_")]
+                assert len(hit) == 1, "%r matches %d repeat prefixes" % (n, len(hit))
+                prefixes.add(hit[0])
+                arrays.add(n[len(hit[0]) + 1:])
             # same array in every repeat...
-            arrays = {n.split("|")[0].split("fullmodel_v2")[-1].lstrip("r123_")
-                      for n in grp}
             assert len(arrays) == 1, grp
             # ...and three DIFFERENT repeat prefixes
-            prefixes = {n.split("_random_periodic")[0] for n in grp}
-            assert prefixes == {fm.REPEAT_PREFIX[r] for r in (1, 2, 3)}, prefixes
+            assert prefixes == want, prefixes
 
     def test_one_repeat_still_gives_one_run_per_group(self, monkeypatch):
         import full_model as fm

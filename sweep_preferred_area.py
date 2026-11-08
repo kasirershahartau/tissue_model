@@ -29,7 +29,10 @@ def one(args):
     frac, idx = args
     import run_model as rm
     a0 = frac * np.pi / 4
-    init = "random_periodic_array%d_for_E17" % idx
+    # Not a hand-built name: initial extracts are "initial_array_<rank>_for_*"
+    # since the winners started being chosen from a large pool.
+    from post_processing import initial_morphology_name
+    init = initial_morphology_name(idx, "E17.5")
     li = rm._li_levels_kwargs_for_initial_sheet(init)
     thr = float(rm._load_saved_threshold(init))
     name = "pasweep_%03d_a%d" % (round(frac * 100), idx)

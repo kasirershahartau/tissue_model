@@ -40,12 +40,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon, Rectangle
 
-from post_processing import RESULTS_DIR
+from post_processing import RESULTS_DIR, initial_morphology_name
 from run_model import load_sheet_from_file
 from inner_ear_model import InnerEarModel
 from ablate_single_hc import BOX
 
-ARRAY = "random_periodic_array0_for_E17"
+# NOTE: the cell ids in CELLS below were picked by eye on THIS extract, so if
+# the chosen arrays are ever re-selected, rank 0 becomes a different tissue and
+# the two cells have to be picked again.
+ARRAY = initial_morphology_name(0, "E17.5")
 CELLS = (147, 148)
 DELTA_FRACTION = 0.5      # of maximal_level; 0 = dark green, 1 = white
 # 0 frames the neighbourhood exactly, so its outer ring is the last thing fully
