@@ -64,8 +64,9 @@ from matplotlib.ticker import MultipleLocator
 from post_processing import (RESULTS_DIR, NEIGHBOR_BINS, _neighbor_trace_tag,
                              _z2_trace_path, initial_morphology_name,
                              chosen_array_run_name, ensemble_neighbor_z2,
+                             load_experimental_results, _neighbor_fractions,
                              _STAGE_COLOUR, _SELECTED_COLOUR, _POINT_MS)
-from plot_neighbor_pairs import STYLE, STYLE_LABEL
+from plot_neighbor_pairs import STYLE, STYLE_LABEL, POINT_COLOUR, POINT_SIZE
 # the project's own definition of "bare", not a second one
 from plot_mechanical_fit_supplement import strip
 
@@ -80,6 +81,26 @@ FIGURE_ARRAYS = {"E17.5": 5, "P0": 5}
 X_MAX = 15.0
 # Figure 3's y tick spacing, in per cent: 0, 10, 20 ...
 Y_STEP = 10.0
+# Figure 3's scattered points: the jitter that keeps them from overprinting is
+# random, but drawn from a FIXED seed so the labelled and the bare version put
+# every dot in the same place and can still be traced onto one another.
+POINT_JITTER_SEED = 11
+_EXP_POINTS = {}
+
+
+def experiment_points(stage, bins=NEIGHBOR_BINS):
+    """The individual experiments' fraction vectors, one row per movie.
+
+    These are the numbers ``_experimental_neighbor_stats`` averages into the
+    experimental bar and takes the SEM of; it keeps only the summary, so they
+    are recomputed here through the same two calls rather than re-derived some
+    other way. :func:`fig_neighbour_hist` checks their mean against the bar.
+    """
+    if stage not in _EXP_POINTS:
+        per_experiment = load_experimental_results(stage, "number of neighbors")
+        _EXP_POINTS[stage] = np.array([_neighbor_fractions(c, bins)
+                                       for c in per_experiment])
+    return _EXP_POINTS[stage]
 SEED_FOLDER = "initial arrays seed data"
 STAR_MS = 20.0            # a star reads smaller than a disc of the same size
 # the greedy floor quoted in the caveat above, per stage: the best joint score
@@ -266,6 +287,7 @@ def fig_neighbour_hist(stages=STAGES, results_dir=RESULTS_DIR, out=None,
     fig, axes = plt.subplots(1, len(stages), figsize=(5.9 * len(stages), 4.8),
                              sharey=True)
     axes = np.atleast_1d(axes)
+    rng = np.random.default_rng(POINT_JITTER_SEED)
     for i, (stage, ax) in enumerate(zip(stages, axes)):
         r = res[stage]
         m_face, m_edge = STYLE[(True, stage)]
@@ -280,6 +302,24 @@ def fig_neighbour_hist(stages=STAGES, results_dir=RESULTS_DIR, out=None,
                facecolor=e_face, edgecolor=e_edge, linewidth=1.3,
                error_kw=dict(ecolor=e_edge, lw=1.1),
                label="experiment  (n = %d movies)" % r["n_exp"])
+
+        # Every array and every movie as its own dot, so the reader sees the
+        # spread the SEM is computed from rather than only its summary -- with
+        # n = 10 and n = 3 the error bar alone hides how little there is to
+        # average. The experiment's dots are checked against the bar they sit
+        # on: if their mean were not the bar height, the figure would be
+        # showing points from one population over an error bar from another.
+        ep = experiment_points(stage)
+        if not np.allclose(ep.mean(axis=0), r["exp_mean"]):
+            raise SystemExit(
+                "%s: the per-movie points do not average to the experimental "
+                "bar (%s vs %s)" % (stage, ep.mean(axis=0), r["exp_mean"]))
+        for xs, pts, kind in ((x - w / 2, r["model_fractions"], "model"),
+                              (x + w / 2, ep, "exp")):
+            jit = rng.uniform(-w * 0.28, w * 0.28, size=pts.shape)
+            ax.scatter((xs[None, :] + jit).ravel(), (100.0 * pts).ravel(),
+                       s=POINT_SIZE[kind], marker=".", color=POINT_COLOUR,
+                       alpha=0.8, linewidths=0, zorder=3)
         ax.set_xticks(x)
         # neighbor_bin_labels spells the open bins "<=4" / ">=8" for the
         # console; on a figure they should be the real symbols
@@ -313,13 +353,27 @@ def fig_neighbour_hist(stages=STAGES, results_dir=RESULTS_DIR, out=None,
                 note += "\n(selection floor $\\approx$ %.0f)" % floor
             ax.annotate(note, xy=(0.98, 0.96), xycoords="axes fraction",
                         ha="right", va="top", fontsize=9.5)
-            ax.legend(fontsize=9, loc="upper left")
+            handles, names = ax.get_legend_handles_labels()
+            for kind, name in (("model", "one array"), ("exp", "one movie")):
+                handles.append(plt.Line2D(
+                    [], [], marker=".", linestyle="none", color=POINT_COLOUR,
+                    alpha=0.8, markersize=np.sqrt(POINT_SIZE[kind]) * 1.8))
+                names.append(name)
+            # two columns: four entries in one would make the legend taller
+            # than the headroom above the bars
+            ax.legend(handles, names, fontsize=9, loc="upper left", ncol=2,
+                      columnspacing=1.1, handletextpad=0.5)
             ax.grid(alpha=0.22, axis="y")
     # round the shared top up to a whole tick, so the axis ends on a labelled
     # value instead of wherever the tallest error bar happens to reach
+    # the SCATTERED POINTS count too: an individual array can sit above its
+    # bar's error bar, and a dot clipped by the frame would be a dropped
+    # observation, not a cosmetic problem
     top = max(100.0 * (r["model_mean"] + r["model_sem"]).max() for r in res.values())
     top = max(top, max(100.0 * (r["exp_mean"] + r["exp_sem"]).max()
                        for r in res.values()))
+    top = max(top, max(100.0 * r["model_fractions"].max() for r in res.values()))
+    top = max(top, max(100.0 * experiment_points(s).max() for s in stages))
     # ... but keep a margin above the tallest bar for the legend and the note,
     # so neither is drawn over the data
     axes[0].set_ylim(0.0, max(y_step * np.ceil(top / y_step), top * 1.22))
