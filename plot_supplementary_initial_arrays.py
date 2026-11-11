@@ -6,8 +6,11 @@
   1. supp_table_initial_arrays.csv          rank, stage, cells, score
   2. supp_fig_score_vs_time.png/.svg        score against time, one array per
                                             stage, best frame starred
-  3. supp_fig_neighbour_hist_<stage>.*      the ensemble's neighbour-count
-                                            distribution beside the experiment
+  3. supp_fig_neighbour_hist.png/.svg       the ensemble's neighbour-count
+                                            distribution beside the experiment,
+                                            E17.5 and P0 side by side on one
+                                            shared y axis (--per-stage also
+                                            writes them as separate panels)
 
 EACH IS WRITTEN TWICE, labelled and BARE, as the other supplement scripts do.
 The bare figures go through ``plot_mechanical_fit_supplement.strip`` -- the same
@@ -56,6 +59,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MultipleLocator
 
 from post_processing import (RESULTS_DIR, NEIGHBOR_BINS, _neighbor_trace_tag,
                              _z2_trace_path, initial_morphology_name,
@@ -74,6 +78,8 @@ FIGURE_ARRAYS = {"E17.5": 5, "P0": 5}
 # length (pool arrays 0-217 ran to t=25, the rest to 15), so the panel is
 # clipped to the shorter one; see fig_score_vs_time.
 X_MAX = 15.0
+# Figure 3's y tick spacing, in per cent: 0, 10, 20 ...
+Y_STEP = 10.0
 SEED_FOLDER = "initial arrays seed data"
 STAR_MS = 20.0            # a star reads smaller than a disc of the same size
 # the greedy floor quoted in the caveat above, per stage: the best joint score
@@ -225,62 +231,110 @@ def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None,
     return stem
 
 
-def fig_neighbour_hist(stage, results_dir=RESULTS_DIR, out=None, bare=False,
-                       res=None):
+def fig_neighbour_hist(stages=STAGES, results_dir=RESULTS_DIR, out=None,
+                       bare=False, res=None, y_step=Y_STEP):
     """The ensemble's neighbour-count distribution beside the experiment.
 
     Both sides are means of independent realisations -- ten arrays, three
     movies -- so both get a standard error, which is exactly the pairing the
     stage-2 score uses. Computed by ``ensemble_neighbor_z2`` itself, so the
     bars and the annotated z^2 cannot disagree.
+
+    One panel per stage, in the order given, SHARING ONE Y AXIS and drawn
+    FLUSH: the two stages are being compared with each other as much as with
+    their own experiment, so a bar has to mean the same height in both panels,
+    and a gap between them would invite the eye to read them as two separate
+    figures. The border between panels is therefore a single line -- the left
+    panel's right spine -- and only the leftmost axis carries the y label,
+    its tick labels and its tick marks. ``y_step`` places the ticks (10, so
+    0, 10, 20 ...) rather than leaving matplotlib to choose per-panel.
+
+    Each panel keeps its own legend and its own z^2, because the two stages are
+    drawn in different colours -- the project's STYLE table gives each stage a
+    model and an experiment colour -- so a single shared legend could not name
+    them.
     """
+    stages = tuple(stages)
     if res is None:
-        runs = [chosen_array_run_name(r, stage) for r in RANKS]
-        res = ensemble_neighbor_z2(runs, stage, verbose=True)
-    labels = res["labels"]
+        res = {s: ensemble_neighbor_z2(
+            [chosen_array_run_name(r, s) for r in RANKS], s, verbose=True)
+            for s in stages}
+    labels = res[stages[0]]["labels"]
     x = np.arange(len(labels), dtype=float)
     w = 0.38
 
-    m_face, m_edge = STYLE[(True, stage)]
-    e_face, e_edge = STYLE[(False, stage)]
-    fig, ax = plt.subplots(figsize=(7.2, 4.8))
-    ax.bar(x - w / 2, 100.0 * res["model_mean"], w,
-           yerr=100.0 * res["model_sem"], capsize=3.5,
-           facecolor=m_face, edgecolor=m_edge, linewidth=1.3,
-           error_kw=dict(ecolor=m_edge, lw=1.1),
-           label="%s  (n = %d arrays)" % (STYLE_LABEL[(True, stage)],
-                                          res["n_runs"]))
-    ax.bar(x + w / 2, 100.0 * res["exp_mean"], w,
-           yerr=100.0 * res["exp_sem"], capsize=3.5,
-           facecolor=e_face, edgecolor=e_edge, linewidth=1.3,
-           error_kw=dict(ecolor=e_edge, lw=1.1),
-           label="%s  (n = %d movies)" % (STYLE_LABEL[(False, stage)],
-                                          res["n_exp"]))
-    ax.set_xticks(x)
-    # neighbor_bin_labels spells the open bins "<=4" / ">=8" for the console;
-    # on a figure they should be the real symbols
-    ax.set_xticklabels([l.replace("<=", r"$\leq$").replace(">=", r"$\geq$")
-                        for l in labels])
-    ax.set_xlabel("number of neighbours")
-    ax.set_ylabel("cells  (%)")
-    dof = len(labels) - 1
-    if bare:
-        strip(ax)
-    else:
-        note = "overall $z^2$ = %.2f on %d dof" % (res["z2"], dof)
-        floor = GREEDY_FLOOR.get(stage)
-        if floor is not None:
-            note += "\n(selection floor $\\approx$ %.0f)" % floor
-        ax.annotate(note, xy=(0.98, 0.96), xycoords="axes fraction",
-                    ha="right", va="top", fontsize=9.5)
-        ax.legend(fontsize=9, loc="upper left")
-        ax.grid(alpha=0.22, axis="y")
-    fig.subplots_adjust(left=0.105, right=0.98, top=0.97, bottom=0.12)
+    fig, axes = plt.subplots(1, len(stages), figsize=(5.9 * len(stages), 4.8),
+                             sharey=True)
+    axes = np.atleast_1d(axes)
+    for i, (stage, ax) in enumerate(zip(stages, axes)):
+        r = res[stage]
+        m_face, m_edge = STYLE[(True, stage)]
+        e_face, e_edge = STYLE[(False, stage)]
+        ax.bar(x - w / 2, 100.0 * r["model_mean"], w,
+               yerr=100.0 * r["model_sem"], capsize=3.5,
+               facecolor=m_face, edgecolor=m_edge, linewidth=1.3,
+               error_kw=dict(ecolor=m_edge, lw=1.1),
+               label="model  (n = %d arrays)" % r["n_runs"])
+        ax.bar(x + w / 2, 100.0 * r["exp_mean"], w,
+               yerr=100.0 * r["exp_sem"], capsize=3.5,
+               facecolor=e_face, edgecolor=e_edge, linewidth=1.3,
+               error_kw=dict(ecolor=e_edge, lw=1.1),
+               label="experiment  (n = %d movies)" % r["n_exp"])
+        ax.set_xticks(x)
+        # neighbor_bin_labels spells the open bins "<=4" / ">=8" for the
+        # console; on a figure they should be the real symbols
+        ax.set_xticklabels([l.replace("<=", r"$\leq$").replace(">=", r"$\geq$")
+                            for l in labels])
+        ax.set_xlabel("number of neighbours")
+        ax.set_xlim(-0.5 - w, len(labels) - 0.5 + w)
+        if i == 0:
+            ax.set_ylabel("cells  (%)")
+        ax.yaxis.set_major_locator(MultipleLocator(y_step))
+        if i:
+            # The panels are FLUSH (wspace=0), so the border between them is
+            # one line, not two touching ones: every panel after the first
+            # gives up its left spine and its y tick marks, which would
+            # otherwise double the border and poke into its neighbour. The
+            # scale is still readable off the far-left axis, which all panels
+            # share.
+            ax.spines["left"].set_visible(False)
+            ax.tick_params(axis="y", left=False)
+        if bare:
+            strip(ax)
+        else:
+            # The stage names the PANEL, so the legend need not repeat it
+            # twice; that keeps the legend narrow enough to sit beside the
+            # tallest bar instead of over it.
+            ax.set_title(stage, fontsize=12.5, fontweight="bold",
+                         color=STYLE[(True, stage)][1], pad=7)
+            note = "overall $z^2$ = %.2f on %d dof" % (r["z2"], len(labels) - 1)
+            floor = GREEDY_FLOOR.get(stage)
+            if floor is not None:
+                note += "\n(selection floor $\\approx$ %.0f)" % floor
+            ax.annotate(note, xy=(0.98, 0.96), xycoords="axes fraction",
+                        ha="right", va="top", fontsize=9.5)
+            ax.legend(fontsize=9, loc="upper left")
+            ax.grid(alpha=0.22, axis="y")
+    # round the shared top up to a whole tick, so the axis ends on a labelled
+    # value instead of wherever the tallest error bar happens to reach
+    top = max(100.0 * (r["model_mean"] + r["model_sem"]).max() for r in res.values())
+    top = max(top, max(100.0 * (r["exp_mean"] + r["exp_sem"]).max()
+                       for r in res.values()))
+    # ... but keep a margin above the tallest bar for the legend and the note,
+    # so neither is drawn over the data
+    axes[0].set_ylim(0.0, max(y_step * np.ceil(top / y_step), top * 1.22))
+    fig.subplots_adjust(left=0.075 if len(stages) > 1 else 0.105,
+                        right=0.985, top=0.93 if not bare else 0.97,
+                        bottom=0.12, wspace=0.0)
 
-    tag = "E17" if stage == "E17.5" else "P0"
-    stem = (os.path.splitext(out or os.path.join(
-        results_dir, "supp_fig_neighbour_hist_%s" % tag))[0]
-        + ("_bare" if bare else ""))
+    if out:
+        stem = os.path.splitext(out)[0]
+    elif len(stages) == 1:
+        tag = "E17" if stages[0] == "E17.5" else "P0"
+        stem = os.path.join(results_dir, "supp_fig_neighbour_hist_%s" % tag)
+    else:
+        stem = os.path.join(results_dir, "supp_fig_neighbour_hist")
+    stem += "_bare" if bare else ""
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)
         print("wrote %s.%s" % (stem, ext))
@@ -305,6 +359,11 @@ def main():
     ap.add_argument("--x-max", dest="x_max", type=float, default=X_MAX,
                     help="clip figure 2's time axis here (default %g); 0 shows"
                          " each curve to its own end" % X_MAX)
+    ap.add_argument("--y-step", dest="y_step", type=float, default=Y_STEP,
+                    help="figure 3's y tick spacing in %% (default %g)" % Y_STEP)
+    ap.add_argument("--per-stage", dest="per_stage", action="store_true",
+                    help="also write figure 3 as two separate single-stage"
+                         " panels, as it was before the stages were combined")
     ap.add_argument("--linear-y", dest="linear_y", action="store_true",
                     help="linear y on figure 2; the default is log, because the"
                          " two stages' minima differ by a factor of ~50")
@@ -354,13 +413,20 @@ def main():
                           x_max=a.x_max)
 
     print("\n=== 3. neighbour-count distributions ===")
-    for stage in STAGES:
-        # scored once, drawn twice: the labelled and bare panels must show the
-        # same bars, not two independent calls that could diverge
-        runs = [chosen_array_run_name(r, stage) for r in RANKS]
-        res = ensemble_neighbor_z2(runs, stage, verbose=True)
-        for bare in (False, True):
-            fig_neighbour_hist(stage, a.results_dir, bare=bare, res=res)
+    # scored ONCE for all four figures below: the combined panel, the two
+    # single-stage ones and every bare counterpart must show the same bars,
+    # which separate ensemble_neighbor_z2 calls could not guarantee
+    res = {s: ensemble_neighbor_z2(
+        [chosen_array_run_name(r, s) for r in RANKS], s, verbose=True)
+        for s in STAGES}
+    for bare in (False, True):
+        fig_neighbour_hist(STAGES, a.results_dir, bare=bare, res=res,
+                           y_step=a.y_step)
+    if a.per_stage:
+        for stage in STAGES:
+            for bare in (False, True):
+                fig_neighbour_hist((stage,), a.results_dir, bare=bare,
+                                   res=res, y_step=a.y_step)
     return 0
 
 
