@@ -31,11 +31,11 @@ through the selection's own functions -- ``_z2_trace_path`` to find them and
 ``ensemble_neighbor_z2`` to pool them. A figure script that recomputed the
 score would be reporting a second opinion, and the bins are the one thing most
 easily got wrong: the production scheme is ``NEIGHBOR_BINS``, tails MERGED
-(``<=4, 5, 6, 7, >=8``, five bins, four degrees of freedom), not the
-single-count 3..9 buckets that the older ``plot_initial_array_neighbor_hist``
-and ``plot_array_selection_score`` draw. Those two scripts predate the merged
-scheme and the z^2 rule; they are left alone rather than retrofitted, because
-the figures they make belong to the superseded p-value selection.
+(``<=4, 5, 6, 7, >=8``, five bins, four degrees of freedom). An earlier trio of
+scripts binned the same counts singly over 3..9 and scored the selection by its
+p value; both were superseded, and the scripts were deleted rather than
+retrofitted, because a second way to bin the same data is exactly the thing
+that gets quoted by mistake.
 
 THE TWO SCORES THESE FIGURES SHOW ARE NOT THE SAME NUMBER, and the table and
 the histograms deliberately report different ones:
