@@ -18,8 +18,9 @@ WHAT IT DOES, in order:
      undercounted twice: runs sitting at 2-3% are collapsed but would pass it.
   3. RETRY each dead run ONCE. The dead attempt is renamed, not deleted, so a
      run that dies twice stays on disk as evidence. Re-running genuinely
-     re-rolls the outcome because the lateral-inhibition seed comes from
-     np.random.rand on the UNSEEDED global RNG.
+     re-rolls the outcome because run() draws a fresh entropy-derived seed per
+     run (it used to rely on the global RNG being UNSEEDED; the re-roll is the
+     same, but the seed is now RECORDED, so a retry is replayable).
   4. FLAG runs that die twice, and EXCLUDE them from scoring rather than
      averaging their zeros into their array's group.
 

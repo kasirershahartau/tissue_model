@@ -28,6 +28,7 @@ import atexit
 import hashlib
 import logging
 import os, shutil, sys
+import random          # stdlib; seeded alongside numpy -- see the seed block
 from tyssue import HistoryHdf5
 # Force the non-interactive backend BEFORE pyplot is imported. The default here
 # is ``qtagg``, under which every figure gets a FigureManagerQT -- a QMainWindow
@@ -907,6 +908,29 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                 params_file = candidate
                 break
             n += 1
+
+    # REPRODUCIBILITY BY DEFAULT.
+    #
+    # A run called without an explicit seed used to leave BOTH generators on
+    # OS entropy, so its trajectory could never be recovered -- and of the ten
+    # drivers that call run(), only array creation ever passed a seed. Every
+    # full-model run, ablation, steady-state check, psigma repeat and mechanics
+    # evaluation was therefore unreproducible, silently.
+    #
+    # Draw one here instead, BEFORE the parameters dump just below, so the
+    # value lands in parameters.txt and the run can be replayed exactly with
+    # run(..., seed=<that value>).
+    #
+    # This changes NO distribution. An entropy-derived seed is as independent
+    # between runs as the entropy it came from, so sweeps that deliberately
+    # want independent repeats (run_psigma_repeats and friends) stay
+    # independent -- they just become replayable afterwards. Drawn from a fresh
+    # SeedSequence rather than the global stream so it cannot perturb it.
+    #
+    # ``seed`` is NOT an argument of _short_run_folder_name, so folder names
+    # and reuse_existing_run matching are unaffected.
+    if seed is None:
+        seed = int(np.random.SeedSequence().generate_state(1)[0])
     variables = locals().copy().items()
 
 
@@ -919,20 +943,49 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     # Seed AFTER the parameters dump, so the seed is recorded in the file, and
     # BEFORE any model is built, so every draw the run makes is covered.
     #
-    # One global seed is enough because every stochastic channel here goes
-    # through the GLOBAL numpy RNG: the per-cell prefered_area / contractility /
-    # area_elasticity draws that ``random_forces`` re-runs every wait_time
-    # units, and the uniform LI seeding in InnerEarModel. The one exception was
-    # the random-division rule, which built its own ``default_rng()`` from OS
-    # entropy; it now derives its seed from this stream (topological_events).
+    # TWO GENERATORS HAVE TO BE SEEDED, NOT ONE. Seed both or the run is not
+    # reproducible; this was measured, not guessed (see below).
+    #
+    # 1. The GLOBAL NUMPY RNG carries almost everything: the virtual-vertex
+    #    shuffles that pick which long edge is subdivided and which short one
+    #    collapses first (virtual_sheet.add/remove_virtual_vertices, the
+    #    dominant per-step consumer), the sharp-corner tie-break, the per-cell
+    #    prefered_area / contractility / area_elasticity draws that
+    #    ``random_forces`` re-runs every wait_time units, the uniform LI
+    #    seeding in InnerEarModel, and the division angle. The one exception
+    #    was the random-division rule, which built its own ``default_rng()``
+    #    from OS entropy; it now derives its seed from this stream
+    #    (topological_events).
+    #
+    # 2. PYTHON'S STDLIB ``random`` decides the ORDER OF EVENTS. tyssue's
+    #    EventManager.update does ``random.shuffle(self.next)``
+    #    (behaviors/event_manager.py), re-rolling the order of division /
+    #    intercalation / delamination / virtual-vertex-update /
+    #    parameter-redraw on EVERY step. That is a different generator from
+    #    numpy's and ``np.random.seed`` does not touch it, so leaving it
+    #    unseeded made the event order come from OS entropy no matter what
+    #    seed the caller passed.
+    #
+    # MEASURED. Two builds of array 0 with this same seed, in one process:
+    # unseeded stdlib random -> bit-identical for ~500 steps (while only the
+    # virtual-vertex update actually acts, so order cannot matter), then
+    # divergence at t~5.2 the moment divisions start and two events compete --
+    # same cells, same forces, different edge count. Seeding both -> BIT
+    # IDENTICAL over all 604 gradient evaluations. Seeding ``random`` changes
+    # no distribution; it only pins which event goes first.
     #
     # WHY IT MATTERS. Without it a random array cannot be rebuilt. The arrays
     # are not a resumable trajectory either -- random_forces keeps drawing
     # throughout -- so there is no frame-0 record that could stand in, the way
     # the LI seed arrays do for a full-model run. An array that is lost, or a
     # division rule whose comparison one wants to repeat, is simply gone.
+    #
+    # NOTE. Every array built BEFORE this fix (the 468-array pool, the chosen
+    # twenty, the division-area sweep) was built with the shuffle loose and is
+    # NOT recoverable from its recorded seed.
     if seed is not None:
         np.random.seed(int(seed) % (2 ** 32))
+        random.seed(int(seed) % (2 ** 32))
 
     # Enable debug logging IMMEDIATELY after the parameters dump
     # (so the dump above isn't polluted with the log-handler local)
@@ -1352,8 +1405,9 @@ def random_array_variant_name(index, division_area=None, division_interval=None)
 #: from this and its index, so the set is reproducible as a whole and each
 #: member is reproducible on its own -- rebuild array 7 alone and it is the
 #: same array 7, which matters because arrays are built one per Azure Batch
-#: task. Pass ``seed=None`` to create_random_arrays for the old unseeded
-#: behaviour; pass a different base for an independent set.
+#: task. Pass ``seed=None`` to create_random_arrays to let each run draw (and
+#: record) its own independent seed instead; pass a different base for an
+#: independent but still index-reproducible set.
 DEFAULT_ARRAY_SEED = 20261102
 
 

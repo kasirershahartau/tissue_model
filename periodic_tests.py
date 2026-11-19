@@ -10,6 +10,7 @@ what the geometry actually does when something there fails.
 import atexit
 import logging
 import os, shutil, sys
+import random          # stdlib; seeded alongside numpy -- see the seed note
 import numpy as np
 from tyssue import HistoryHdf5
 from matplotlib import pyplot as plt
@@ -254,12 +255,23 @@ def run():
 
     #  Saving model  parameters
     params_file = os.path.join(os.path.join(RESULTS_DIR, name, name + "_parameters.txt"))
+
+    # REPRODUCIBILITY BY DEFAULT -- same contract as run_model.run(). Draw a
+    # seed BEFORE the dump so it is recorded, then seed BOTH generators: numpy
+    # for the draws, and Python's stdlib random because tyssue's
+    # EventManager.update shuffles the per-step event ORDER with it. Seeding
+    # only numpy leaves the event order on OS entropy and the run cannot be
+    # replayed. See the long note in run_model.run for the measurement.
+    seed = int(np.random.SeedSequence().generate_state(1)[0])
     variables = locals().copy().items()
     with open(params_file, "w") as f:
         for var_name, var_value in variables:
             # Exclude built-in and special variables (e.g., those starting with '__')
             if not var_name.startswith("__") and not callable(var_value) and not isinstance(var_value, type(os)):
                 f.write(f"{var_name}: {repr(var_value)}\n")
+
+    np.random.seed(seed % (2 ** 32))
+    random.seed(seed % (2 ** 32))
 
     # Enable debug logging IMMEDIATELY after the parameters dump
     # (so the dump above isn't polluted with the log-handler local)

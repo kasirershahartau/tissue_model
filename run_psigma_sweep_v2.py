@@ -45,10 +45,13 @@ E17.5 between 0.20 and 0.25. Ratio of thresholds ~1.29 against a stress ratio of
 1.23. So the shared psigma is squeezed from above by P0 and from below by the
 onset of any benefit at all.
 
-DEAD RUNS ARE RETRIED ONCE (--dead-below, --no-retry). The LI seed is drawn from
-np.random.rand on the UNSEEDED global RNG, so a re-run genuinely re-rolls the
-initial condition; near threshold that coin flip decides the outcome. A run that
-dies twice is recorded in the JSON under "flagged_dead_twice" and kept.
+DEAD RUNS ARE RETRIED ONCE (--dead-below, --no-retry). The LI levels are drawn
+from np.random.rand and run() gives each run its own fresh entropy-derived
+seed, so a re-run genuinely re-rolls the initial condition; near threshold that
+coin flip decides the outcome. A run that dies twice is recorded in the JSON
+under "flagged_dead_twice" and kept. (Previously attributed to an UNSEEDED
+global RNG; it is seeded and RECORDED now, so the re-roll is unchanged but
+replayable.)
 
 SCORING HAZARD, visible in the numbers above: when the tissue dies, score 2
 reads a spurious 0 (sim% is nan, scored as zero) and P0's score 3 IMPROVES
@@ -97,10 +100,12 @@ def retry_dead(stage, names, fit, psigma, a):
     """Re-run any array that ended dead, ONCE. Returns (dead, revived, flagged).
 
     Worth doing because the initial notch/delta/repressor levels come from
-    np.random.rand on the UNSEEDED global RNG (there is no np.random.seed
-    anywhere in the codebase), so a fresh process re-rolls the initial
-    condition rather than reproducing the same death. Near the collapse
-    threshold that is exactly the coin-flip that decides the outcome.
+    np.random.rand and run() draws a fresh entropy-derived seed for every run,
+    so a retry re-rolls the initial condition rather than reproducing the same
+    death. Near the collapse threshold that is exactly the coin-flip that
+    decides the outcome. (This used to say the global RNG was UNSEEDED and that
+    np.random.seed appeared nowhere in the codebase -- both false now; the seed
+    is set AND recorded, so the retry re-rolls and stays replayable.)
 
     The dead attempt is RENAMED, not deleted, so the evidence survives — a run
     that dies twice at the same psigma is a result, not a glitch.

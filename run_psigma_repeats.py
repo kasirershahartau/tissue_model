@@ -16,10 +16,15 @@ run would collide with the first. Each repeat therefore gets its own NAME PREFIX
 exists, so only 2 and 3 are simulated here.
 
 THE REPEATS ARE GENUINELY INDEPENDENT: the initial notch/delta/repressor levels
-are drawn from np.random.rand on the UNSEEDED global RNG (there is no
-np.random.seed anywhere in the codebase), so each fresh worker process starts
-from a different initial condition on the same array. That is precisely the
-variable the scatter comes from.
+are drawn from np.random.rand, and run() gives each run its own fresh
+entropy-derived seed, so each worker process starts from a different initial
+condition on the same array. That is precisely the variable the scatter comes
+from. (This used to say the global RNG was UNSEEDED and that nothing in the
+codebase called np.random.seed. Both are now false: run() seeds numpy AND
+Python's stdlib random -- the latter because tyssue's EventManager shuffles the
+per-step event order with it -- and RECORDS the seed in parameters.txt. The
+independence is unchanged; what is new is that any repeat can be replayed
+exactly by passing its recorded seed back to run().)
 
 Scoring is deliberately NOT done here — pooling all repeats into one comparison
 is the point, and that is score_psigma_pooled.py.

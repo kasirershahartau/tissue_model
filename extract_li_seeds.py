@@ -3,12 +3,23 @@
     python extract_li_seeds.py --pattern "fullmodel_v2*" --out /data/reproduce
     python extract_li_seeds.py --pattern "fullmodel_v2*" --out D:\\pkg --workers 6
 
-WHY THIS EXISTS. A run is NOT reproducible from its ``parameters.txt`` alone.
-Every base run is started with ``randomize_notch_delta_levels=True`` and
-``notch_levels: None``, and the draw goes through the UNSEEDED global
-``np.random`` (inner_ear_model, ``_seed_li_levels``). Re-running the recorded
-parameters therefore gives a statistically equivalent trajectory, not the same
-one. The drawn state survives in exactly one place: frame 0 of ``history.hf5``.
+WHY THIS EXISTS. Every run made BEFORE the 2026-11-19 seeding fix is NOT
+reproducible from its ``parameters.txt`` alone. Those runs were started with
+``randomize_notch_delta_levels=True`` and ``notch_levels: None``, the draw went
+through the global ``np.random`` (inner_ear_model, ``_seed_li_levels``) which
+nothing had seeded, and -- worse -- tyssue's EventManager shuffled the per-step
+event ORDER with Python's stdlib ``random``, which nothing seeded either. So
+re-running their recorded parameters gives a statistically equivalent
+trajectory, not the same one. The drawn state survives in exactly one place:
+frame 0 of ``history.hf5``.
+
+THAT IS STILL TRUE OF EVERY EXISTING RUN, so this script remains the only way
+to package them. It is runs made from 2026-11-19 ONWARD that no longer need it:
+``run()`` now draws a seed when the caller gives none, seeds BOTH generators
+with it, and records it in ``parameters.txt``, so those are replayable from the
+parameters alone. Keep using this for the archive either way -- the frame-0
+arrays cost ~15 KB and remove any doubt about which side of the fix a run falls
+on.
 
 So the archive that actually reproduces the work is
 

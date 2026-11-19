@@ -4,10 +4,13 @@
     python revive_dead_runs.py --psigma 0.164 0.165 --repeats 4 5 --workers 4
 
 WHY A RETRY IS LEGITIMATE. The initial notch/delta/repressor levels come from
-np.random.rand on the UNSEEDED global RNG, so a fresh process re-rolls the
-initial condition instead of reproducing the same death. Near the collapse
-threshold that roll is exactly what decides the outcome, so a dead run is one
-draw from the outcome distribution rather than a broken simulation.
+np.random.rand, and run() gives every run its own fresh entropy-derived seed,
+so a retry re-rolls the initial condition instead of reproducing the same
+death. Near the collapse threshold that roll is exactly what decides the
+outcome, so a dead run is one draw from the outcome distribution rather than a
+broken simulation. (This used to attribute the re-roll to the global RNG being
+UNSEEDED. It is seeded now -- numpy and Python's stdlib random both -- and the
+seed is RECORDED, so the re-roll still happens and the retry is replayable.)
 
 WHICH MEANS THE RETRY IS NOT FREE OF BIAS, AND THE REPORT SAYS SO. Retrying only
 the deaths and keeping whatever comes back censors the collapse rate downwards:
