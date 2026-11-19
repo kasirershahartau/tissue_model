@@ -29,7 +29,7 @@ WHAT THE STEPS DO
   select     Rank the arrays by their own best frame, keep the best ten per
              stage, and write each one out as a single-frame extract.
   seed-data  Copy the parameters and cross-check every recorded seed against
-             the rule, so the pool can be rebuilt without the histories.
+             the rule, so what each array WAS is on record without its history.
   prune      Preserve the small artefacts, then delete the non-winners.
   finalise   Rename the twenty winners by RANK and gather them, with
              everything else from this step, under one results folder.
@@ -74,9 +74,17 @@ STAGES = ("E17.5", "P0")
 TRACE = "z2_vs_time_mergedtails.npz"
 DIVISION_AREA = 1.1
 KEEP = 10
-#: Appended to the variant name, to keep a SEEDED rebuild off the folder names
-#: of the earlier unseeded sets -- those cannot be regenerated, so a rebuild
-#: must not be able to land on them.
+#: Appended to the variant name, to keep a seeded build off the folder names of
+#: the earlier unseeded sets, which must not be overwritten.
+#:
+#: "Seeded" does NOT mean reproducible, and nothing here should imply it does.
+#: Measured 2026-11-19: array 0 built twice with the same seed and identical
+#: settings gave two different tissues. The runs agree through the regular
+#: lattice and the first parameter re-draw, then separate at t~5.2 when
+#: divisions begin -- a last-bit difference changes which cell divides first,
+#: that division consumes a random angle, and the streams never resynchronise.
+#: The seed fixes the DRAWS, so the pool reproduces as a distribution; no
+#: individual array can be recovered, so every run folder is irreplaceable.
 NAME_SUFFIX = "_seeded"
 _HEAD = "random_periodic_array"
 
