@@ -1,7 +1,12 @@
 """The three supplementary items that document the initial-array selection.
 
-    python plot_supplementary_initial_arrays.py
-    python plot_supplementary_initial_arrays.py --seed 7 --linear-y
+Every figure and table for the initial-configuration step is here;
+:mod:`build_initial_arrays` is the other half, and runs the step. Nothing here
+simulates and nothing there plots. Output goes to the step's own ``figures``
+folder beside the runs and the seed data.
+
+    python plot_initial_arrays.py
+    python plot_initial_arrays.py --random --seed 7 --linear-y
 
   1. supp_table_initial_arrays.csv          rank, stage, cells, score
   2. supp_fig_score_vs_time.png/.svg        score against time, one array per
@@ -65,6 +70,7 @@ from post_processing import (RESULTS_DIR, NEIGHBOR_BINS, _neighbor_trace_tag,
                              _z2_trace_path, initial_morphology_name,
                              chosen_array_run_name, ensemble_neighbor_z2,
                              load_experimental_results, _neighbor_fractions,
+                             INITIAL_CONFIG_FIGURES, INITIAL_CONFIG_SEED_DATA,
                              _STAGE_COLOUR, _SELECTED_COLOUR, _POINT_MS)
 from plot_neighbor_pairs import STYLE, STYLE_LABEL, POINT_COLOUR, POINT_SIZE
 # the project's own definition of "bare", not a second one
@@ -101,7 +107,20 @@ def experiment_points(stage, bins=NEIGHBOR_BINS):
         _EXP_POINTS[stage] = np.array([_neighbor_fractions(c, bins)
                                        for c in per_experiment])
     return _EXP_POINTS[stage]
-SEED_FOLDER = "initial arrays seed data"
+
+
+def figures_dir(results_dir=RESULTS_DIR):
+    """Where every figure and table here is written, created if missing.
+
+    Beside the runs and the seed data, under the step's own folder, so the
+    whole initial-configuration part is one thing to copy or archive -- not
+    scattered through a results root shared with the differentiation runs.
+    """
+    d = os.path.join(results_dir, INITIAL_CONFIG_FIGURES)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 STAR_MS = 20.0            # a star reads smaller than a disc of the same size
 # the greedy floor quoted in the caveat above, per stage: the best joint score
 # reachable by picking ten arrays, which is what the ensemble should be
@@ -136,7 +155,8 @@ def load_trace(rank, stage, results_dir=RESULTS_DIR):
 
 def recorded_selection(results_dir=RESULTS_DIR):
     """chosen_arrays.json: what the selection actually extracted, by rank."""
-    path = os.path.join(results_dir, SEED_FOLDER, "chosen_arrays.json")
+    path = os.path.join(results_dir, INITIAL_CONFIG_SEED_DATA,
+                        "chosen_arrays.json")
     with open(path) as fh:
         doc = json.load(fh)
     return {(stage, r["rank"]): r for stage, rows in doc.items() for r in rows}
@@ -175,12 +195,13 @@ def write_table(rows, results_dir=RESULTS_DIR):
     cols = ["rank", "stage", "n_cells", "score", "frame_time", "extract",
             "run", "pool_array"]
     bare_cols = ["rank", "stage", "n_cells", "score"]
-    path = os.path.join(results_dir, "supp_table_initial_arrays.csv")
+    path = os.path.join(figures_dir(results_dir), "supp_table_initial_arrays.csv")
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
-    bare_path = os.path.join(results_dir, "supp_table_initial_arrays_bare.csv")
+    bare_path = os.path.join(figures_dir(results_dir),
+                             "supp_table_initial_arrays_bare.csv")
     with open(bare_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=bare_cols, extrasaction="ignore")
         w.writeheader()
@@ -244,7 +265,8 @@ def fig_score_vs_time(picked, log_y=True, results_dir=RESULTS_DIR, out=None,
         ax.legend(fontsize=9, loc="best")
     fig.subplots_adjust(left=0.105, right=0.98, top=0.97, bottom=0.11)
     stem = os.path.splitext(out or os.path.join(
-        results_dir, "supp_fig_score_vs_time"))[0] + ("_bare" if bare else "")
+        figures_dir(results_dir), "supp_fig_score_vs_time"))[0] \
+        + ("_bare" if bare else "")
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)
         print("wrote %s.%s" % (stem, ext))
@@ -385,9 +407,10 @@ def fig_neighbour_hist(stages=STAGES, results_dir=RESULTS_DIR, out=None,
         stem = os.path.splitext(out)[0]
     elif len(stages) == 1:
         tag = "E17" if stages[0] == "E17.5" else "P0"
-        stem = os.path.join(results_dir, "supp_fig_neighbour_hist_%s" % tag)
+        stem = os.path.join(figures_dir(results_dir),
+                            "supp_fig_neighbour_hist_%s" % tag)
     else:
-        stem = os.path.join(results_dir, "supp_fig_neighbour_hist")
+        stem = os.path.join(figures_dir(results_dir), "supp_fig_neighbour_hist")
     stem += "_bare" if bare else ""
     for ext in ("png", "svg"):
         fig.savefig("%s.%s" % (stem, ext), dpi=200)

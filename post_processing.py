@@ -124,6 +124,20 @@ _STAGE_SHEET_SUFFIX = {"E17.5": "_for_E17", "P0": "_for_P0"}
 # silently build a folder nobody writes.
 _STAGE_ALIASES = {"E17.5": "E17.5", "E17": "E17.5", "P0": "P0"}
 
+# Everything the initial-configuration work produced lives under one folder in
+# the results root -- the generation runs, the seed data, the figures and the
+# working plots -- so that finished part of the project is one thing to copy,
+# archive or ignore. The TWENTY EXTRACTS ARE THE EXCEPTION and stay at the
+# root: they are what every later run loads, through initial_morphology_name.
+INITIAL_CONFIG_DIR = "initial configurations"
+#: where the full array-generation runs sit inside it
+INITIAL_CONFIG_RUNS = os.path.join(INITIAL_CONFIG_DIR, "runs")
+#: the seeds, parameters and z^2 traces that let the pool be rebuilt and the
+#: selection re-derived (see that folder's own README)
+INITIAL_CONFIG_SEED_DATA = os.path.join(INITIAL_CONFIG_DIR, "seed data")
+#: where the supplementary figures and tables are written
+INITIAL_CONFIG_FIGURES = os.path.join(INITIAL_CONFIG_DIR, "figures")
+
 
 
 
@@ -313,7 +327,7 @@ def initial_morphology_name(index, stage):
     no longer has anything to do with the pool index of the raw array it came
     from -- ``random_array_name`` still names those. The mapping from rank back
     to pool array, with the frame taken from each, is recorded in
-    ``<results>/initial arrays seed data/chosen_arrays.json``.
+    ``<results>/<INITIAL_CONFIG_SEED_DATA>/chosen_arrays.json``.
 
     The ``_for_E17`` / ``_for_P0`` suffix is unchanged, so code that classifies
     a run by ``name.endswith("_for_P0")`` (build_run_table, build_mechanics_table)
@@ -330,8 +344,17 @@ def initial_morphology_name(index, stage):
 
 
 def chosen_array_run_name(index, stage):
-    """Folder name of the FULL array-generation run behind the chosen array at
-    rank ``index`` for ``stage``: ``random_array_<index>_<E17|P0>``.
+    """Path to the FULL array-generation run behind the chosen array at rank
+    ``index`` for ``stage``, RELATIVE TO THE RESULTS ROOT:
+    ``initial configurations/runs/random_array_<index>_<E17|P0>``.
+
+    A relative path rather than a bare folder name, because these runs were
+    gathered under :data:`INITIAL_CONFIG_DIR` once the work was finished. Every
+    consumer joins it to the results root (``load_history_file``,
+    ``_z2_trace_path``), so the extra component costs them nothing -- but do
+    not use it where a flat NAME is wanted, such as in a run folder's own
+    title. :func:`initial_morphology_name` is still a bare name: the extracts
+    did NOT move, since the whole pipeline loads them from the root.
 
     Not to be confused with ``initial_morphology_name``, which is one frame of
     this run -- the frame whose neighbour-number distribution best matched the
@@ -344,13 +367,14 @@ def chosen_array_run_name(index, stage):
     The twenty of these were renamed out of the 468-array pool namespace on
     2026-11-08, so the folder name no longer records the pool index it was
     built as, and the files INSIDE it still carry the old name because they are
-    the verbatim record of the run() call that made it. The mapping both ways is
-    in ``<results>/initial arrays seed data/chosen_arrays.json``
+    the verbatim record of the run() call that made it. The mapping both ways
+    is in ``<results>/<INITIAL_CONFIG_SEED_DATA>/chosen_arrays.json``
     (``run_folder`` / ``pool_folder``) and in that folder's ``arrays.csv``
     (``kept_as``).
     """
     suffix = _STAGE_SHEET_SUFFIX[canonical_stage(stage)]
-    return "random_array_%d_%s" % (index, suffix[len("_for_"):])
+    return os.path.join(INITIAL_CONFIG_RUNS,
+                        "random_array_%d_%s" % (index, suffix[len("_for_"):]))
 
 
 
