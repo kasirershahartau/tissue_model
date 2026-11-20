@@ -13,7 +13,12 @@ The parts that are not obvious:
 * **Resuming is not the same as restarting.** ``continue_existing_run`` reads the
   archive's last frame and carries the evolved state forward — including the
   differentiation levels, which must NOT be re-seeded, or the pattern is silently
-  replaced by a fresh random one mid-run.
+  replaced by a fresh random one mid-run. What the archive cannot carry (both RNG
+  streams mid-stream, the event order, the model's countdowns, the adaptive step)
+  travels in a sidecar beside it, so a resume CONTINUES the original trajectory
+  rather than starting a new one from the same sheet — see :mod:`resume_state`.
+  Runs recorded before that sidecar existed have none, and resuming one still
+  produces a fresh continuation; the resume says so in the log.
 * **Failure is reported, not absorbed.** A run whose solver dies re-raises rather
   than returning a folder, so a caller scoring the output cannot mistake a
   corrupt or truncated archive for a result.
@@ -371,14 +376,47 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     return name
 
 
-# The per-cell columns InnerEarModel.set_random_parameters draws, i.e. the
-# state a ``random_forces`` run carries that its parameters cannot rebuild.
-# A resume restores these from the archive; see where they are captured in run().
-# ``area_elasticity`` joined the list when set_random_parameters started drawing
-# alpha as well; leaving it out would let a resume silently fall back to the
-# uniform per-type stiffness while A0 and gamma stayed randomised.
-_RANDOMISED_FACE_COLUMNS = ("prefered_area", "prefered_vol", "contractility",
-                            "area_elasticity")
+# Per-cell state that is NOT a parameter, so a resume must keep the archive's
+# values rather than the by-type defaults ``update_specs(..., reset=True)``
+# writes. ``type`` is the cell's identity and ``is_alive`` marks a cell on its
+# way out; the rest come from ``inner.face_params`` / ``inner.edge_params``,
+# i.e. exactly the columns ``update_cell_type_parameters`` interpolates in atoh
+# (prefered_area, prefered_vol, contractility, area_elasticity,
+# prefered_perimeter, bending, repulsion, repulsion_distance; line_tension on
+# edges) and ``set_random_parameters`` re-draws. Taken from the model so a new
+# parameter is covered automatically.
+_RESUMED_STATE_EXTRA = {"face": ("type", "is_alive")}
+
+
+def _restore_derived_columns(inner, saved):
+    """Put the archive's per-cell derived state back after
+    ``InnerEarModel.__init__`` reset it. Yields ``(element, columns)`` for the
+    log. See the long note at the call site in :func:`run`."""
+    derived = {
+        "face": tuple(inner.face_params.keys()) + _RESUMED_STATE_EXTRA["face"],
+        "edge": tuple(inner.edge_params.keys()),
+    }
+    out = []
+    for element, columns in derived.items():
+        live = inner.sheet.datasets.get(element)
+        was = saved.get(element)
+        if live is None or was is None:
+            continue
+        cols = [c for c in columns if c in was.columns and c in live.columns]
+        if not cols:
+            continue
+        shared = live.index.intersection(was.index)
+        if not len(shared):
+            continue
+        for col in cols:
+            # Column at a time, preserving each one's dtype (``type`` is an
+            # integer, and a block assignment would float it -- which
+            # HistoryHdf5 rejects, having captured the dtypes already).
+            live.loc[shared, col] = was.loc[shared, col].astype(
+                live[col].dtype)
+        out.append((element, cols))
+    return out
+
 
 # L0, the lateral-inhibition length_normalization_factor, written beside every
 # run so a fork can INHERIT it instead of re-measuring.
@@ -446,10 +484,21 @@ def _recorded_L0(run_name, results_dir=None, depth=0):
 
 
 def _write_L0(folder, value):
-    """Record the L0 this run used, for any fork taken from it later."""
+    """Record the L0 this run used, for any fork taken from it later.
+
+    ``repr`` (the shortest string that round-trips a float64 exactly), not
+    ``%.12g``. L0 is a MEASURED mean perimeter -- on the plain lattice it is
+    1.5 + sqrt(5) -- and 12 significant digits threw away the last ~15 bits.
+    That was invisible until a resume: the inheriting run's L0 differed from
+    the original's by ~6e-12 relative, which is nothing physically but makes
+    ``set_random_parameters`` (A0 = N(mean, std) * L0**2) draw slightly
+    different preferred areas, and the trajectories separate from there. Old
+    records keep their 12 digits and are read exactly as before; a resume
+    takes L0 from the resume sidecar, which carries it exactly.
+    """
     try:
         with open(os.path.join(folder, _L0_FILE), "w") as fh:
-            fh.write("%.12g\n" % float(value))
+            fh.write("%s\n" % repr(float(value)))
     except OSError:
         pass                      # a missing record only costs a re-measure
 
@@ -471,7 +520,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         save_interval=None, stress_shift=0.0, notch_inhibition=False,
         l0_ratio=1.0, inherit_length_unit=True, random_area_stage=None,
         uniform_delta_level=None, division_area=1.2, division_rule="area",
-        division_interval=None, division_start=None, seed=None):
+        division_interval=None, division_start=None, seed=None,
+        restore_resume_state=True):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -488,6 +538,17 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         that died at ``t=17.6`` can be resumed with the same
         ``t_end=100`` and it will only have to cover the remaining
         ``100 - continue_from_time`` units.
+
+        A resume CONTINUES the original trajectory: the state the
+        archive cannot hold — both RNG streams mid-stream, the
+        shuffled event order, the ``random_forces`` / random-division
+        countdowns, the solver's adaptive ``dt`` and save phase, the
+        cell labels — is read back from the sidecar written beside
+        the archive (:mod:`resume_state`). ``seed`` is then
+        irrelevant to the continuation; the restored stream position
+        decides it. Resuming an archive recorded BEFORE the sidecar
+        existed still works but yields a fresh (statistically
+        equivalent) continuation, and logs a warning saying so.
 
         If False, the standard "new run" behaviour applies:
         ``results/<name>/`` is created from scratch and the
@@ -510,7 +571,20 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         ``initial_sheet_name``, just with the snapshot chosen by
         time rather than always being the last one. ``None`` (the
         default) keeps the historical "load last snapshot"
-        behaviour.
+        behaviour. A fork does NOT inherit the source run's live
+        state (it is a new run, reproducible from its own seed); only
+        a resume does.
+    restore_resume_state : bool, default True
+        On a resume, restore the live state from the sidecar beside
+        the archive so the continuation is the one the original run
+        would have taken. Pass False to continue from the same frame
+        with a FRESH stream when a DIFFERENT tail is the point of the
+        resume — e.g. :func:`restore_array_run`, which resumes a run
+        from a fold-free frame precisely to replace the folded tail,
+        or recovering an array build that died at the dt floor, where
+        reproducing the original continuation would reproduce the
+        crash. Both modes are reproducible: with the sidecar from the
+        sidecar, without it from this run's recorded ``seed``.
     reuse_existing_run : bool, default False
         Smart restart for re-launched parameter fits. When True and a
         results folder for ``name`` already exists, the previous run's
@@ -1027,14 +1101,12 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             # ``force_periodic_box`` recovers legacy archives that
             # didn't stash their periodicity (the model is always a
             # periodic nx*distx by ny*disty box).
-            sheet = load_sheet_from_file(
-                initial_sheet_name,
-                time_point=continue_from_time,
-                force_periodic_box=(nx * distx, ny * disty),
-            )
-            # If the caller didn't pin a time, pin it now to the
-            # last recorded snapshot so the truncate + solver-clock
-            # plumbing below works on the same time stamp.
+            #
+            # Pin the time to an ACTUAL stamp first: the loader snaps to the
+            # nearest frame, and the solver clock, the archive truncation and
+            # the resume-state lookup all have to name that same frame rather
+            # than whatever round number the caller asked for (see
+            # _nearest_archive_time).
             if continue_from_time is None:
                 _resume_hist = HistoryHdf5.from_archive(
                     os.path.join(initial_sheet_name, "history.hf5"), eptm_class=VirtualSheet,
@@ -1044,6 +1116,21 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                     "continue_from_time defaulted to last snapshot t=%g",
                     continue_from_time,
                 )
+            else:
+                _snapped = _nearest_archive_time(initial_sheet_name,
+                                                 continue_from_time)
+                if _snapped is not None and _snapped != float(continue_from_time):
+                    run_log.info(
+                        "continue_from_time %g snapped to the nearest recorded "
+                        "snapshot t=%g (the frame the sheet is loaded from)",
+                        continue_from_time, _snapped,
+                    )
+                    continue_from_time = _snapped
+            sheet = load_sheet_from_file(
+                initial_sheet_name,
+                time_point=continue_from_time,
+                force_periodic_box=(nx * distx, ny * disty),
+            )
         elif os.path.isfile(os.path.join(initial_sheet_name, "history.hf5")):
             # Fork mode (when continue_from_time is set) OR the old
             # "load the last snapshot from the source archive"
@@ -1091,20 +1178,32 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # than trusting the caller's flag.
         if continue_existing_run:
             randomize_notch_delta_levels = False
-        # ... and for the same reason a RESUME of a random-forces run must keep
-        # the archive's PER-CELL mechanical state. ``random_forces`` appends
-        # ``get_random_initializer``, which re-draws prefered_area (and
-        # prefered_vol, contractility) per cell every wait_time units; those
-        # draws are the run's state, not something the parameters can rebuild.
-        # InnerEarModel.__init__ calls ``update_specs(..., reset=True)``, which
-        # resets the whole column to the uniform by-type default, so without
-        # this the resumed tissue relaxes toward one target area, no cell ever
-        # reaches ``division_area`` again, and the run FREEZES: a 25->30 resume
-        # of random_periodic_array99 produced 533 faces at every frame and 4
-        # topology changes, against ~33 per 5 time units before it.
-        # Only for random_forces: elsewhere these columns ARE reproducible from
-        # the parameters, and restoring them would silently ignore a resume
-        # that deliberately changes them.
+        # ... and for the same reason a RESUME must keep the archive's PER-CELL
+        # mechanical state. ``InnerEarModel.__init__`` calls
+        # ``update_specs(..., reset=True)``, which resets every spec-backed
+        # column to its uniform by-type default, and the per-cell values it
+        # wipes are state, not parameters:
+        #
+        #  * ``random_forces`` re-draws prefered_area / prefered_vol /
+        #    contractility / area_elasticity per cell every wait_time units.
+        #    Those draws cannot be rebuilt from the parameters; without them the
+        #    resumed tissue relaxes toward ONE target area, no cell reaches
+        #    ``division_area`` again and the run FREEZES — a 25->30 resume of
+        #    random_periodic_array99 produced 533 faces at every frame and 4
+        #    topology changes, against ~33 per 5 time units before it.
+        #  * with differentiation on, the same columns (plus ``type`` and the
+        #    edge ``line_tension``) are interpolated per cell in atoh by
+        #    ``update_cell_type_parameters``. That runs at the first LI step —
+        #    but the solver evaluates the FORCES first, so step 1 of the resume
+        #    used by-type defaults where the original run used the pattern's
+        #    values. Measured: a full-model resume diverged at its very first
+        #    frame, with the topology still identical.
+        #
+        # So restore every column the model DERIVES per cell (``face_params`` /
+        # ``edge_params`` keys, ``type``, ``is_alive``) and nothing else: a
+        # resume that changes a real parameter still takes effect, because
+        # ``update_cell_type_parameters`` overwrites these from atoh at the
+        # first LI step anyway.
         # L0 must come from the run this one descends from, not from the frame
         # it starts at. Both a resume and a fork load someone's archive, so
         # both inherit; a genuinely fresh sheet measures its own.
@@ -1127,11 +1226,9 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             run_log.info("inherit_length_unit=False: re-measuring the length"
                          " unit on this frame rather than inheriting it")
 
-        resumed_face_state = None
-        if continue_existing_run and random_forces:
-            keep = [c for c in _RANDOMISED_FACE_COLUMNS if c in sheet.face_df.columns]
-            if keep:
-                resumed_face_state = sheet.face_df[keep].copy()
+        resumed_state = None
+        if continue_existing_run:
+            resumed_state = {el: df.copy() for el, df in sheet.datasets.items()}
         inner = InnerEarModel(sheet, tension=tension, repulsion=repulsion, repulsion_distance=repulsion_distance,
                               repulsion_exp=repulsion_exponent, preferred_area=preferred_area,
                               preferred_area_override=preferred_area_override, contractility=contractility,
@@ -1174,13 +1271,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         run_log.info("l0_ratio = L0/<perimeter> = %.6g  ->  L0 = %.6g",
                      inner.l0_ratio,
                      inner.l0_ratio * inner.length_normalization_factor)
-        if resumed_face_state is not None:
-            # put the archive's draws back over what __init__ reset them to
-            shared = inner.sheet.face_df.index.intersection(resumed_face_state.index)
-            inner.sheet.face_df.loc[shared, resumed_face_state.columns] = \
-                resumed_face_state.loc[shared]
-            run_log.info("resume: restored %s for %d face(s) from the archive",
-                         ", ".join(resumed_face_state.columns), len(shared))
+        if resumed_state is not None:
+            for element, columns in _restore_derived_columns(inner, resumed_state):
+                run_log.info("resume: restored %s %s from the archive",
+                             element, ", ".join(columns))
         draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
                                                 color_by="atoh")
         fig1, ax1 = draw_func(inner.sheet)
@@ -1243,6 +1337,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                                  history_file=history_file, save_interval=save_interval,
                                  max_wall_seconds=max_wall_seconds, min_progress_rate=min_progress_rate,
                                  progress_window_seconds=progress_window_seconds,
+                                 restore_resume_state=restore_resume_state,
                                  continue_from_time=(continue_from_time if continue_existing_run else None))
         # ``inner.save_notch_delta(...)`` USED to write a pickle
         # side-file with the final LI levels for the next run to
@@ -1362,9 +1457,13 @@ def restore_array_run(index, continue_from_time, t_end=None):
       * ``continue_from_time`` must be an EXISTING time stamp in the archive
         that is verified fold-free (see the values reported for arrays
         1/2/3/5/7/8).
-      * The run uses ``random_forces=True``, so the continuation is stochastic —
-        it does NOT reproduce the original trajectory, it produces a fresh,
-        fold-free one. Re-run ``store_best_time_point_for_random_arrays`` after.
+      * ``restore_resume_state=False``, DELIBERATELY. A resume normally
+        continues the original trajectory exactly (from the sidecar beside the
+        archive); here that is the one thing we do not want — the point is to
+        replace a folded tail with a fresh, fold-free one, and reproducing the
+        original continuation would reproduce the fold. The new tail is still
+        reproducible, from the seed this run records. Re-run
+        ``store_best_time_point_for_random_arrays`` after.
       * ``t_end`` defaults to the archive's current last time (re-run to the
         same end); the cumulative end-time semantics of ``run`` apply.
     """
@@ -1375,6 +1474,7 @@ def restore_array_run(index, continue_from_time, t_end=None):
         t_end = float(np.max(hist.time_stamps))
     return run(0.01, 10, 1, 1, name=name, initial_sheet_name=name,
                continue_existing_run=True, continue_from_time=continue_from_time,
+               restore_resume_state=False,   # a NEW tail is the point; see above
                random_forces=True, end_on_steady_state=False, t_end=t_end, dt=0.01,
                divisions=True, no_differentiation=True)
 
@@ -1731,6 +1831,34 @@ def _latest_archive_time(results_dir):
             return None
         return float(np.max(stamps))
     except Exception:
+        return None
+
+
+def _nearest_archive_time(archive_dir, requested):
+    """The snapshot time in ``<archive_dir>/history.hf5`` CLOSEST to
+    ``requested``, or None when the archive has none.
+
+    A resume has to agree with itself about which frame it starts from.
+    ``HistoryHdf5.retrieve`` snaps a requested time to the nearest recorded
+    stamp, so the sheet comes from an existing frame -- but the solver clock
+    and the archive truncation used the REQUESTED value, which is usually a
+    round number and the stamps are not (a step lands just past each save
+    boundary, so 0.1-spaced saves sit at 3.51, 3.61, ...). Asking for 3.5 then
+    loaded the sheet of frame 3.51, started the clock at 3.50, and dropped
+    frame 3.51 as part of the abandoned tail: the continuation ran 0.01 behind
+    the original and no frame of it lined up. Snapping the request to the frame
+    that will actually be loaded removes all three mismatches at once.
+    """
+    path = os.path.join(archive_dir, "history.hf5")
+    if not os.path.isfile(path):
+        return None
+    try:
+        hist = HistoryHdf5.from_archive(path, eptm_class=VirtualSheet)
+        stamps = np.asarray(hist.time_stamps, float)
+        if stamps.size == 0:
+            return None
+        return float(stamps[np.argmin(np.abs(stamps - float(requested)))])
+    except Exception:                                          # noqa: BLE001
         return None
 
 

@@ -19,11 +19,18 @@ same one:
 A run that cannot take a valid step even at the smallest ``dt`` raises rather
 than continuing, so a caller scoring the result never reads a corrupt sheet as
 data.
+
+Every recorded snapshot also gets a line of resume state (both RNG streams, the
+event order, the model's countdowns, the adaptive ``dt``) in a sidecar beside
+the archive, so a run can be CONTINUED reproducibly and not merely replayed
+from the start. See :mod:`resume_state`.
 """
 import time
 import numpy as np
 from tyssue.solvers.viscous import EulerSolver, log
 from tqdm import tqdm
+
+import resume_state
 
 
 def count_folded_faces(eptm, tol=0.3):
@@ -85,9 +92,17 @@ class IVPSolver(EulerSolver):
         bounds=None,
         with_t1=False,
         with_t3=False,
+        resume_state_path=None,
     ):
         super().__init__(eptm, geom, model, history, auto_reconnect, manager, bounds, with_t1, with_t3)
         self.inner = inner
+        #: Where to write the per-snapshot resume state (None disables it, e.g.
+        #: for an in-memory History). See :mod:`resume_state`.
+        self.resume_state_path = resume_state_path
+        #: Loop scalars restored from a sidecar, consumed once by ``solve``.
+        self._resume_loop_state = None
+        #: The current loop scalars, refreshed by ``solve`` before each record.
+        self._loop_state = None
 
     def clip_new_pos(self, old_pos, new_pos):
         change_in_pos = new_pos - old_pos
@@ -108,11 +123,23 @@ class IVPSolver(EulerSolver):
         """Write a history snapshot at simulation time ``t`` and stamp
         the dt that produced the step. The stamp is stored as a column
         on ``face_df`` so it travels through every History backend
-        without changes to the archive schema."""
+        without changes to the archive schema.
+
+        Also writes this frame's RESUME STATE to the sidecar, so every frame
+        the archive holds can be continued from exactly, not just replayed
+        from t=0. Captured here, at the recording point, because that is the
+        one moment the sheet, both RNG streams, the event order and the
+        adaptive dt all belong to the same frame.
+        """
         if self.history is None:
             return
         self.eptm.face_df["step_dt"] = float(dt)
         self.history.record(time_stamp=t)
+        if self.resume_state_path:
+            resume_state.write(
+                self.resume_state_path, t,
+                resume_state.capture(self, self._loop_state),
+            )
 
     def solve(self, tf, dt, on_topo_change=None, topo_change_args=(),
               method=None, quasi_static=False, quasi_static_threshold=0.01,
@@ -278,8 +305,62 @@ class IVPSolver(EulerSolver):
         # topology-changing step resets it to zero.
         steady_streak = 0
 
+        # --- RESUME: continue the loop where the original run left off ---
+        # Restored HERE, after the nominal arguments have fixed ``initial_dt``,
+        # ``dt_min`` and the ratchet ceiling, so a resume inherits the adaptive
+        # STATE without inheriting a floored dt as its new nominal step.
+        # Without this a resume takes a different first step from the one the
+        # original run took at this time (it restarts at the nominal dt, having
+        # possibly been pinned 1000x smaller), saves on a different grid, and
+        # needs ``steady_state_min_steps`` fresh steady steps however many it
+        # had already accumulated.
+        _resumed = self._resume_loop_state
+        self._resume_loop_state = None          # consume it; one solve, one use
+        if _resumed:
+            dt = float(_resumed.get("next_dt", _resumed.get("dt", dt)))
+            next_save_t = float(_resumed.get("next_save_t", next_save_t))
+            steady_streak = int(_resumed.get("steady_streak", steady_streak))
+            last_differentiation_t = float(
+                _resumed.get("last_differentiation_t", last_differentiation_t))
+            self.eptm.settings["dt"] = dt
+            log.info("resuming the solver loop at t=%g with dt=%g, "
+                     "next save at %g, steady streak %d",
+                     current_t, dt, next_save_t, steady_streak)
+
+        def _record(t, dt_now):
+            """Snapshot the loop scalars, then record. ``_record_at`` writes
+            them to the resume sidecar along with the RNGs and the event
+            order; they are read off the live loop here so there is exactly
+            one place that knows what the loop's state is.
+
+            ``next_save_t`` is normalised to the next boundary STRICTLY after
+            ``t``, which is the invariant the save branch below restores right
+            after it records -- but it records first, so the raw variable is
+            one boundary stale at exactly the call that matters most for a
+            resume. Normalising here keeps every call site canonical, and a
+            resume therefore saves on the same grid instead of adding a frame
+            the original run does not have.
+            """
+            nst = float(next_save_t)
+            if save_interval and save_interval > 0:
+                while nst <= float(t):
+                    nst += save_interval
+            self._loop_state = {
+                # The step the NEXT iteration will take, not the one that
+                # produced this frame: the ratchet below runs AFTER the record,
+                # so the raw dt is one ratchet stale. (``step_dt`` on face_df
+                # still carries the dt that produced the step -- that is what
+                # analysis reads.) At the initial record dt is initial_dt, where
+                # the ratchet is a no-op, so this is exact there too.
+                "next_dt": min(float(dt_now) * dt_increase_factor, initial_dt),
+                "next_save_t": nst,
+                "steady_streak": int(steady_streak),
+                "last_differentiation_t": float(last_differentiation_t),
+            }
+            self._record_at(t, dt_now)
+
         # Record the initial state.
-        self._record_at(current_t, dt)
+        _record(current_t, dt)
 
         # Baseline number of self-intersecting (folded) faces. The fold safety
         # net (check C2 below) rejects a step only if it INCREASES this count —
@@ -315,7 +396,7 @@ class IVPSolver(EulerSolver):
                         log.warning("stopping at t=%g: wall-clock budget %.0fs "
                                     "exceeded (elapsed %.0fs)", current_t,
                                     max_wall_seconds, _now - _start_wall)
-                        self._record_at(current_t, dt)
+                        _record(current_t, dt)
                         raise RuntimeError(
                             f"simulation exceeded its wall-clock budget "
                             f"({max_wall_seconds:g}s) at t={current_t:g} of "
@@ -327,7 +408,7 @@ class IVPSolver(EulerSolver):
                             log.warning("stopping at t=%g: progress %.3g sim-time/s "
                                         "over last %.0fs < floor %.3g", current_t,
                                         _rate, _now - _progress_wall, min_progress_rate)
-                            self._record_at(current_t, dt)
+                            _record(current_t, dt)
                             raise RuntimeError(
                                 f"simulation progressing too slowly ({_rate:.3g} "
                                 f"sim-time/s < {min_progress_rate:g}) over the last "
@@ -402,7 +483,7 @@ class IVPSolver(EulerSolver):
                             pos_msg = f" at ({wx:.4f}, {wy:.4f})"
                         except Exception:
                             pos_msg = ""
-                        self._record_at(current_t, dt)
+                        _record(current_t, dt)
                         raise RuntimeError(
                             f"dt fell below {dt_min:.3e} (initial {initial_dt:.3e}) "
                             f"at t={current_t:g}: vertex {worst_vert_label}{pos_msg} "
@@ -440,7 +521,7 @@ class IVPSolver(EulerSolver):
                     dt *= 0.5
                     steady_streak = 0  # rejected step breaks the steady run
                     if dt < dt_min:
-                        self._record_at(current_t, dt)
+                        _record(current_t, dt)
                         raise RuntimeError(
                             f"dt fell below {dt_min:.3e} (initial {initial_dt:.3e}) "
                             f"at t={current_t:g}: edge crossing produced negative area"
@@ -491,7 +572,7 @@ class IVPSolver(EulerSolver):
                         )
                         continue
                     if not tolerate_unavoidable_folds:
-                        self._record_at(current_t, dt)
+                        _record(current_t, dt)
                         raise RuntimeError(
                             f"dt fell below {dt_min:.3e} (initial "
                             f"{initial_dt:.3e}) at t={current_t:g}: a step "
@@ -531,13 +612,25 @@ class IVPSolver(EulerSolver):
                 if self.manager is not None:
                     if quasi_static:
                         if (np.abs(pos - new_pos) < quasi_static_threshold).all():
-                            self.manager.append(
+                            # One-shot: it does NOT re-append itself, and the
+                            # interval since the last differentiation is baked
+                            # into the closure rather than passed as a kwarg.
+                            # Tag it so a resume can tell it apart from the
+                            # per-step differentiation (same inner function
+                            # name) and rebuild it with the same interval —
+                            # see resume_state.restore_manager.
+                            _one_shot_dt = current_t - last_differentiation_t
+                            _one_shot = (
                                 self.inner.lateral_inhibition_model
                                 .get_length_dependent_differentiation_function(
-                                    dt=current_t - last_differentiation_t,
+                                    dt=_one_shot_dt,
                                     quasi_static=True,
                                 )
                             )
+                            _one_shot.__name__ = \
+                                resume_state.QUASI_STATIC_DIFFERENTIATION
+                            _one_shot._resume_dt = float(_one_shot_dt)
+                            self.manager.append(_one_shot)
                             last_differentiation_t = current_t
                     self.eptm.update_after_each_time_step()
                     self.manager.execute(self.eptm)
@@ -620,7 +713,7 @@ class IVPSolver(EulerSolver):
                         # Record this state before breaking so the
                         # history's final frame is the steady-state
                         # snapshot.
-                        self._record_at(current_t, dt)
+                        _record(current_t, dt)
                         break
 
                 # --- Constant-time history saving ---
@@ -629,7 +722,7 @@ class IVPSolver(EulerSolver):
                 # dt skipped multiple boundaries, save once at current_t
                 # (the state hasn't changed across those skipped points).
                 if current_t >= next_save_t:
-                    self._record_at(current_t, dt)
+                    _record(current_t, dt)
                     # Advance past the current point so we don't double-save.
                     while next_save_t <= current_t:
                         next_save_t += save_interval
@@ -655,6 +748,6 @@ class IVPSolver(EulerSolver):
 
         # Make sure the final state is always recorded, even if it
         # doesn't land on a save boundary.
-        self._record_at(current_t, dt)
+        _record(current_t, dt)
 
 

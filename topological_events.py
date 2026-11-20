@@ -291,8 +291,20 @@ class TopologicalEventsHandler:
         # irreproducible for no visible reason. Drawing the seed from the
         # global stream ties it to run()'s seed, and leaves behaviour unchanged
         # when nothing seeded the global.
-        rng = (np.random.default_rng(int(np.random.randint(0, 2 ** 32)))
+        # ``dtype=np.int64`` explicitly: numpy's default integer dtype is the C
+        # long, which is 32-BIT ON WINDOWS, so a bare randint(0, 2**32) raised
+        # "high is out of bounds for int32" there -- this whole branch crashed
+        # on any Windows run of the random division rule. int64 is what the
+        # default already was on Linux, so the draw (and the stream position
+        # after it) is unchanged there.
+        rng = (np.random.default_rng(
+                   int(np.random.randint(0, 2 ** 32, dtype=np.int64)))
                if rng is None else rng)
+        # Kept on the handler as well as in the closure so a resume can save
+        # and restore its position: it is a SECOND stream, and seeding it from
+        # the top again on a resume would re-pick the same cells the original
+        # run picked at t=0 (see resume_state.capture_model).
+        self._division_rng = rng
 
         def random_division(sheet, manager):
             step = float(getattr(sheet, "settings", {}).get("dt", dt) or dt)

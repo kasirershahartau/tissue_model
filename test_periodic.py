@@ -5620,6 +5620,373 @@ class TestResumePreservesLIState:
         assert captured["delta_levels"] is arr
 
 
+class TestResumeState:
+    """A resume must continue the ORIGINAL trajectory, not start a new one from
+    the same sheet. The archive restores the geometry exactly (measured: vertex
+    positions, topology and edge row order are bit-identical in every frame);
+    everything else travels in the ``resume_state`` sidecar. Verified end to
+    end as well: an 8x8 array built to t=7 and resumed from t=3.51 is
+    BIT-IDENTICAL over all 36 remaining frames, while the same resume with the
+    sidecar deleted ends with 64 cells where the original has 82."""
+
+    # -- both generators ---------------------------------------------------
+    def test_both_generators_round_trip(self):
+        import random
+        import resume_state
+        np.random.seed(7)
+        random.seed(7)
+        np.random.rand(1234)                   # off the top of both streams
+        [random.random() for _ in range(55)]
+        state = resume_state.capture_rngs()
+        want_np = np.random.rand(5)
+        want_shuffle = list(range(20))
+        random.shuffle(want_shuffle)
+
+        np.random.seed(999)
+        random.seed(999)
+        resume_state.restore_rngs(state)
+        np.testing.assert_array_equal(np.random.rand(5), want_np)
+        got_shuffle = list(range(20))
+        random.shuffle(got_shuffle)
+        # The stdlib stream is the EVENT ORDER: same state, same shuffle.
+        assert got_shuffle == want_shuffle
+
+    # -- file I/O ----------------------------------------------------------
+    def test_sidecar_is_named_after_its_archive(self):
+        import resume_state
+        assert resume_state.sidecar_path(os.path.join("d", "history.hf5")) \
+            == os.path.join("d", "history_resume.jsonl")
+        assert resume_state.sidecar_path(None) is None
+
+    def test_read_is_exact_and_takes_the_last_write(self, tmp_path):
+        import resume_state
+        p = str(tmp_path / "history_resume.jsonl")
+        for t in (0.0, 0.1, 0.2, 0.3):
+            resume_state.write(p, t, {"format": 1, "tag": "first"})
+        resume_state.write(p, 0.2, {"format": 1, "tag": "second"})
+        # record() replaces the row at an existing time, so the LAST write wins.
+        assert resume_state.read(p, 0.2)["tag"] == "second"
+        assert resume_state.read(p, 0.2 + 1e-12)["tag"] == "second"
+        # NOT the nearest: a frame with no line of its own (killed between the
+        # archive append and this one) must fall back to "no resume state"
+        # rather than be paired with a neighbouring frame's RNG position.
+        assert resume_state.read(p, 0.1999) is None
+
+    def test_truncate_drops_the_tail_and_dedupes(self, tmp_path):
+        import resume_state
+        p = str(tmp_path / "history_resume.jsonl")
+        for t in (0.0, 0.1, 0.2, 0.3, 0.4):
+            resume_state.write(p, t, {"format": 1})
+        resume_state.write(p, 0.2, {"format": 1, "tag": "again"})
+        assert resume_state.truncate(p, 0.2) == 3
+        assert [r["t"] for r in resume_state._iter_records(p)] == [0.0, 0.1, 0.2]
+        # de-duplication keeps the LAST record at the kept stamp
+        assert resume_state.read(p, 0.2)["tag"] == "again"
+
+    def test_a_missing_sidecar_is_not_an_error(self, tmp_path):
+        """Every run recorded before the sidecar existed has none; resuming one
+        must still work (with a warning), not raise."""
+        import resume_state
+        p = str(tmp_path / "nope_resume.jsonl")
+        assert resume_state.read(p, 1.0) is None
+        assert resume_state.truncate(p, 1.0) == 0
+
+    # -- the event manager -------------------------------------------------
+    @staticmethod
+    def _manager(behaviors):
+        from tyssue.behaviors import EventManager
+        m = EventManager("face")
+        for b in behaviors:
+            m.append(b)
+        return m
+
+    @staticmethod
+    def _named(name):
+        def behavior(eptm, manager, **kwargs):
+            manager.append(behavior)
+        behavior.__name__ = name
+        return behavior
+
+    def test_event_order_is_restored_by_name(self):
+        import resume_state
+        names = ["division", "intercalation", "delamination",
+                 "update_virtual_vertices"]
+        live = self._manager([self._named(n) for n in names])
+        live.update()                      # shuffles next -> current
+        recorded = resume_state.capture_manager(live)
+        order = [e["name"] for e in recorded["current"]]
+
+        fresh = self._manager([self._named(n) for n in names])
+        resume_state.restore_manager(fresh, recorded)
+        assert [b.__name__ for b, _ in fresh.current] == order
+        assert fresh.clock == live.clock
+
+    def test_a_one_shot_that_already_fired_is_not_re_appended(self):
+        """``ablation`` (and, in quasi-static mode, the differentiation
+        appended at setup) does not re-append itself, so it is absent from any
+        queue recorded after the first step. Re-appending it would re-tag a
+        dying cell / inject a differentiation step the original run never
+        took."""
+        import resume_state
+        live = self._manager([self._named("division"), self._named("ablation")])
+        live.update()
+        live.current = type(live.current)(
+            [e for e in live.current if e[0].__name__ != "ablation"])
+        recorded = resume_state.capture_manager(live)
+
+        fresh = self._manager([self._named("division"), self._named("ablation")])
+        notes = resume_state.restore_manager(fresh, recorded)
+        queued = [b.__name__ for b, _ in fresh.current] + \
+                 [b.__name__ for b, _ in fresh.next]
+        assert "ablation" not in queued
+        assert any("ablation" in n and "dropped" in n for n in notes), notes
+
+    # -- cell labels -------------------------------------------------------
+    def test_unique_id_is_restored_with_its_dtype(self):
+        """tyssue's Epithelium.__init__ overwrites ``unique_id`` with the row
+        index, so a resume's sheet comes back relabelled. The labels key
+        labels.npy / contact_matrix.npy / cell_info.pkl."""
+        import resume_state
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.face_df["unique_id"] = np.arange(sheet.Nf) + 100
+        sheet.specs.setdefault("face", {})["unique_id_max"] = 999
+        state = resume_state.capture_identity(sheet)
+
+        sheet.face_df["unique_id"] = np.arange(sheet.Nf)
+        sheet.specs["face"]["unique_id_max"] = sheet.Nf
+        resume_state.restore_identity(sheet, state)
+        np.testing.assert_array_equal(sheet.face_df["unique_id"].to_numpy(),
+                                      np.arange(sheet.Nf) + 100)
+        assert sheet.specs["face"]["unique_id_max"] == 999
+        assert sheet.face_df["unique_id"].dtype == np.dtype("int64")
+
+    def test_identity_is_not_applied_to_a_different_frame(self):
+        import resume_state
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.face_df["unique_id"] = np.arange(sheet.Nf)
+        state = resume_state.capture_identity(sheet)
+        other = _build_sheet_with_virtuals(6, 6)
+        other.face_df["unique_id"] = np.arange(other.Nf)
+        notes = resume_state.restore_identity(other, state)
+        assert any("NOT restored" in n for n in notes), notes
+        np.testing.assert_array_equal(other.face_df["unique_id"].to_numpy(),
+                                      np.arange(other.Nf))
+
+    # -- the measured length unit -----------------------------------------
+    def test_l0_is_restored_to_full_precision(self):
+        """L0 is a measured mean perimeter; ``l0.txt`` used to record 12
+        significant digits, so an inheriting run's L0 differed in the last
+        bits. Nothing depends on that until the first set_random_parameters
+        draw (A0 = N(mean, std) * L0**2) -- and then the trajectories part."""
+        import resume_state
+
+        class _LI:
+            length_normalization_factor = None
+
+        class _Inner:
+            def __init__(self, l0):
+                self.length_normalization_factor = l0
+                self.lateral_inhibition_model = _LI()
+
+        exact = 1.5 + float(np.sqrt(5))        # what the lattice measures
+        lossy = float("%.12g" % exact)         # what l0.txt could carry
+        assert lossy != exact
+        state = resume_state.capture_model(_Inner(exact))
+        inner = _Inner(lossy)
+        notes = resume_state.restore_model(inner, state)
+        assert inner.length_normalization_factor == exact
+        assert inner.lateral_inhibition_model.length_normalization_factor == exact
+        assert any("L0" in n for n in notes), notes
+
+    def test_write_l0_round_trips_exactly(self, tmp_path):
+        import run_model
+        exact = 1.5 + float(np.sqrt(5))
+        d = tmp_path / "run"
+        d.mkdir()
+        run_model._write_L0(str(d), exact)
+        assert float((d / "l0.txt").read_text().strip()) == exact
+
+    # -- the countdowns ----------------------------------------------------
+    def test_the_random_forces_countdown_is_restored(self):
+        import resume_state
+
+        class _Inner:
+            time_to_random = 1.25
+            length_normalization_factor = 1.0
+            topological_events_handler = None
+            lateral_inhibition_model = None
+
+        state = resume_state.capture_model(_Inner())
+        inner = _Inner()
+        inner.time_to_random = 5.0             # what a fresh run starts at
+        resume_state.restore_model(inner, state)
+        assert inner.time_to_random == pytest.approx(1.25)
+
+    def test_the_random_division_stream_is_restored(self):
+        """The random division rule draws from its OWN PCG64 stream, so seeding
+        the global generators does not place it."""
+        import resume_state
+        from topological_events import TopologicalEventsHandler
+
+        np.random.seed(0)
+        handler = TopologicalEventsHandler(model=None)
+        handler.get_random_division_function(interval=1.0, dt=0.01)
+        rng = handler._division_rng
+        rng.random(37)                         # move it off its seed
+        state = resume_state.capture_model(
+            type("I", (), {"topological_events_handler": handler,
+                           "length_normalization_factor": None,
+                           "lateral_inhibition_model": None})())
+        want = rng.random(5)
+
+        np.random.seed(0)
+        handler2 = TopologicalEventsHandler(model=None)
+        handler2.get_random_division_function(interval=1.0, dt=0.01)
+        resume_state.restore_model(
+            type("I", (), {"topological_events_handler": handler2,
+                           "length_normalization_factor": None,
+                           "lateral_inhibition_model": None})(), state)
+        np.testing.assert_array_equal(handler2._division_rng.random(5), want)
+
+    # -- the solver loop ---------------------------------------------------
+    @staticmethod
+    def _tiny_solver(history=None, resume_state_path=None):
+        from solvers import IVPSolver
+        from tyssue.dynamics import model_factory
+        from tyssue.dynamics.effectors import (FaceContractility,
+                                               FaceAreaElasticity)
+        sheet = VirtualSheet.planar_virtual_sheet_2d(
+            "resume_dt", nx=2, ny=2, distx=1.0, disty=1.0,
+            maximal_bond_length=10.0, minimal_bond_length=0.05,
+            periodic=True, draw_debug=False,
+        )
+        sheet.vert_df["viscosity"] = 1.0
+        sheet.vert_df["is_active"] = 1
+        sheet.active_verts = np.arange(sheet.Nv)
+        sheet.edge_df["is_active"] = 1
+        sheet.face_df["is_active"] = 1
+        from tyssue import History
+        hist = History(sheet, save_every=0.1, save_all=False, dt=0.01) \
+            if history is None else history
+        solver = IVPSolver(
+            None, sheet, sheet.geom,
+            model_factory([FaceContractility, FaceAreaElasticity]),
+            manager=None, history=hist, resume_state_path=resume_state_path,
+        )
+        solver.ode_func = lambda t, pos: np.zeros_like(pos)   # nothing moves
+        return sheet, solver
+
+    def test_solver_resumes_from_the_restored_step(self):
+        """The adaptive dt is state: the original run may have been pinned far
+        below the nominal step. A resume must take ITS step, not the nominal
+        one -- and must not adopt it as the new nominal (the floor and the
+        ratchet ceiling come from the caller)."""
+        sheet, solver = self._tiny_solver()
+        solver.prev_t = 1.0
+        solver._resume_loop_state = {"next_dt": 0.0025, "next_save_t": 1.001,
+                                     "steady_streak": 0,
+                                     "last_differentiation_t": 1.0}
+        solver.solve(tf=1.02, dt=0.01, max_displacement=1.0,
+                     save_interval=0.001)
+        # tyssue's in-memory History records the sheet at t=0 when it is
+        # constructed, before the solver's clock is moved; ignore that frame.
+        ts = sorted(t for t in set(round(float(t), 9)
+                                   for t in solver.history.time_stamps)
+                    if t >= 1.0)
+        assert ts[0] == pytest.approx(1.0)
+        # First step is the RESTORED dt, then the ratchet grows it back.
+        assert ts[1] - ts[0] == pytest.approx(0.0025, rel=1e-9)
+        assert ts[2] - ts[1] == pytest.approx(0.0025 * 1.1, rel=1e-9)
+
+    def test_without_a_resume_state_the_nominal_step_is_used(self):
+        sheet, solver = self._tiny_solver()
+        solver.solve(tf=0.02, dt=0.005, max_displacement=1.0,
+                     save_interval=0.001)
+        ts = sorted(set(round(float(t), 9) for t in solver.history.time_stamps))
+        assert ts[1] - ts[0] == pytest.approx(0.005, rel=1e-9)
+
+    def test_each_recorded_frame_gets_a_sidecar_line(self, tmp_path):
+        import resume_state
+        p = str(tmp_path / "history_resume.jsonl")
+        sheet, solver = self._tiny_solver(resume_state_path=p)
+        solver.solve(tf=0.03, dt=0.01, max_displacement=1.0,
+                     save_interval=0.01)
+        frames = sorted(set(round(float(t), 9)
+                            for t in solver.history.time_stamps))
+        recorded = sorted(set(round(r["t"], 9)
+                              for r in resume_state._iter_records(p)))
+        assert recorded == frames
+        one = resume_state.read(p, frames[-1])
+        assert one["rngs"]["numpy"]["kind"] == "MT19937"
+        assert one["loop"]["next_dt"] == pytest.approx(0.01)
+        # ``next_save_t`` is normalised past the frame it is recorded with, so
+        # a resume saves on the same grid instead of adding a frame.
+        assert one["loop"]["next_save_t"] > frames[-1]
+
+    # -- run() plumbing ----------------------------------------------------
+    def test_resume_snaps_to_an_actual_recorded_stamp(self, tmp_path):
+        """The loader snaps the requested time to the nearest frame; the solver
+        clock and the truncation have to name that same frame."""
+        import run_model
+        d = tmp_path / "run"
+        d.mkdir()
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.get_opposite()
+        TestForkFromSnapshot._write_minimal_history(
+            str(d / "history.hf5"), sheet, [0.01, 0.11, 0.21])
+        assert run_model._nearest_archive_time(str(d), 0.1) \
+            == pytest.approx(0.11)
+        assert run_model._nearest_archive_time(str(d), 0.0) \
+            == pytest.approx(0.01)
+        assert run_model._nearest_archive_time(str(tmp_path / "nope"), 1.0) \
+            is None
+
+    def test_restore_array_run_asks_for_a_fresh_stream(self, monkeypatch):
+        """Its whole point is to replace a folded tail; reproducing the
+        original continuation would reproduce the fold."""
+        import run_model
+        captured = {}
+        monkeypatch.setattr(run_model, "run",
+                            lambda *a, **kw: captured.update(kw) or "n")
+        run_model.restore_array_run(3, continue_from_time=5.0, t_end=7.0)
+        assert captured["restore_resume_state"] is False
+        assert captured["continue_existing_run"] is True
+
+    def test_derived_per_cell_columns_are_restored(self):
+        """``InnerEarModel.__init__`` resets every spec-backed column to the
+        by-type default. The ones the model DERIVES per cell (atoh
+        interpolation, the random_forces draws, ``type``) are state, and the
+        solver evaluates the forces BEFORE the first differentiation step that
+        would recompute them."""
+        import run_model
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.get_opposite()
+
+        class _Inner:
+            face_params = {"prefered_area": None, "contractility": None}
+            edge_params = {"line_tension": None}
+
+            def __init__(self, s):
+                self.sheet = s
+
+        saved = {"face": sheet.face_df.copy(), "edge": sheet.edge_df.copy()}
+        saved["face"]["prefered_area"] = np.linspace(0.3, 0.9, sheet.Nf)
+        saved["face"]["contractility"] = 0.07
+        saved["face"]["type"] = 1
+        saved["edge"]["line_tension"] = 0.5
+        sheet.face_df["prefered_area"] = 1.0        # the by-type default
+        sheet.face_df["contractility"] = 0.0
+        sheet.face_df["type"] = 0
+        sheet.edge_df["line_tension"] = 0.0
+
+        run_model._restore_derived_columns(_Inner(sheet), saved)
+        np.testing.assert_allclose(sheet.face_df["prefered_area"].to_numpy(),
+                                   np.linspace(0.3, 0.9, sheet.Nf))
+        assert (sheet.face_df["type"] == 1).all()
+        assert sheet.face_df["type"].dtype == np.dtype("int64")
+        np.testing.assert_allclose(sheet.edge_df["line_tension"].to_numpy(), 0.5)
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 

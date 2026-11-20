@@ -28,6 +28,7 @@ Vocabulary: cell types are stored as ``'HC'`` and ``'SC'`` and the signal column
 as ``atoh_level`` / ``delta_level``, named for the biological system this was
 written for; read them as primary / secondary and signal.
 """
+import logging
 import os.path
 import sys
 import tyssue
@@ -47,6 +48,11 @@ from matplotlib import pyplot as plt
 
 from empty_effector import EmptyAffector
 from topological_events import TopologicalEventsHandler
+import resume_state
+
+#: ``"inner_ear_model"`` is one of run_model._DEBUG_LOG_TARGETS, so anything
+#: logged here lands in the run's debug.log.
+log = logging.getLogger(__name__)
 
 
 class ContractilityPerimeterElasticity(PerimeterElasticity):
@@ -1097,7 +1103,8 @@ class InnerEarModel:
                  dt_min_factor=0.0001, dt_increase_factor=1.1,
                  until_steady_state=False, lateral_inhibition_threshold=1e-3, save_every=0.1,
                  continue_from_time=None, steady_state_min_steps=4,
-                 max_wall_seconds=None, min_progress_rate=None, progress_window_seconds=30.0):
+                 max_wall_seconds=None, min_progress_rate=None, progress_window_seconds=30.0,
+                 restore_resume_state=True):
         """Run the simulation until ``t_end`` (or, if
         ``until_steady_state`` is True, until the dynamics settle).
 
@@ -1165,6 +1172,19 @@ class InnerEarModel:
         When ``continue_from_time`` is ``None`` (the default) the
         normal "fresh run" behaviour is preserved: any pre-existing
         archive at ``history_file`` is deleted before recording.
+
+        ``restore_resume_state`` (default True) additionally restores the
+        live state the archive has no room for — both RNG streams
+        mid-stream, the shuffled event order, the model's countdowns,
+        the adaptive ``dt`` — from the sidecar written beside the
+        archive, so the continuation is the one the original run would
+        have taken. Pass False to continue from the same sheet with a
+        FRESH stream instead, which is what you want when the point of
+        the resume is to get a DIFFERENT tail (see
+        ``run_model.restore_array_run``) rather than to reproduce the
+        old one. Either way the continuation is reproducible: with the
+        sidecar from the sidecar, without it from the run's recorded
+        seed.
         """
         manager = EventManager("face")
         # Interior-angle threshold (radians) for the incipient-fold sharp-corner
@@ -1267,6 +1287,13 @@ class InnerEarModel:
         # loop): the partial archive can be opened from another process
         # while the simulation is still running. Without it we fall back
         # to in-memory History (faster for short runs).
+        # The resume sidecar lives beside the archive and carries, per recorded
+        # frame, the state the archive has no column for: both RNG streams, the
+        # event order, the model's countdowns, the adaptive dt. Without it a
+        # resume restarts every one of those from scratch and the continuation
+        # is a different (equally valid) trajectory. See :mod:`resume_state`.
+        sidecar = resume_state.sidecar_path(history_file)
+        resumed_state = None
         if history_file is not None:
             if continue_from_time is not None:
                 # Resuming a previous run: keep the snapshots up to
@@ -1289,16 +1316,32 @@ class InnerEarModel:
                 _rewrite_history_for_resume(
                     history_file, continue_from_time, history,
                 )
+                # Read BEFORE truncating (the record at the resume time
+                # survives either way, but the read must not depend on that),
+                # then drop the abandoned tail so the sidecar and the archive
+                # stay in step. The truncate happens even when the state is
+                # not being restored: the tail belongs to a trajectory this
+                # run is replacing either way, and the new continuation
+                # records its own state as it goes.
+                if restore_resume_state:
+                    resumed_state = resume_state.read(sidecar,
+                                                      continue_from_time)
+                resume_state.truncate(sidecar, continue_from_time)
             else:
                 # Remove an existing file so HistoryHdf5 doesn't auto-rename.
                 if os.path.isfile(history_file):
                     os.remove(history_file)
+                # ... and the stale sidecar with it: a fresh run must not
+                # inherit the resume state of whatever used to be here.
+                if sidecar and os.path.isfile(sidecar):
+                    os.remove(sidecar)
                 history = HistoryHdf5(self.sheet, save_every=save_every, dt=dt,
                                        hf5file=history_file, overwrite=True)
         else:
             history = History(self.sheet, save_every=save_every, save_all=False, dt=dt)
         model = self.get_model(only_differentiation, effectors=effectors)
-        solver = IVPSolver(self, self.sheet, self.sheet.geom, model, manager=manager, history=history, auto_reconnect=False)
+        solver = IVPSolver(self, self.sheet, self.sheet.geom, model, manager=manager, history=history, auto_reconnect=False,
+                           resume_state_path=sidecar)
         # When resuming, seed the solver's clock so its ``while
         # current_t < tf`` loop starts at the resume time. Without
         # this the solver would happily begin at t=0 and double-cover
@@ -1309,6 +1352,35 @@ class InnerEarModel:
             # so the first ``_record_at`` call doesn't mis-tag the
             # initial snapshot.
             history.time = float(continue_from_time)
+            # Put the live state back: both RNG streams mid-stream, the
+            # shuffled event order, the countdowns, the cell labels and the
+            # solver's loop scalars. AFTER the manager is fully populated
+            # (restore_manager replays the recorded order against the
+            # behaviours it holds) and BEFORE solve().
+            if resumed_state is not None:
+                for note in resume_state.apply(
+                        solver, resumed_state,
+                        atoh_by_repressor=atoh_by_repressor):
+                    log.info("resume: %s", note)
+                log.info("resume: state restored from %s (frame t=%g)",
+                         sidecar, resumed_state.get("t", float("nan")))
+            elif not restore_resume_state:
+                log.info(
+                    "resume: restore_resume_state=False, so this continues "
+                    "from the frame at t=%s with a FRESH stream -- a new "
+                    "trajectory off the same sheet, reproducible from this "
+                    "run's own recorded seed rather than from the sidecar.",
+                    continue_from_time)
+            else:
+                log.warning(
+                    "resume: no resume state for t=%s in %s. The sheet is "
+                    "restored exactly, but the RNG streams, the event order "
+                    "and the solver's adaptive step all restart from scratch, "
+                    "so this continuation is a NEW trajectory rather than the "
+                    "one the original run would have taken (it is still "
+                    "reproducible from this run's recorded seed). Runs "
+                    "recorded before the sidecar existed have none.",
+                    continue_from_time, sidecar)
 
         # Translate the differentiation flags into the solver's
         # steady-state check flags. ``only_differentiation`` means
