@@ -54,6 +54,13 @@ import resume_state
 #: logged here lands in the run's debug.log.
 log = logging.getLogger(__name__)
 
+#: Per-cell preferred area: the area each cell had in the INITIAL array, held
+#: constant for the whole run and inherited by every fork and resume. Spelled
+#: like tyssue's misspelled ``prefered_area``, which the effectors read, so the
+#: pair is obvious in a dataframe dump. Kept OUT of the spec dict on purpose --
+#: see :meth:`InnerEarModel.set_preferred_area_per_cell`.
+PREFERRED_AREA_INITIAL = "prefered_area_initial"
+
 
 class ContractilityPerimeterElasticity(PerimeterElasticity):
     """Perimeter elasticity ``1/2 * contractility * (perimeter - prefered_perimeter)**2``.
@@ -450,7 +457,8 @@ class InnerEarModel:
                  notch_levels=None, delta_levels=None, repressor_levels=None,
                  initial_notch_delta_level=None,
                  length_normalization_factor=None, l0_ratio=1.0,
-                 random_area_stage=None, uniform_delta_level=None):
+                 random_area_stage=None, uniform_delta_level=None,
+                 preferred_area_per_cell=False):
         # Setting class constants
         self.CELL_TYPES = ['SC', 'HC']
         self.DIMENSIONS = ['2D']
@@ -535,6 +543,14 @@ class InnerEarModel:
         # same time (one shared P0 drives them together).
         p0_hc = float(shape_index if hc_shape_index is None else hc_shape_index)
         p0_sc = float(shape_index if sc_shape_index is None else sc_shape_index)
+        # Kept as the SHAPE INDICES, not only folded into the per-type target
+        # perimeters below, because with a PER-CELL A0 the target perimeter is
+        # p0(type) * sqrt(A0_i) and the product cannot be precomputed per type.
+        self.shape_index_by_type = {'HC': p0_hc, 'SC': p0_sc}
+        #: Per-cell preferred area: A0_i is the cell's area in the INITIAL array
+        #: rather than one fitted number for the whole tissue. See
+        #: :meth:`set_preferred_area_per_cell`.
+        self.preferred_area_per_cell = bool(preferred_area_per_cell)
         self.face_params = {"contractility": contractility, "repulsion": repulsion,
                             "repulsion_distance": repulsion_distance,
                             "prefered_area": preferred_area,
@@ -610,6 +626,25 @@ class InnerEarModel:
         for param in self.face_params.keys():
             new_values = atoh_level * self.face_params[param]["HC"] + (1 - atoh_level) * self.face_params[param]["SC"]
             self.sheet.face_df.loc[differentiating_cells,param] = new_values[differentiating_cells]
+        if (self.preferred_area_per_cell
+                and PREFERRED_AREA_INITIAL in self.sheet.face_df.columns):
+            # A0 is the cell's own INITIAL area, not a per-type number, so the
+            # interpolation above must not have the last word on the three
+            # columns derived from it. Re-applied here rather than skipped in
+            # the loop so there is one place that knows what A0 means.
+            # Restricted to the same ``type >= 0`` rows: a cell tagged for
+            # removal has had its target area driven to 0 on purpose, and
+            # putting A0 back would resurrect it.
+            #
+            # The column test is not defensive clutter: __init__ calls this
+            # method (to set the per-type mechanics from the loaded atoh)
+            # BEFORE the carrier exists on a sheet that has to measure it, and
+            # the areas cannot be measured until the edge order is final at the
+            # end of __init__. So the first application happens when
+            # set_preferred_area_per_cell runs; from then on every call lands
+            # here.
+            self._apply_preferred_area_per_cell(differentiating_cells,
+                                                atoh_level)
 
         new_types = (atoh_level > self.differentiation_threshold).astype(np.int32)
         self.sheet.face_df.loc[differentiating_cells, 'type'] = new_types[differentiating_cells]
@@ -627,6 +662,102 @@ class InnerEarModel:
             new_vals[np.logical_and(first_types == 0, second_types == 1)] = self.edge_params[param][("SC", "HC")]
             new_vals[np.logical_and(first_types == 0, second_types == 0)] = self.edge_params[param][("SC", "SC")]
             self.sheet.edge_df.loc[:, param] = new_vals
+
+    def set_preferred_area_per_cell(self, areas=None):
+        """Fix every cell's A0 to its area in the INITIAL array.
+
+        A0 stops being one fitted number for the whole tissue and becomes data:
+        each cell's target area is the area that cell had in the array the run
+        starts from, so the array's area HETEROGENEITY is inherited instead of
+        replaced by a uniform target.
+
+        The value lives in the ``prefered_area_initial`` column (misspelled to
+        sit beside tyssue's ``prefered_area``, which the effectors read), and
+        that column is the carrier for the whole lineage:
+
+        * it is deliberately NOT in the spec dict, so
+          ``update_specs(..., reset=True)`` -- which wipes every per-type
+          parameter column at construction -- leaves it alone, exactly as the
+          lateral-inhibition levels are left alone;
+        * it travels in the history archive, so a FORK or a RESUME loads it
+          already aligned with the sheet, and INHERITS it. A run whose source
+          frame carries it therefore keeps the ORIGINAL initial array's areas,
+          however far the tissue has relaxed since -- which is what the
+          ablation run needs: it forks from the base run's relaxed steady state
+          and must be the same mechanical system as the base run, not one
+          re-referenced to the relaxed areas;
+        * a sheet without it is itself the initial array, so the areas are
+          MEASURED here (``areas`` overrides, for a caller that knows better).
+
+        A DIVISION copies the mother's row, so a daughter inherits the mother's
+        A0. That is the only sensible default available (the daughter has no
+        area in the initial array) and it is irrelevant to the mechanical fit,
+        which runs with divisions off.
+
+        Returns ``(source, a0)`` with ``source`` in ``{"inherited",
+        "measured"}``.
+        """
+        face = self.sheet.face_df
+        col = PREFERRED_AREA_INITIAL
+        have = None
+        if col in face.columns:
+            have = face[col].to_numpy(float)
+            if not (np.isfinite(have).all() and (have > 0).all()):
+                log.warning("%s is present but not usable (%d non-positive / "
+                            "non-finite of %d); measuring this frame's areas "
+                            "instead", col, int((~(have > 0)).sum()), have.size)
+                have = None
+        if have is not None:
+            source, a0 = "inherited", have
+        else:
+            if areas is None:
+                # The archived ``area`` column is recomputed from the loaded
+                # positions anyway; update first so A0 is this frame's geometry
+                # and not whatever was last stamped on the column.
+                self.sheet.geom.update_all(self.sheet)
+                areas = face["area"].to_numpy(float)
+            a0 = np.asarray(areas, dtype=float)
+            if a0.shape != (len(face),):
+                raise ValueError(
+                    "per-cell A0 needs one area per face: got %s for %d faces"
+                    % (a0.shape, len(face)))
+            if not (np.isfinite(a0).all() and (a0 > 0).all()):
+                raise ValueError(
+                    "per-cell A0 must be finite and positive; %d of %d are not"
+                    % (int((~(a0 > 0)).sum()), a0.size))
+            face[col] = a0
+            source = "measured"
+        self._apply_preferred_area_per_cell(
+            face.query("type >= 0").index,
+            face["atoh_level"] if "atoh_level" in face.columns else None,
+        )
+        return source, a0
+
+    def _apply_preferred_area_per_cell(self, cells, atoh_level):
+        """Write the per-cell A0 (and the target perimeter it implies) onto the
+        columns the effectors read. ``cells`` is the ``type >= 0`` subset: a
+        cell tagged for removal keeps the zeroed target area that is collapsing
+        it."""
+        face = self.sheet.face_df
+        a0 = face[PREFERRED_AREA_INITIAL]
+        face.loc[cells, "prefered_area"] = a0.loc[cells]
+        if "prefered_vol" in face.columns:
+            face.loc[cells, "prefered_vol"] = a0.loc[cells]
+        if "prefered_perimeter" in face.columns:
+            # P0_i = p0(type_i) * sqrt(A0_i). Per type the product is a
+            # constant and ``face_params`` can hold it; per cell it cannot, so
+            # the SHAPE INDEX is interpolated in atoh and multiplied by the
+            # cell's own sqrt(A0). p0 = 0 (the v2 model) gives 0 either way.
+            if atoh_level is None:
+                p0 = pd.Series(self.shape_index_by_type['SC'], index=face.index)
+            else:
+                atoh = (atoh_level if isinstance(atoh_level, pd.Series)
+                        else pd.Series(np.asarray(atoh_level, float),
+                                       index=face.index))
+                p0 = (atoh * self.shape_index_by_type['HC']
+                      + (1.0 - atoh) * self.shape_index_by_type['SC'])
+            face.loc[cells, "prefered_perimeter"] = (
+                p0 * np.sqrt(a0)).loc[cells]
 
     def set_random_parameters(self):
         """Re-draw the per-cell mechanical parameters (every ``wait_time`` units

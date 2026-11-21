@@ -48,13 +48,33 @@ def _evaluate_mechanics_for_sheet(args):
     :func:`extract_model_mechanics` so the HC/SC classification is identical for
     every sheet; ``fix_threshold=None`` keeps the per-run calculated mid-range
     threshold.
+
+    A0. The 21-field task sets ONE preferred area for the whole tissue
+    (``preferred_area``). An optional 22nd field asks for A0 PER CELL instead,
+    taken from the initial array's own cell areas; ``preferred_area`` must then
+    be None. The ablation run INHERITS those areas rather than re-measuring —
+    it forks the base run's relaxed steady state, and re-measuring there would
+    make it a different mechanical system from the run it is compared against.
     """
+    args = tuple(args)
     (gammaSC, gammaHC_ratio, alphaHC_ratio, initial, experimental_stage,
      ablated_cells, post_ablation_frame, fix_threshold, type_by,
      max_wall_seconds, min_progress_rate, progress_window_seconds,
      rerun_stalled_runs, shape_index,
      base_quasi_static_threshold, ablation_quasi_static_threshold, line_tension,
-     hc_shape_index, sc_shape_index, bending, preferred_area) = args
+     hc_shape_index, sc_shape_index, bending, preferred_area) = args[:21]
+    # OPTIONAL 22nd field, so the task tuples the existing drivers build
+    # (grid_fit_mechanics_v2, p0_gamma_scan, p0_from_e17_stiffness,
+    # score_point) keep working unchanged. True sets A0 per cell from the
+    # initial array's areas instead of using ``preferred_area`` for the whole
+    # tissue, and then ``preferred_area`` must be None.
+    preferred_area_per_cell = bool(args[21]) if len(args) > 21 else False
+    if preferred_area_per_cell and preferred_area is not None:
+        raise ValueError(
+            "a task cannot ask for per-cell A0 AND a uniform preferred_area "
+            "(%r)" % (preferred_area,))
+    a0_kwargs = dict(preferred_area_per_cell=True) if preferred_area_per_cell \
+        else dict(preferred_area_override=preferred_area)
     # Optional non-progress safety net: a crawling parameter region bails with a
     # RuntimeError (caught below) so it scores worst-case instead of stalling.
     stall_kwargs = dict(max_wall_seconds=max_wall_seconds,
@@ -87,7 +107,8 @@ def _evaluate_mechanics_for_sheet(args):
         quasi_static_threshold=base_quasi_static_threshold,
         line_tension=line_tension, bending=bending,
         hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
-        preferred_area=preferred_area)
+        preferred_area=preferred_area,
+        preferred_area_per_cell=preferred_area_per_cell)
     print("[mechanics] START  %s  (initial=%s, gammaSC=%.4g, gammaHC_ratio=%.4g, "
           "alphaHC_ratio=%.4g, shape_index=%.4g)" % (model_name, initial, gammaSC,
                                    gammaHC_ratio, alphaHC_ratio, shape_index), flush=True)
@@ -104,8 +125,8 @@ def _evaluate_mechanics_for_sheet(args):
                 quasi_static_threshold=base_quasi_static_threshold,
                 line_tension=line_tension, bending=bending,
                 hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
-                preferred_area_override=preferred_area,
                 save_interval=_FIT_SAVE_INTERVAL,
+                **a0_kwargs,
                 **li_kwargs, **stall_kwargs, **atoh_kwargs))
 
         ablation_kwargs = {}
@@ -119,7 +140,11 @@ def _evaluate_mechanics_for_sheet(args):
                         quasi_static_threshold=ablation_quasi_static_threshold,
                         line_tension=line_tension, bending=bending,
                         hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
-                        preferred_area_override=preferred_area,
+                        # Per-cell A0 is INHERITED here, not re-measured: this
+                        # run forks the base run's relaxed steady state, whose
+                        # frame carries the initial array's areas in
+                        # prefered_area_initial.
+                        **a0_kwargs,
                         # Safe to coarsen ONLY when the analysis reads the LAST
                         # frame (-1), which is always recorded. A positive frame
                         # INDEX would point at a different simulation time under

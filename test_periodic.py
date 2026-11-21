@@ -5987,6 +5987,222 @@ class TestResumeState:
         np.testing.assert_allclose(sheet.edge_df["line_tension"].to_numpy(), 0.5)
 
 
+class TestPreferredAreaPerCell:
+    """A0 per cell, fixed to the cell's area in the INITIAL array.
+
+    A0 stops being a fitted number for the whole tissue and becomes data, so
+    the array's area heterogeneity is inherited instead of replaced by a
+    uniform target. It must be fixed for the whole run and inherited by every
+    fork and resume — in particular the ablation run, which forks the base
+    run's RELAXED steady state and would otherwise re-reference itself to the
+    relaxed areas and stop being the same mechanical system as the run it is
+    compared against."""
+
+    @staticmethod
+    def _model(sheet, **kw):
+        from inner_ear_model import InnerEarModel
+        kw.setdefault("contractility", {"HC": 0.4, "SC": 0.1})
+        kw.setdefault("elasticity", {"HC": 2.0, "SC": 1.0})
+        kw.setdefault("atoh_sensitivity", 0.4)
+        return InnerEarModel(sheet, preferred_area_per_cell=True, **kw)
+
+    def _sheet(self):
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.get_opposite()
+        sheet.geom.update_all(sheet)
+        return sheet
+
+    def test_measures_this_frame_when_there_is_nothing_to_inherit(self):
+        from inner_ear_model import PREFERRED_AREA_INITIAL as COL
+        sheet = self._sheet()
+        inner = self._model(sheet)
+        areas = sheet.face_df["area"].to_numpy(float).copy()
+        source, a0 = inner.set_preferred_area_per_cell()
+        assert source == "measured"
+        np.testing.assert_array_equal(sheet.face_df[COL].to_numpy(float), areas)
+        np.testing.assert_array_equal(
+            sheet.face_df["prefered_area"].to_numpy(float), areas)
+        np.testing.assert_array_equal(
+            sheet.face_df["prefered_vol"].to_numpy(float), areas)
+
+    def test_inherits_the_carrier_column_instead_of_re_measuring(self):
+        """The ablation run's case: the sheet it loads has relaxed far from the
+        initial array, and the areas it would measure are the wrong answer."""
+        from inner_ear_model import PREFERRED_AREA_INITIAL as COL
+        sheet = self._sheet()
+        inherited = sheet.face_df["area"].to_numpy(float) * 1.37
+        sheet.face_df[COL] = inherited
+        inner = self._model(sheet)
+        source, a0 = inner.set_preferred_area_per_cell()
+        assert source == "inherited"
+        np.testing.assert_array_equal(a0, inherited)
+        np.testing.assert_array_equal(
+            sheet.face_df["prefered_area"].to_numpy(float), inherited)
+
+    def test_the_carrier_survives_model_construction(self):
+        """``update_specs(..., reset=True)`` wipes every spec-backed column at
+        construction; the carrier is deliberately NOT in the spec dict, which
+        is what lets a fork or a resume inherit it."""
+        from inner_ear_model import PREFERRED_AREA_INITIAL as COL
+        sheet = self._sheet()
+        inherited = sheet.face_df["area"].to_numpy(float) * 1.37
+        sheet.face_df[COL] = inherited
+        self._model(sheet)
+        np.testing.assert_array_equal(sheet.face_df[COL].to_numpy(float),
+                                      inherited)
+
+    def test_unusable_carrier_falls_back_to_measuring(self):
+        from inner_ear_model import PREFERRED_AREA_INITIAL as COL
+        sheet = self._sheet()
+        sheet.face_df[COL] = 0.0
+        inner = self._model(sheet)
+        source, a0 = inner.set_preferred_area_per_cell()
+        assert source == "measured"
+        np.testing.assert_array_equal(
+            a0, sheet.face_df["area"].to_numpy(float))
+
+    def test_the_type_interpolation_no_longer_owns_the_area_columns(self):
+        """``update_cell_type_parameters`` interpolates every face parameter in
+        atoh. With per-cell A0 the three area-derived columns must come back to
+        the cell's own A0 — while the genuinely per-type ones still don't."""
+        from inner_ear_model import PREFERRED_AREA_INITIAL as COL
+        sheet = self._sheet()
+        inner = self._model(sheet)
+        inner.set_preferred_area_per_cell()
+        a0 = sheet.face_df[COL].to_numpy(float).copy()
+        atoh = pd.Series(np.linspace(0.0, 1.0, sheet.Nf), index=sheet.face_df.index)
+        inner.update_cell_type_parameters(atoh)
+        np.testing.assert_array_equal(
+            sheet.face_df["prefered_area"].to_numpy(float), a0)
+        gamma = sheet.face_df["contractility"].to_numpy(float)
+        assert gamma[0] == pytest.approx(0.1)      # atoh 0 -> SC
+        assert gamma[-1] == pytest.approx(0.4)     # atoh 1 -> HC
+        alpha = sheet.face_df["area_elasticity"].to_numpy(float)
+        assert alpha[0] == pytest.approx(1.0) and alpha[-1] == pytest.approx(2.0)
+
+    def test_a_dying_cell_keeps_its_zeroed_target_area(self):
+        """Ablation / delamination drive a cell's target area to 0 to collapse
+        it. Putting A0 back would resurrect it."""
+        sheet = self._sheet()
+        inner = self._model(sheet)
+        inner.set_preferred_area_per_cell()
+        victim = sheet.face_df.index[3]
+        sheet.face_df.loc[victim, "type"] = -1
+        sheet.face_df.loc[victim, "prefered_area"] = 0.0
+        sheet.face_df.loc[victim, "prefered_vol"] = 0.0
+        inner.update_cell_type_parameters(sheet.face_df["atoh_level"])
+        assert sheet.face_df.at[victim, "prefered_area"] == 0.0
+        assert sheet.face_df.at[victim, "prefered_vol"] == 0.0
+
+    def test_target_perimeter_uses_each_cell_s_own_a0(self):
+        """P0_i = p0(type_i) * sqrt(A0_i). Per type the product is a constant;
+        per cell it cannot be, so the shape index is interpolated and
+        multiplied by the cell's own sqrt(A0)."""
+        from inner_ear_model import PREFERRED_AREA_INITIAL as COL
+        sheet = self._sheet()
+        inner = self._model(sheet, hc_shape_index=4.0, sc_shape_index=2.0)
+        inner.set_preferred_area_per_cell()
+        a0 = sheet.face_df[COL].to_numpy(float)
+        atoh = pd.Series(np.zeros(sheet.Nf), index=sheet.face_df.index)
+        inner.update_cell_type_parameters(atoh)
+        np.testing.assert_allclose(
+            sheet.face_df["prefered_perimeter"].to_numpy(float),
+            2.0 * np.sqrt(a0))
+        atoh[:] = 1.0
+        inner.update_cell_type_parameters(atoh)
+        np.testing.assert_allclose(
+            sheet.face_df["prefered_perimeter"].to_numpy(float),
+            4.0 * np.sqrt(a0))
+
+    def test_folder_name_separates_per_cell_from_uniform_a0(self):
+        import run_model
+        kw = dict(initial_sheet_name="arr0", gammaSC=0.0105,
+                  gammaHC_ratio=6.746, alphaHC_ratio=6.746, psigma=0)
+        uniform = run_model._short_run_folder_name(preferred_area=0.74, **kw)
+        per_cell = run_model._short_run_folder_name(
+            preferred_area=None, preferred_area_per_cell=True, **kw)
+        assert per_cell != uniform
+        assert "_pacell" in per_cell and "_pacell" not in uniform
+        # and not just the readable prefix: the hash has to differ too
+        assert per_cell.split("_")[-1] != uniform.split("_")[-1]
+
+    def test_the_auto_generated_folder_name_carries_the_flag(self, tmp_path,
+                                                             monkeypatch):
+        """The mechanics fit passes no ``name``, so run() derives one. Per-cell
+        A0 leaves ``preferred_area_override`` None, so without the flag in the
+        hash the folder is IDENTICAL to a run with no A0 specified at all — and
+        the fit runs with reuse_existing_run=True, so it would be handed back
+        the uniform-A0 archive."""
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        seen = {}
+        real = run_model._short_run_folder_name
+
+        def spy(*a, **kw):
+            seen.update(kw)
+            return real(*a, **kw)
+
+        class _Stop(Exception):
+            pass
+
+        def stop(*a, **k):
+            raise _Stop
+
+        monkeypatch.setattr(run_model, "_short_run_folder_name", spy)
+        monkeypatch.setattr(run_model, "initialize_sheet", stop)
+        with pytest.raises(_Stop):
+            run_model.run(0.0105, 6.746, 6.746, 0,
+                          preferred_area_per_cell=True, t_end=1)
+        assert seen.get("preferred_area_per_cell") is True
+        made = [p.name for p in tmp_path.iterdir() if p.is_dir()]
+        assert made and all("_pacell" in n for n in made), made
+
+    def test_run_refuses_the_combinations_that_would_fight_it(self, tmp_path,
+                                                              monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        with pytest.raises(ValueError, match="random_forces"):
+            run_model.run(0.01, 1.0, 1.0, 0, name="r1",
+                          preferred_area_per_cell=True, random_forces=True)
+        with pytest.raises(ValueError, match="preferred_area_override"):
+            run_model.run(0.01, 1.0, 1.0, 0, name="r2",
+                          preferred_area_per_cell=True,
+                          preferred_area_override=0.74)
+
+    def test_mechanics_task_can_ask_for_per_cell_a0(self, monkeypatch):
+        """The 21-field task keeps setting one A0 for the whole tissue; a 22nd
+        field asks for per-cell instead. Both runs of a task must agree, or the
+        ablation would not be comparable to its base."""
+        import mechanics_eval
+        seen = []
+
+        def fake_run(*a, **kw):
+            seen.append(kw)
+            raise FileNotFoundError("stop here")
+
+        monkeypatch.setattr(mechanics_eval, "run", fake_run)
+        base_task = [0.0105, 6.746, 6.746, "arr0", "E17.5", [], -1, 0.3,
+                     "delta_level", 100, None, 30.0, False, 0.0, 0.03, 0.02,
+                     None, 0.0, 0.0, 0.0, 0.74]
+
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(tuple(base_task))
+        assert seen[-1]["preferred_area_override"] == pytest.approx(0.74)
+        assert "preferred_area_per_cell" not in seen[-1]
+
+        per_cell = list(base_task)
+        per_cell[20] = None          # no uniform A0 ...
+        per_cell.append(True)        # ... per cell instead
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(tuple(per_cell))
+        assert seen[-1]["preferred_area_per_cell"] is True
+        assert "preferred_area_override" not in seen[-1]
+
+        both = list(base_task) + [True]
+        with pytest.raises(ValueError, match="per-cell A0"):
+            mechanics_eval._evaluate_mechanics_for_sheet(tuple(both))
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 

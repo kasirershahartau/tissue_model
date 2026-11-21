@@ -239,7 +239,7 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
                            line_tension=None,
                            hc_shape_index=None, sc_shape_index=None,
                            bending=None, preferred_area=None, stress_shift=0.0,
-                           l0_ratio=1.0):
+                           l0_ratio=1.0, preferred_area_per_cell=False):
     """Build a SHORT, deterministic, collision-resistant results-folder name.
 
     The previous scheme embedded the full ``initial_sheet_name`` verbatim::
@@ -329,6 +329,13 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     # stale and must not be reused; always supply preferred_area post-fix.
     if preferred_area is not None:
         canonical += "|pa=%.4f" % preferred_area
+    # PER-CELL A0 is a different model from any single A0 -- every cell has its
+    # own target area, taken from the initial array -- so it must never collide
+    # with (or be reused for) a uniform-A0 run at the same parameters. There is
+    # no value to fold in: the areas come from the initial sheet, which is
+    # already in the hash.
+    if preferred_area_per_cell:
+        canonical += "|pacell=1"
     # Mechanosensitivity SHIFT K: changes the dynamics, so a non-zero value must
     # get its own folder (K=0 keeps the historical names).
     if stress_shift:
@@ -357,6 +364,8 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
         name += "_bend%.3f" % bending
     if preferred_area is not None:
         name += "_pa%.3f" % preferred_area
+    if preferred_area_per_cell:
+        name += "_pacell"
     if stress_shift:
         name += "_ks%.3f" % stress_shift
     # Surface a non-default L0/<perimeter> ratio in the readable prefix too, so
@@ -521,7 +530,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         l0_ratio=1.0, inherit_length_unit=True, random_area_stage=None,
         uniform_delta_level=None, division_area=1.2, division_rule="area",
         division_interval=None, division_start=None, seed=None,
-        restore_resume_state=True):
+        restore_resume_state=True, preferred_area_per_cell=False):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -585,6 +594,20 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         reproducing the original continuation would reproduce the
         crash. Both modes are reproducible: with the sidecar from the
         sidecar, without it from this run's recorded ``seed``.
+    preferred_area_per_cell : bool, default False
+        Set A0 PER CELL to that cell's area in the initial array,
+        instead of taking one value for the whole tissue from
+        ``preferred_area_override`` / the per-type ``preferred_area``.
+        A0 then stops being a fitted parameter and becomes data: the
+        array's area heterogeneity is inherited rather than replaced
+        by a uniform target. The value is fixed for the whole run and
+        inherited by every fork and resume off it — in particular the
+        ablation run, which forks from the base run's relaxed steady
+        state and must stay the same mechanical system as the base
+        run. See :meth:`InnerEarModel.set_preferred_area_per_cell`.
+        Incompatible with ``random_forces`` (which re-draws A0 per
+        cell every few time units) and with
+        ``preferred_area_override``.
     reuse_existing_run : bool, default False
         Smart restart for re-launched parameter fits. When True and a
         results folder for ``name`` already exists, the previous run's
@@ -728,6 +751,12 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             hc_shape_index, sc_shape_index, bending,
             preferred_area=preferred_area_override, stress_shift=stress_shift,
             l0_ratio=l0_ratio,
+            # Without this a per-cell-A0 run and a run with NO A0 specified at
+            # all hash to the SAME folder (per-cell A0 leaves
+            # preferred_area_override None, so nothing else distinguishes
+            # them) -- and the mechanics fit runs with reuse_existing_run=True,
+            # so it would be handed back the uniform-A0 run's archive.
+            preferred_area_per_cell=preferred_area_per_cell,
         )
     elif ablated_cells is not None and len(ablated_cells) > 0:
         # Caller supplied an explicit ``name`` AND an ablation list: keep the
@@ -807,6 +836,25 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                 "single cell type."
                 % ("delta_levels" if delta_levels is not None
                    else "initial_sheet_name=%r" % (initial_sheet_name,)))
+    # Per-cell A0 and the two ways of setting ONE A0 for the whole tissue are
+    # mutually exclusive, and silently letting one win would be the worst
+    # outcome: ``random_forces`` re-draws prefered_area per cell every
+    # wait_time units (so the per-cell A0 would survive ~5 time units and then
+    # be replaced), and an explicit override says the caller wants a specific
+    # uniform value.
+    if preferred_area_per_cell:
+        if random_forces:
+            raise ValueError(
+                "preferred_area_per_cell is incompatible with random_forces: "
+                "set_random_parameters re-draws prefered_area for every cell "
+                "every few time units, which would overwrite the initial-area "
+                "A0 mid-run.")
+        if preferred_area_override is not None:
+            raise ValueError(
+                "pass preferred_area_per_cell OR preferred_area_override, not "
+                "both: the first sets A0 to each cell's initial area, the "
+                "second sets one A0 for the whole tissue (%r)."
+                % (preferred_area_override,))
     quasi_static = True
     # quasi_static_threshold is now a run() parameter (default
     # _DEFAULT_QUASI_STATIC_THRESHOLD) so the mechanics fit can relax base and
@@ -1263,7 +1311,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                               length_normalization_factor=inherited_L0,
                               l0_ratio=l0_ratio,
                               random_area_stage=random_area_stage,
-                              uniform_delta_level=uniform_delta_level)
+                              uniform_delta_level=uniform_delta_level,
+                              preferred_area_per_cell=preferred_area_per_cell)
         # record what was used, so anything forked from THIS run inherits it
         _write_L0(name, inner.length_normalization_factor)
         run_log.info("length unit (mean initial perimeter) in use: %.6g",
@@ -1275,6 +1324,19 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             for element, columns in _restore_derived_columns(inner, resumed_state):
                 run_log.info("resume: restored %s %s from the archive",
                              element, ", ".join(columns))
+        if preferred_area_per_cell:
+            # AFTER the resume restore above, which has just put the archive's
+            # prefered_area back (including the zeros that are collapsing a
+            # delaminating cell — the call below writes only ``type >= 0``
+            # rows, so those survive).
+            source, a0 = inner.set_preferred_area_per_cell()
+            run_log.info(
+                "A0 is per cell, %s: %d cell(s), mean %.6g, min %.6g, "
+                "max %.6g, std %.6g",
+                ("MEASURED on this frame (it is the initial array)"
+                 if source == "measured" else
+                 "INHERITED from the loaded frame (the initial array's areas)"),
+                a0.size, a0.mean(), a0.min(), a0.max(), a0.std())
         draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
                                                 color_by="atoh")
         fig1, ax1 = draw_func(inner.sheet)
