@@ -394,7 +394,12 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
 # prefered_perimeter, bending, repulsion, repulsion_distance; line_tension on
 # edges) and ``set_random_parameters`` re-draws. Taken from the model so a new
 # parameter is covered automatically.
-_RESUMED_STATE_EXTRA = {"face": ("type", "is_alive")}
+_RESUMED_STATE_EXTRA = {"face": ("type", "is_alive", "id")}
+# ``id`` is here for a different reason: it is the persistent cell identity
+# that analysis tracks cells ACROSS frames by, and InnerEarModel.__init__
+# re-bases it to the row index on every construction. A run that removed a cell
+# before the resume point would otherwise come back with every later cell
+# relabelled.
 
 
 def _restore_derived_columns(inner, saved):
@@ -431,6 +436,25 @@ def _restore_derived_columns(inner, saved):
 # run so a fork can INHERIT it instead of re-measuring.
 _L0_FILE = "l0.txt"
 _L0_MAX_DEPTH = 8                 # a chain deeper than this is a loop
+
+
+def _recorded_parameter(folder, key):
+    """The value ``run()`` recorded for ``key`` in ``<folder>/parameters.txt``
+    (the ORIGINAL run's file; resumes write parameters_continueN.txt beside
+    it), or None when there is no such record or it cannot be parsed."""
+    import ast
+    path = os.path.join(folder, "parameters.txt")
+    if not os.path.isfile(path):
+        return None
+    prefix = key + ":"
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith(prefix):
+                    return ast.literal_eval(line[len(prefix):].strip())
+    except (OSError, ValueError, SyntaxError):
+        return None
+    return None
 
 
 def _recorded_L0(run_name, results_dir=None, depth=0):
@@ -1010,6 +1034,29 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     else:
         os.mkdir(results_dir)
 
+    # Ablating on a RESUME. With the resume state restored, the event queue is
+    # replayed from the sidecar and a behaviour it does not mention is DROPPED
+    # (it is a one-shot that already fired -- see resume_state.restore_manager).
+    # That is right when this resume CONTINUES an ablation run: its ablations
+    # fired long ago and must not fire again on cells that may since have been
+    # removed and their labels reused. It is wrong when the resume ADDS an
+    # ablation the original run never had: the request would silently do
+    # nothing. Tell the two apart by the original run's own record, and refuse
+    # the second -- loudly, because a run that quietly skips the ablation it
+    # was asked for produces a plausible, wrong archive.
+    if continue_existing_run and ablated_cells and restore_resume_state:
+        original = _recorded_parameter(results_dir, "ablated_cells")
+        if not original:
+            raise ValueError(
+                "cannot ADD an ablation (%s) while resuming %s: the original "
+                "run had none, and with restore_resume_state=True the restored "
+                "event queue would not carry it, so it would never fire. Fork "
+                "instead -- initial_sheet_name=<this run> with "
+                "continue_from_time=<t> (or None for its last frame), which "
+                "is what the mechanical fit does and keeps the source archive "
+                "intact -- or pass restore_resume_state=False."
+                % (list(ablated_cells), name))
+
     #  Saving model  parameters
     params_file = os.path.join(results_dir, "parameters.txt")
     if continue_existing_run and os.path.exists(params_file):
@@ -1140,6 +1187,17 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     # array (no continue_from_time) measures it, which is the same thing.
     loaded_from_archive = bool(continue_existing_run
                                or continue_from_time is not None)
+    # A fork that names NO time loads the source's LAST frame. That source is
+    # either an initial array (an extract: it records no L0, because nothing was
+    # ever run on it) or a previous RUN, which does. The first must measure --
+    # that frame IS the initial array -- and the second must inherit: the
+    # mechanical fit's ablation run is exactly this case, forking the base
+    # run's relaxed steady state, and re-measuring there gives a different
+    # unit from the run it is compared against. So the decision is made by
+    # whether the source has an L0 to give, not by whether a time was named.
+    forked_last_frame = bool(
+        not loaded_from_archive and source_run_name
+        and os.path.isfile(os.path.join(initial_sheet_name, "history.hf5")))
     try:
         # Load or initialize sheet
         if continue_existing_run:
@@ -1273,6 +1331,15 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         elif loaded_from_archive:
             run_log.info("inherit_length_unit=False: re-measuring the length"
                          " unit on this frame rather than inheriting it")
+        elif forked_last_frame and inherit_length_unit:
+            inherited_L0 = _recorded_L0(source_run_name)
+            if inherited_L0 is None:
+                run_log.info("length unit MEASURED on this frame: %s records "
+                             "none, so it is the initial array",
+                             source_run_name)
+            else:
+                run_log.info("length unit inherited through %s: %r",
+                             source_run_name, inherited_L0)
 
         resumed_state = None
         if continue_existing_run:

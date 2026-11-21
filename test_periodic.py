@@ -6203,6 +6203,137 @@ class TestPreferredAreaPerCell:
             mechanics_eval._evaluate_mechanics_for_sheet(tuple(both))
 
 
+class TestInheritOrMeasure:
+    """What a run takes from its source and what it works out for itself.
+
+    A run that starts from an INITIAL array measures L0 and A0 on it; a run
+    that continues from a previous RUN inherits both — including the
+    mechanical fit's ablation run, which forks the base run's last frame
+    without naming a time. The deciding fact is whether the source has an L0
+    to give: the initial-array extracts record none."""
+
+    @staticmethod
+    def _capture(monkeypatch, run_model):
+        captured = {}
+
+        class _Stop(Exception):
+            pass
+
+        def fake_model(s, **kw):
+            captured.update(kw)
+            raise _Stop
+
+        monkeypatch.setattr(run_model, "InnerEarModel", fake_model)
+        return captured, _Stop
+
+    def _source(self, rd, name, l0=None):
+        os.makedirs(os.path.join(rd, name))
+        open(os.path.join(rd, name, "history.hf5"), "wb").close()
+        if l0 is not None:
+            with open(os.path.join(rd, name, "l0.txt"), "w") as fh:
+                fh.write(repr(l0) + "\n")
+
+    def _fork(self, tmp_path, monkeypatch, l0):
+        import run_model
+        rd = str(tmp_path / "results")
+        os.makedirs(rd)
+        monkeypatch.setattr(run_model, "RESULTS_DIR", rd)
+        self._source(rd, "src", l0)
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.get_opposite()
+        monkeypatch.setattr(run_model, "load_sheet_from_file",
+                            lambda *a, **k: sheet)
+        captured, _Stop = self._capture(monkeypatch, run_model)
+        with pytest.raises(_Stop):
+            run_model.run(0.01, 1.0, 1.0, 0, initial_sheet_name="src",
+                          name="fork1", no_differentiation=True, t_end=1)
+        return captured
+
+    def test_a_fork_of_an_initial_array_measures_L0(self, tmp_path,
+                                                    monkeypatch):
+        """An extract records no L0 (nothing was ever run on it), so the
+        fork's first frame IS the initial array and L0 is measured there."""
+        captured = self._fork(tmp_path, monkeypatch, l0=None)
+        assert captured["length_normalization_factor"] is None
+
+    def test_a_fork_of_a_previous_run_inherits_L0(self, tmp_path, monkeypatch):
+        """The mechanical fit's ablation run: a fork of the base run's LAST
+        frame with no time named. Re-measuring on that relaxed frame would give
+        a different unit from the run it is compared against."""
+        exact = 1.5 + float(np.sqrt(5))
+        captured = self._fork(tmp_path, monkeypatch, l0=exact)
+        assert captured["length_normalization_factor"] == exact
+
+    def test_recorded_parameter_reads_the_original_run(self, tmp_path):
+        import run_model
+        d = tmp_path / "r"
+        d.mkdir()
+        (d / "parameters.txt").write_text(
+            "gammaSC: 0.0105\nablated_cells: [337, 304]\nname: 'r'\n")
+        assert run_model._recorded_parameter(str(d), "ablated_cells") == [337, 304]
+        assert run_model._recorded_parameter(str(d), "gammaSC") == 0.0105
+        assert run_model._recorded_parameter(str(d), "missing") is None
+        assert run_model._recorded_parameter(str(tmp_path / "nope"), "x") is None
+
+    def _resume_with_ablation(self, tmp_path, monkeypatch, recorded):
+        import run_model
+        rd = str(tmp_path / "results")
+        monkeypatch.setattr(run_model, "RESULTS_DIR", rd)
+        # an explicit name meeting an ablation list gets "ablated_<ids>"
+        folder = os.path.join(rd, "r1ablated_3")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "parameters.txt"), "w") as fh:
+            fh.write("ablated_cells: %r\n" % (recorded,))
+
+        class _Stop(Exception):
+            pass
+
+        def stop(*a, **k):
+            raise _Stop
+
+        monkeypatch.setattr(run_model, "load_sheet_from_file", stop)
+        return run_model, _Stop
+
+    def test_resuming_and_ADDING_an_ablation_refuses(self, tmp_path,
+                                                     monkeypatch):
+        """The restored event queue cannot carry an ablation the original run
+        never had, so it would silently never fire."""
+        run_model, _Stop = self._resume_with_ablation(tmp_path, monkeypatch, [])
+        with pytest.raises(ValueError, match="Fork instead"):
+            run_model.run(0.01, 1.0, 1.0, 0, name="r1", ablated_cells=[3],
+                          continue_existing_run=True, continue_from_time=1.0)
+
+    def test_resuming_an_ablation_run_is_allowed(self, tmp_path, monkeypatch):
+        """Continuing an interrupted ablation run: its ablations already fired
+        and must not fire again, so the drop is right and nothing refuses."""
+        run_model, _Stop = self._resume_with_ablation(tmp_path, monkeypatch, [3])
+        with pytest.raises(_Stop):
+            run_model.run(0.01, 1.0, 1.0, 0, name="r1", ablated_cells=[3],
+                          continue_existing_run=True, continue_from_time=1.0)
+
+    def test_resume_keeps_cell_ids(self):
+        """``InnerEarModel.__init__`` re-bases ``id`` to the row index; after a
+        removal that relabels every later cell, and ``id`` is what analysis
+        tracks cells across frames by."""
+        import run_model
+        sheet = _build_sheet_with_virtuals(4, 4)
+        sheet.get_opposite()
+
+        class _Inner:
+            face_params = {}
+            edge_params = {}
+
+            def __init__(self, s):
+                self.sheet = s
+
+        saved = {"face": sheet.face_df.copy()}
+        saved["face"]["id"] = np.arange(sheet.Nf) + 7      # gaps from removals
+        sheet.face_df["id"] = np.arange(sheet.Nf)          # what __init__ does
+        run_model._restore_derived_columns(_Inner(sheet), saved)
+        np.testing.assert_array_equal(sheet.face_df["id"].to_numpy(),
+                                      np.arange(sheet.Nf) + 7)
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 
