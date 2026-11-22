@@ -6829,6 +6829,124 @@ def cell_adjacency_ring(sheet):
     return [f0] + sorted(adj[f0])
 
 
+class TestMechanicsScoring:
+    """SI section 7: closed forms, SEMs, the lambda^2 <= 0 rule, the stress
+    ratio and the pairing of stages."""
+
+    @staticmethod
+    def _face_df(seed=0, n=40, gamma_scale=0.01):
+        rng = np.random.default_rng(seed)
+        A = rng.uniform(0.6, 0.9, n)
+        return pd.DataFrame({
+            "area": A, "perimeter": np.sqrt(A) * rng.uniform(3.6, 3.9, n),
+            "prefered_area": A * rng.uniform(0.95, 1.05, n),
+            "area_elasticity": rng.choice([1.0, 3.5], n),
+            "contractility": gamma_scale * rng.choice([1.0, 6.7], n),
+            "prefered_perimeter": np.zeros(n), "type": np.zeros(n, int)})
+
+    @staticmethod
+    def _energy(fd, lam):
+        return float(np.sum(fd.area_elasticity / 2
+                            * (lam ** 2 * fd.area - fd.prefered_area) ** 2
+                            + fd.contractility / 2 * lam ** 2 * fd.perimeter ** 2))
+
+    def test_eq31_minimises_the_scaled_energy(self):
+        from mechanics_scoring import shrinkage_lambda_squared
+        from post_processing import relaxed_cut_scale
+        fd = self._face_df()
+        lam = np.sqrt(shrinkage_lambda_squared(fd))
+        grid = np.linspace(0.5, 1.3, 80001)
+        brute = grid[np.argmin([self._energy(fd, g) for g in grid])]
+        assert lam == pytest.approx(brute, abs=2e-5)
+        assert lam == pytest.approx(relaxed_cut_scale(fd), abs=1e-9)
+
+    def test_eq36_is_dE_over_dAtot_at_one(self):
+        from mechanics_scoring import isotropic_stress
+        fd = self._face_df(seed=1)
+        h = 1e-6
+        dE = (self._energy(fd, 1 + h) - self._energy(fd, 1 - h)) / (2 * h)
+        dA = 2 * fd.area.sum()                 # d(lambda^2 sum A)/dlambda at 1
+        assert isotropic_stress(fd) == pytest.approx(dE / dA, rel=1e-7)
+
+    def test_dying_cells_are_left_out_and_p0_is_refused(self):
+        from mechanics_scoring import shrinkage_lambda_squared
+        fd = self._face_df()
+        dying = fd.copy()
+        dying.loc[0, ["type", "prefered_area", "contractility"]] = [-1, 0.0, 10.0]
+        assert shrinkage_lambda_squared(dying) == pytest.approx(
+            shrinkage_lambda_squared(fd.drop(index=0)))
+        fd.loc[3, "prefered_perimeter"] = 1.0
+        with pytest.raises(ValueError, match="target perimeter"):
+            shrinkage_lambda_squared(fd)
+
+    def test_chi2_carries_both_sems(self):
+        from mechanics_scoring import chi2, WORST_CHI2
+        assert chi2(1.3, 0.03, 1.2, 0.04) == pytest.approx(0.01 / 0.0025)
+        assert chi2(1.3, float("nan"), 1.2, 0.04) == WORST_CHI2
+
+    def _summary(self, rr, ab, lam_sq, stress):
+        from mechanics_scoring import stage_summary
+        return stage_summary([{"roundness_ratio": a, "ablation_ratio": b,
+                               "lambda_squared": c, "stress": d}
+                              for a, b, c, d in zip(rr, ab, lam_sq, stress)])
+
+    def test_one_nonpositive_lambda_squared_rejects_the_stage(self):
+        from mechanics_scoring import stage_chi2, WORST_CHI2
+        targets = {"roundness_ratio": (1.2, 0.05, 3),
+                   "ablation_ratio": (0.85, 0.04, 3),
+                   "shrinkage": (0.925, 0.005, 14)}
+        ok = self._summary([1.2, 1.21, 1.19], [0.8, 0.9, None],
+                           [0.86, 0.85, 0.855], [0.1, 0.1, 0.1])
+        bad = self._summary([1.2, 1.21, 1.19], [0.8, 0.9, None],
+                            [0.86, -0.01, 0.855], [0.1, 0.1, 0.1])
+        t_ok, j_ok = stage_chi2(ok, targets)
+        t_bad, j_bad = stage_chi2(bad, targets)
+        assert t_ok["shrinkage"] < 10 and t_bad["shrinkage"] == WORST_CHI2
+        # the None ablation ratio is dropped, not counted
+        assert ok["ablation_ratio"][2] == 2
+        assert t_ok["roundness_ratio"] == t_bad["roundness_ratio"]
+        # model SEM of lambda enters: sqrt of the lambda^2 values
+        lam = np.sqrt([0.86, 0.85, 0.855])
+        sem = lam.std(ddof=1) / np.sqrt(3)
+        assert t_ok["shrinkage"] == pytest.approx(
+            (lam.mean() - 0.925) ** 2 / (0.005 ** 2 + sem ** 2))
+
+    def test_stress_ratio_is_e17_over_p0_with_propagated_sems(self):
+        from mechanics_scoring import stress_chi2, ratio_sem
+        sE = self._summary([1] * 3, [1] * 3, [0.8] * 3, [0.30, 0.32, 0.34])
+        sP = self._summary([1] * 3, [1] * 3, [0.8] * 3, [0.20, 0.21, 0.19])
+        tE = {"stress": (0.30896, 0.045659, 14)}
+        tP = {"stress": (0.20035, 0.019051, 14)}
+        r_e, s_e = ratio_sem(0.30896, 0.045659, 0.20035, 0.019051)
+        # the SI's own form of the experimental SEM
+        si = np.sqrt(0.045659 ** 2 / 0.20035 ** 2
+                     + 0.019051 ** 2 * (0.30896 / 0.20035 ** 2) ** 2)
+        assert s_e == pytest.approx(si)
+        mE, mP = 0.32, 0.20
+        semE = np.std([0.30, 0.32, 0.34], ddof=1) / np.sqrt(3)
+        semP = np.std([0.20, 0.21, 0.19], ddof=1) / np.sqrt(3)
+        r_m, s_m = mE / mP, mE / mP * np.hypot(semE / mE, semP / mP)
+        assert stress_chi2(sE, sP, tE, tP) == pytest.approx(
+            (r_m - r_e) ** 2 / (s_e ** 2 + s_m ** 2))
+
+    def test_pairs_are_ranked_by_j_mech(self):
+        from mechanics_scoring import rank_pairs
+        targets = {"roundness_ratio": (1.2, 0.05, 3),
+                   "ablation_ratio": (0.85, 0.04, 3),
+                   "shrinkage": (0.925, 0.005, 14), "stress": (0.3, 0.04, 14)}
+        tP = dict(targets, stress=(0.2, 0.02, 14))
+        good = self._summary([1.2, 1.21, 1.19], [0.84, 0.86, 0.85],
+                             [0.855, 0.857, 0.853], [0.30, 0.31, 0.29])
+        far = self._summary([1.0, 1.01, 0.99], [0.84, 0.86, 0.85],
+                            [0.855, 0.857, 0.853], [0.30, 0.31, 0.29])
+        p0 = self._summary([1.2, 1.21, 1.19], [0.84, 0.86, 0.85],
+                           [0.855, 0.857, 0.853], [0.20, 0.21, 0.19])
+        rows = rank_pairs({"good": good, "far": far}, {"p": p0}, targets, tP)
+        assert [r["E17.5"] for r in rows] == ["good", "far"]
+        assert rows[0]["J_mech"] == pytest.approx(
+            rows[0]["J_E17.5"] + rows[0]["J_P0"] + rows[0]["chi2_stress"])
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 

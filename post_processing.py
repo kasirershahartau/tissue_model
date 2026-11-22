@@ -2285,7 +2285,8 @@ def _hc_over_mean_sc(hc_values, sc_values):
 
 def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
                             time_point=-1, ablation_model_name=None,
-                            ablated_cells=[], post_ablation_frame=None):
+                            ablated_cells=[], post_ablation_frame=None,
+                            require_ablated_removed=False):
     """Extract ONE run's per-term model DISTRIBUTIONS for the mechanics comparison.
 
     Splitting extraction from comparison lets several runs — the SAME parameters
@@ -2304,7 +2305,17 @@ def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
     (The HC/SC-area-ratio term was dropped — its experimental spread is
     small-sample noise the model can't reproduce — and the single ablation
     HC-over-SC ratio was split into separate HC and SC area-change terms.)
+
+    Also returned, for the SI section 7 objective (:mod:`mechanics_scoring`):
+    ``lambda_squared`` (Eq. 31) and ``stress`` (Eq. 36) of the same frame,
+    each None when the formula does not apply (a target perimeter), and
+    ``ablated_removed`` -- whether every ablated cell is gone from the
+    ablation run's last frame. With ``require_ablated_removed`` a run whose
+    cells are still there contributes NO ablation term: its neighbours have
+    not finished closing the hole, so the area change is not the one the
+    experiment measures.
     """
+    from mechanics_scoring import shrinkage_lambda_squared, isotropic_stress
     history = load_history_file(model_name)
     if time_point == -1:
         time_point = np.max(history.time_stamps)
@@ -2315,11 +2326,21 @@ def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
     sc_roundness = calc_roundness_for_type(sheet, cell_type="SC", type_by=type_by, threshold=threshold)
 
     hc_ablation = sc_ablation = None
+    ablated_removed = None
     if ablation_model_name is not None and post_ablation_frame is not None and len(ablated_cells) > 0:
         ablation_history = load_history_file(ablation_model_name)
-        hc_ablation, sc_ablation = calc_area_change_after_ablation(
-            ablation_history, ablation_model_name, ablated_cells=ablated_cells,
-            end_time=post_ablation_frame, type_by=type_by, threshold=threshold)
+        # ablated_cells are LABELS of the ablation run's first frame; the last
+        # frame is checked by id, which survives the removals.
+        first = ablation_history.retrieve(float(np.min(ablation_history.time_stamps)))
+        first.arrange_sheet_from_history()
+        last = ablation_history.retrieve(float(np.max(ablation_history.time_stamps)))
+        last.arrange_sheet_from_history()
+        ablated_ids = first.face_df.loc[list(ablated_cells), "id"].to_numpy()
+        ablated_removed = not np.isin(ablated_ids, last.face_df["id"].to_numpy()).any()
+        if ablated_removed or not require_ablated_removed:
+            hc_ablation, sc_ablation = calc_area_change_after_ablation(
+                ablation_history, ablation_model_name, ablated_cells=ablated_cells,
+                end_time=post_ablation_frame, type_by=type_by, threshold=threshold)
     # Predicted LINEAR shrinkage (%) of a cut disc — a whole-tissue observable
     # taken from the SAME final frame, so it costs no extra simulation. One value
     # per run, wrapped in an array so it pools like the per-cell terms.
@@ -2337,11 +2358,18 @@ def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
     # diagnostics; only the ratios are scored (see _MECHANICS_EXPERIMENTAL_TYPE).
     roundness_ratio = _hc_over_mean_sc(hc_roundness, sc_roundness)
     ablation_ratio = _hc_over_mean_sc(hc_ablation, sc_ablation)
+    try:
+        lambda_squared = shrinkage_lambda_squared(sheet.face_df)
+        stress = isotropic_stress(sheet.face_df)
+    except ValueError:
+        lambda_squared = stress = None
     return {"hc_roundness": hc_roundness, "sc_roundness": sc_roundness,
             "hc_ablation": hc_ablation, "sc_ablation": sc_ablation,
             "roundness_ratio": roundness_ratio,
             "ablation_ratio": ablation_ratio,
-            "shrinkage": shrinkage}
+            "shrinkage": shrinkage,
+            "lambda_squared": lambda_squared, "stress": stress,
+            "ablated_removed": ablated_removed}
 
 
 # The fit objectives -> the experimental "type" each is compared against.

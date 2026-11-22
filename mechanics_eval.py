@@ -61,7 +61,8 @@ def _evaluate_mechanics_for_sheet(args):
     the strict criterion); the two quasi-static thresholds are cutoffs on it.
     An optional 24th field says how the ablation run ends: "steady" (the
     default) or "removed" -- once every ablated cell is gone, as in the
-    experiment; the ablation threshold is then unused.
+    experiment; the ablation threshold is then unused. An optional 25th is
+    the t_end cap of both runs (None: run()'s default, 25).
 
     ``ablated_cells`` may also be ``{"ids": [...]}``: cells named by their
     persistent ``id`` (see :mod:`ablation_targets`), translated to the
@@ -97,6 +98,11 @@ def _evaluate_mechanics_for_sheet(args):
     # is gone, which is the experiment's protocol (run()'s ``ablation_stop``).
     ablation_stop = (str(args[23]) if len(args) > 23 and args[23]
                      else "steady")
+    # OPTIONAL 25th field: the t_end CAP of both runs (each stops earlier on
+    # its own rule). None keeps run()'s default of 25, which is SHORTER than
+    # the median-1e-3 base run needs (it settled at t=27.5 on E17.5 array 4).
+    t_end_kwargs = ({} if len(args) <= 24 or args[24] is None
+                    else dict(t_end=float(args[24])))
     # Optional non-progress safety net: a crawling parameter region bails with a
     # RuntimeError (caught below) so it scores worst-case instead of stalling.
     stall_kwargs = dict(max_wall_seconds=max_wall_seconds,
@@ -151,7 +157,7 @@ def _evaluate_mechanics_for_sheet(args):
                 save_interval=_FIT_SAVE_INTERVAL,
                 steady_state_statistic=steady_state_statistic,
                 **a0_kwargs,
-                **li_kwargs, **stall_kwargs, **atoh_kwargs))
+                **li_kwargs, **stall_kwargs, **atoh_kwargs, **t_end_kwargs))
 
         ablation_kwargs = {}
         ablation_ids = None
@@ -194,10 +200,12 @@ def _evaluate_mechanics_for_sheet(args):
                         # a coarse cadence, so keep those dense.
                         save_interval=(_FIT_SAVE_INTERVAL
                                        if post_ablation_frame == -1 else None),
-                        **stall_kwargs, **atoh_kwargs))
+                        **stall_kwargs, **atoh_kwargs, **t_end_kwargs))
                 ablation_kwargs = dict(ablation_model_name=with_ablation_name,
                                        ablated_cells=ablated_cells,
-                                       post_ablation_frame=post_ablation_frame)
+                                       post_ablation_frame=post_ablation_frame,
+                                       require_ablated_removed=(
+                                           ablation_stop == "removed"))
             except FileNotFoundError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -216,6 +224,11 @@ def _evaluate_mechanics_for_sheet(args):
 
         terms = extract_model_mechanics(
             base_name, type_by=type_by, threshold=fix_threshold, **ablation_kwargs)
+        # Provenance for the per-simulation record: which runs, which cells.
+        terms["base_run"] = base_name
+        terms["ablation_run"] = ablation_kwargs.get("ablation_model_name")
+        terms["ablated_labels"] = [int(c) for c in (ablated_cells or [])]
+        terms["ablated_ids"] = ablation_ids
         print("[mechanics] DONE   %s  %s"
               % (model_name, "  ".join(
                   "%s n=%d" % (t, 0 if terms.get(t) is None else len(terms[t]))
