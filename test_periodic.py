@@ -6334,6 +6334,116 @@ class TestInheritOrMeasure:
                                       np.arange(sheet.Nf) + 7)
 
 
+class TestMedianSpeedSteadyState:
+    """The strict steady-state criterion: the MEDIAN per-vertex speed, not the
+    fastest velocity component, is compared with ``quasi_static_threshold``.
+
+    The max plateaus on topological noise (one rearranging vertex holds it
+    up), so a cutoff on it stops on a random lull; the median reports the bulk
+    of the tissue. These tests pin the two properties that make that so: one
+    fast vertex does not hold the median up, and the median is of the speed
+    (Euclidean norm), not of a component."""
+
+    @staticmethod
+    def _solve(monkeypatch, velocity_fn, statistic, threshold, tf=0.2):
+        sheet, solver = TestSteadyStateStop._build(monkeypatch,
+                                                   velocity_fn=velocity_fn)
+        solver.solve(
+            tf=tf, dt=0.01, max_displacement=1e9, save_interval=tf,
+            until_steady_state=True, quasi_static_threshold=threshold,
+            check_mechanical_steady=True,
+            check_lateral_inhibition_steady=False,
+            steady_state_min_steps=4, steady_state_statistic=statistic,
+        )
+        return solver.prev_t
+
+    @staticmethod
+    def _one_fast_vertex(t, pos):
+        v = np.zeros_like(pos)
+        v[0] = 0.5                     # vertex 0's x: a local rearrangement
+        return v
+
+    def test_one_fast_vertex_holds_the_max_up_but_not_the_median(
+            self, monkeypatch):
+        # short tf: 0.1 at speed 0.5 moves vertex 0 by 0.05, well short of
+        # crossing an edge of the test sheet
+        t_max = self._solve(monkeypatch, self._one_fast_vertex, "max", 1e-3,
+                            tf=0.1)
+        t_med = self._solve(monkeypatch, self._one_fast_vertex, "median", 1e-3,
+                            tf=0.1)
+        assert t_max >= 0.1 - 1e-9          # never steady: ran to tf
+        assert t_med < 0.06                 # 4 steady steps and out
+
+    def test_the_median_is_of_the_speed_not_a_component(self, monkeypatch):
+        """Every vertex moves at 1e-3 in x AND y: each component is under a
+        1.2e-3 cutoff, the speed (1.41e-3) is not."""
+        uniform = lambda t, pos: np.full_like(pos, 1e-3)
+        assert self._solve(monkeypatch, uniform, "max", 1.2e-3) < 0.06
+        assert self._solve(monkeypatch, uniform, "median", 1.2e-3) >= 0.2 - 1e-9
+        assert self._solve(monkeypatch, uniform, "median", 1.5e-3) < 0.06
+
+    def test_an_unknown_statistic_is_refused(self, monkeypatch):
+        with pytest.raises(ValueError, match="steady_state_statistic"):
+            self._solve(monkeypatch, self._one_fast_vertex, "mean", 1e-3)
+
+    def test_folder_name_separates_the_two_criteria(self):
+        import run_model
+        kw = dict(initial_sheet_name="arr0", gammaSC=0.0105,
+                  gammaHC_ratio=6.746, alphaHC_ratio=3.5, psigma=0,
+                  preferred_area_per_cell=True)
+        old = run_model._short_run_folder_name(**kw)
+        same = run_model._short_run_folder_name(steady_state_statistic="max",
+                                                **kw)
+        med = run_model._short_run_folder_name(
+            quasi_static_threshold=1e-3, steady_state_statistic="median", **kw)
+        med_finer = run_model._short_run_folder_name(
+            quasi_static_threshold=5e-4, steady_state_statistic="median", **kw)
+        max_1e3 = run_model._short_run_folder_name(
+            quasi_static_threshold=1e-3, **kw)
+        assert same == old                  # the default keeps every old name
+        assert "_medv0.001_" in med
+        assert len({med, med_finer, max_1e3, old}) == 4
+        # 5e-4 and 1e-3 differ in the HASH, below the qst tag's 3 decimals
+        assert med.split("_")[-1] != med_finer.split("_")[-1]
+
+    def test_run_refuses_an_unknown_statistic_before_making_a_folder(
+            self, tmp_path, monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        with pytest.raises(ValueError, match="steady_state_statistic"):
+            run_model.run(0.0105, 6.746, 3.5, 0, "arr0",
+                          no_differentiation=True,
+                          steady_state_statistic="medain")
+        assert os.listdir(tmp_path) == []
+
+    def test_mechanics_task_passes_it_to_both_runs(self, monkeypatch):
+        """The 22-field task keeps the max criterion; a 23rd field selects the
+        statistic, and the base AND ablation runs must both get it."""
+        import mechanics_eval
+        seen = []
+
+        def fake_run(*a, **kw):
+            seen.append(kw)
+            if len(seen) % 2 == 1:
+                return "base_run"            # base run done ...
+            raise FileNotFoundError("stop")  # ... stop in the ablation run
+
+        monkeypatch.setattr(mechanics_eval, "run", fake_run)
+        task = [0.0105, 6.746, 3.5, "arr0", "E17.5", [0, 1], -1, 0.3,
+                "delta_level", 100, None, 30.0, False, 0.0, 1e-3, 1e-3,
+                None, 0.0, 0.0, 0.0, None, True]
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(tuple(task))
+        assert [kw["steady_state_statistic"] for kw in seen] == ["max", "max"]
+
+        seen.clear()
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(
+                tuple(task + ["median"]))
+        assert [kw["steady_state_statistic"] for kw in seen] == \
+            ["median", "median"]
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 

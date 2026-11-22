@@ -55,6 +55,10 @@ def _evaluate_mechanics_for_sheet(args):
     be None. The ablation run INHERITS those areas rather than re-measuring —
     it forks the base run's relaxed steady state, and re-measuring there would
     make it a different mechanical system from the run it is compared against.
+
+    Steady state. An optional 23rd field names the statistic both runs' stop
+    reads: "max" (the default, historical) or "median" (median vertex speed,
+    the strict criterion); the two quasi-static thresholds are cutoffs on it.
     """
     args = tuple(args)
     (gammaSC, gammaHC_ratio, alphaHC_ratio, initial, experimental_stage,
@@ -75,6 +79,11 @@ def _evaluate_mechanics_for_sheet(args):
             "(%r)" % (preferred_area,))
     a0_kwargs = dict(preferred_area_per_cell=True) if preferred_area_per_cell \
         else dict(preferred_area_override=preferred_area)
+    # OPTIONAL 23rd field: the statistic both runs' steady-state stop reads
+    # ("max" historical, "median" the strict criterion -- see run()). The two
+    # quasi-static thresholds are then cutoffs on THAT statistic.
+    steady_state_statistic = (str(args[22]) if len(args) > 22 and args[22]
+                              else "max")
     # Optional non-progress safety net: a crawling parameter region bails with a
     # RuntimeError (caught below) so it scores worst-case instead of stalling.
     stall_kwargs = dict(max_wall_seconds=max_wall_seconds,
@@ -108,7 +117,8 @@ def _evaluate_mechanics_for_sheet(args):
         line_tension=line_tension, bending=bending,
         hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
         preferred_area=preferred_area,
-        preferred_area_per_cell=preferred_area_per_cell)
+        preferred_area_per_cell=preferred_area_per_cell,
+        steady_state_statistic=steady_state_statistic)
     print("[mechanics] START  %s  (initial=%s, gammaSC=%.4g, gammaHC_ratio=%.4g, "
           "alphaHC_ratio=%.4g, shape_index=%.4g)" % (model_name, initial, gammaSC,
                                    gammaHC_ratio, alphaHC_ratio, shape_index), flush=True)
@@ -126,6 +136,7 @@ def _evaluate_mechanics_for_sheet(args):
                 line_tension=line_tension, bending=bending,
                 hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
                 save_interval=_FIT_SAVE_INTERVAL,
+                steady_state_statistic=steady_state_statistic,
                 **a0_kwargs,
                 **li_kwargs, **stall_kwargs, **atoh_kwargs))
 
@@ -145,6 +156,7 @@ def _evaluate_mechanics_for_sheet(args):
                         # frame carries the initial array's areas in
                         # prefered_area_initial.
                         **a0_kwargs,
+                        steady_state_statistic=steady_state_statistic,
                         # Safe to coarsen ONLY when the analysis reads the LAST
                         # frame (-1), which is always recorded. A positive frame
                         # INDEX would point at a different simulation time under

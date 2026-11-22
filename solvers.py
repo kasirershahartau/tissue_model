@@ -151,6 +151,7 @@ class IVPSolver(EulerSolver):
               check_mechanical_steady=True,
               check_lateral_inhibition_steady=True,
               steady_state_min_steps=4,
+              steady_state_statistic="max",
               tolerate_unavoidable_folds=True,
               max_wall_seconds=None, min_progress_rate=None,
               progress_window_seconds=30.0):
@@ -233,13 +234,37 @@ class IVPSolver(EulerSolver):
             (displacement / negative-area / solver failure) — so a
             single transient blip restarts the count. Set to 1 to
             recover the old "halt on the first steady step" behaviour.
+        steady_state_statistic : {"max", "median"}, default "max"
+            Which statistic of the per-step vertex velocity the mechanical
+            criterion compares with ``quasi_static_threshold``.
+
+            ``"max"`` (the historical test) is the largest velocity
+            COMPONENT over all active vertices. It does not converge: on
+            the E17.5 arrays it falls to a median of ~0.02-0.03 by t~20
+            and stays there to t=50, with spikes of 0.1-0.5 from T1s and
+            virtual vertices, so any cutoff stops on the first quiet
+            stretch, whenever that happens to come, and a strict one
+            never fires.
+
+            ``"median"`` is the median over active vertices of the
+            per-vertex SPEED |dx|/dt (Euclidean norm). It reports the
+            bulk of the tissue rather than its single fastest vertex,
+            so a local rearrangement cannot hold it up or reset it, and
+            it decays smoothly (~5e-3 at t=5, ~2e-3 at t=20, ~1e-3 at
+            t=35 on the same arrays). It is the one a strict criterion
+            can use.
+
+            Only the steady-state STOP reads this; the quasi-static
+            differentiation trigger keeps its own per-component test.
 
         Steady-state detection
         ----------------------
         When ``until_steady_state`` is True, after every ACCEPTED step
         we evaluate:
 
-          - mech_ok = ``max(|new_pos - old_pos|) < quasi_static_threshold``
+          - mech_ok = ``max(|new_pos - old_pos|)/dt < quasi_static_threshold``
+                     (``"max"``), or ``median_v(|new_v - old_v|)/dt <
+                     quasi_static_threshold`` (``"median"``)
                      (only when ``check_mechanical_steady``)
           - li_ok   = ``max(|new_levels - old_levels|) < lateral_inhibition_threshold``
                      (only when ``check_lateral_inhibition_steady``)
@@ -256,6 +281,10 @@ class IVPSolver(EulerSolver):
         division / delamination / T1) resets the counter, so brief
         excursions can't trigger a premature stop.
         """
+        if steady_state_statistic not in ("max", "median"):
+            raise ValueError(
+                "steady_state_statistic must be 'max' or 'median', not %r"
+                % (steady_state_statistic,))
         initial_dt = float(dt)
         dt = initial_dt
         dt_min = initial_dt * dt_min_factor
@@ -667,10 +696,17 @@ class IVPSolver(EulerSolver):
                     if check_mechanical_steady:
                         # Raw (new_pos - pos) is periodicity-correct — see the
                         # NOTE where the step is accepted above.
-                        mech_ok = bool(
-                            np.abs(new_pos - pos).max()/dt < quasi_static_threshold
-                        )
+                        if steady_state_statistic == "median":
+                            # pos is ravelled (x0, y0, x1, y1, ...): one row
+                            # per active vertex, then its speed.
+                            mech_stat = float(np.median(np.linalg.norm(
+                                (new_pos - pos).reshape(-1, self.eptm.dim),
+                                axis=1))) / dt
+                        else:
+                            mech_stat = float(np.abs(new_pos - pos).max()) / dt
+                        mech_ok = bool(mech_stat < quasi_static_threshold)
                     else:
+                        mech_stat = float("nan")
                         mech_ok = True
 
                     if check_lateral_inhibition_steady and li_cols:
@@ -707,8 +743,11 @@ class IVPSolver(EulerSolver):
                     if steady_streak >= steady_state_min_steps:
                         log.info(
                             "steady state reached at t=%g after %d "
-                            "consecutive steady steps (mech_ok=%s, li_ok=%s)",
+                            "consecutive steady steps (mech_ok=%s, li_ok=%s; "
+                            "%s vertex speed %.3g < %g)",
                             current_t, steady_streak, mech_ok, li_ok,
+                            steady_state_statistic, mech_stat,
+                            quasi_static_threshold,
                         )
                         # Record this state before breaking so the
                         # history's final frame is the steady-state

@@ -239,7 +239,8 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
                            line_tension=None,
                            hc_shape_index=None, sc_shape_index=None,
                            bending=None, preferred_area=None, stress_shift=0.0,
-                           l0_ratio=1.0, preferred_area_per_cell=False):
+                           l0_ratio=1.0, preferred_area_per_cell=False,
+                           steady_state_statistic="max"):
     """Build a SHORT, deterministic, collision-resistant results-folder name.
 
     The previous scheme embedded the full ``initial_sheet_name`` verbatim::
@@ -305,6 +306,13 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     # must NOT collide and be reused for one another).
     if abs(quasi_static_threshold - _DEFAULT_QUASI_STATIC_THRESHOLD) > 1e-9:
         canonical += "|qst=%.3f" % quasi_static_threshold
+    # The MEDIAN-speed criterion is a different stopping rule from the max one
+    # at any threshold, so it gets its own tag -- and carries the threshold at
+    # full precision, because its useful cutoffs (~1e-3) sit below the
+    # resolution of the 3-decimal qst tag above (5e-4 and 1e-3 would collide).
+    if steady_state_statistic != "max":
+        canonical += "|sss=%s:%.6g" % (steady_state_statistic,
+                                       quasi_static_threshold)
     # Fold a non-None line tension into the hash so a line-tension fit gets
     # DISTINCT folders from the no-line-tension runs (it changes the relaxed
     # morphology, so they must not collide / be reused for one another).
@@ -356,7 +364,10 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
         name += "_p0%.2f" % shape_index
     # Surface a NON-default steady-state cutoff in the readable prefix too, so
     # 0.03 (base) / 0.02 (ablation) runs are self-describing on disk.
-    if abs(quasi_static_threshold - _DEFAULT_QUASI_STATIC_THRESHOLD) > 1e-9:
+    if steady_state_statistic != "max":
+        # e.g. "_medv0.001": the median-speed cutoff, at %g precision
+        name += "_%sv%g" % (steady_state_statistic[:3], quasi_static_threshold)
+    elif abs(quasi_static_threshold - _DEFAULT_QUASI_STATIC_THRESHOLD) > 1e-9:
         name += "_qst%.3f" % quasi_static_threshold
     if line_tension is not None:
         name += "_lt%.3f" % line_tension
@@ -554,7 +565,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         l0_ratio=1.0, inherit_length_unit=True, random_area_stage=None,
         uniform_delta_level=None, division_area=1.2, division_rule="area",
         division_interval=None, division_start=None, seed=None,
-        restore_resume_state=True, preferred_area_per_cell=False):
+        restore_resume_state=True, preferred_area_per_cell=False,
+        steady_state_statistic="max"):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -632,6 +644,19 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         Incompatible with ``random_forces`` (which re-draws A0 per
         cell every few time units) and with
         ``preferred_area_override``.
+    steady_state_statistic : {"max", "median"}, default "max"
+        What ``end_on_steady_state`` compares with
+        ``quasi_static_threshold``: the largest vertex-velocity
+        component (``"max"``, historical) or the median per-vertex
+        speed (``"median"``). The max plateaus on topological noise
+        (~0.02-0.03 from t~20 on the E17.5 arrays), so a cutoff on it
+        stops at the first quiet stretch; the median decays smoothly,
+        and ``"median"`` with ``quasi_static_threshold=1e-3`` is the
+        strict criterion chosen for the mechanical fit's BASE run.
+        Measured on E17.5 array 4 at the phase-1 parameters it stopped
+        at t=27.5, bit-identical to a no-stop run up to there, with the
+        HC/SC roundness ratio 1.4% of its total change short of its
+        t=50 value. A median run gets its own folder (``_medv<thr>``).
     reuse_existing_run : bool, default False
         Smart restart for re-launched parameter fits. When True and a
         results folder for ``name`` already exists, the previous run's
@@ -781,6 +806,9 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             # them) -- and the mechanics fit runs with reuse_existing_run=True,
             # so it would be handed back the uniform-A0 run's archive.
             preferred_area_per_cell=preferred_area_per_cell,
+            # A different stopping rule relaxes to a different state, so it
+            # must not share (or be reused as) a max-criterion run's folder.
+            steady_state_statistic=steady_state_statistic,
         )
     elif ablated_cells is not None and len(ablated_cells) > 0:
         # Caller supplied an explicit ``name`` AND an ablation list: keep the
@@ -879,6 +907,11 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                 "both: the first sets A0 to each cell's initial area, the "
                 "second sets one A0 for the whole tissue (%r)."
                 % (preferred_area_override,))
+    if steady_state_statistic not in ("max", "median"):
+        # Checked here, not only in the solver, so a typo fails before a
+        # results folder is created under a name built from it.
+        raise ValueError("steady_state_statistic must be 'max' or 'median', "
+                         "not %r" % (steady_state_statistic,))
     quasi_static = True
     # quasi_static_threshold is now a run() parameter (default
     # _DEFAULT_QUASI_STATIC_THRESHOLD) so the mechanics fit can relax base and
@@ -1467,6 +1500,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                                  max_wall_seconds=max_wall_seconds, min_progress_rate=min_progress_rate,
                                  progress_window_seconds=progress_window_seconds,
                                  restore_resume_state=restore_resume_state,
+                                 steady_state_statistic=steady_state_statistic,
                                  continue_from_time=(continue_from_time if continue_existing_run else None))
         # ``inner.save_notch_delta(...)`` USED to write a pickle
         # side-file with the final LI levels for the next run to

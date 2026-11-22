@@ -1235,7 +1235,7 @@ class InnerEarModel:
                  until_steady_state=False, lateral_inhibition_threshold=1e-3, save_every=0.1,
                  continue_from_time=None, steady_state_min_steps=4,
                  max_wall_seconds=None, min_progress_rate=None, progress_window_seconds=30.0,
-                 restore_resume_state=True):
+                 restore_resume_state=True, steady_state_statistic="max"):
         """Run the simulation until ``t_end`` (or, if
         ``until_steady_state`` is True, until the dynamics settle).
 
@@ -1245,8 +1245,12 @@ class InnerEarModel:
         quantities falls below threshold. ``t_end`` then acts as a
         wall-clock safety cap.
 
-        - Mechanical criterion: ``max(|new_pos - old_pos|) <
-          quasi_static_threshold`` for every active vertex.
+        - Mechanical criterion: the vertex velocity, summarised by
+          ``steady_state_statistic``, is below ``quasi_static_threshold``:
+          ``"max"`` (default) takes the largest component over every
+          active vertex, ``"median"`` the median per-vertex speed. The
+          max does not converge (it plateaus on topological noise), so a
+          strict criterion needs the median — see ``IVPSolver.solve``.
         - Lateral-inhibition criterion:
           ``max(|new - old|) < lateral_inhibition_threshold`` across
           whichever of ``notch_level``, ``delta_level``,
@@ -1545,6 +1549,7 @@ class InnerEarModel:
             check_mechanical_steady=check_mech,
             check_lateral_inhibition_steady=check_li,
             steady_state_min_steps=steady_state_min_steps,
+            steady_state_statistic=steady_state_statistic,
             max_wall_seconds=max_wall_seconds,
             min_progress_rate=min_progress_rate,
             progress_window_seconds=progress_window_seconds,
