@@ -68,6 +68,7 @@ experimental_results_folder = os.environ.get(
 # experimental data dir, which is how it is staged on the VM. Override with
 # CIRCULAR_ABLATION_FILE.
 _CIRCULAR_ABLATION_NAME = "circular_ablation_raw_data(figure 3 +S4).xlsx"
+_CIRCULAR_ABLATION_NAME_EXTENDED_DATA = "circular_ablation_raw_data(figure 3 +E4).xlsx"
 CIRCULAR_ABLATION_FILE = os.environ.get(
     "CIRCULAR_ABLATION_FILE",
     os.path.join(os.path.dirname(experimental_results_folder), "Raw Data",
@@ -93,6 +94,12 @@ def resolve_circular_ablation_file():
     """
     candidates = [CIRCULAR_ABLATION_FILE,
                   os.path.join(experimental_results_folder, _CIRCULAR_ABLATION_NAME)]
+    # The local workbook is now named "+E4" (Extended Data) instead of "+S4",
+    # and only the new name exists there; a VM copy may still carry the old
+    # one. Both spellings are tried, in both layouts, old name first.
+    for old in list(candidates):
+        candidates.append(os.path.join(
+            os.path.dirname(old), _CIRCULAR_ABLATION_NAME_EXTENDED_DATA))
     for path in candidates:
         if os.path.isfile(path):
             return path
