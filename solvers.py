@@ -32,6 +32,10 @@ from tqdm import tqdm
 
 import resume_state
 
+# Logged when ``stop_when_removed`` ends a run; run_model reads it back to tell
+# an ablation run that ended on its protocol from one that ran out of time.
+REMOVAL_STOP_MARKER = "ablated cells removed at t="
+
 
 def count_folded_faces(eptm, tol=0.3):
     """Number of faces whose polygon has FOLDED OVER ITSELF (self-intersected).
@@ -154,7 +158,7 @@ class IVPSolver(EulerSolver):
               steady_state_statistic="max",
               tolerate_unavoidable_folds=True,
               max_wall_seconds=None, min_progress_rate=None,
-              progress_window_seconds=30.0):
+              progress_window_seconds=30.0, stop_when_removed=None):
         """Solves the ODE from the current time to tf with ADAPTIVE dt
         and edge-crossing safety nets.
 
@@ -256,6 +260,16 @@ class IVPSolver(EulerSolver):
 
             Only the steady-state STOP reads this; the quasi-static
             differentiation trigger keeps its own per-component test.
+        stop_when_removed : iterable of int, optional
+            Face ``id`` values (the persistent cell identity, not the
+            per-frame index). When given, the run stops at the first
+            accepted step after which none of these cells is left in
+            the tissue, and that state is recorded as the final frame.
+            This is how an ablation run ends when it should mirror the
+            experiment, which measures the neighbours once the hole has
+            closed. It is independent of ``until_steady_state``; ``tf``
+            stays a cap, and reaching it with one of the cells still
+            present logs a warning.
 
         Steady-state detection
         ----------------------
@@ -285,6 +299,11 @@ class IVPSolver(EulerSolver):
             raise ValueError(
                 "steady_state_statistic must be 'max' or 'median', not %r"
                 % (steady_state_statistic,))
+        removal_ids = (None if stop_when_removed is None
+                       else np.asarray(list(stop_when_removed), dtype=np.int64))
+        if removal_ids is not None and "id" not in self.eptm.face_df.columns:
+            raise ValueError("stop_when_removed needs the face 'id' column to "
+                             "track cells across topology changes")
         initial_dt = float(dt)
         dt = initial_dt
         dt_min = initial_dt * dt_min_factor
@@ -415,6 +434,7 @@ class IVPSolver(EulerSolver):
         _progress_wall = _start_wall
         _progress_sim = current_t
 
+        stopped_on_removal = False
         pbar = tqdm(total=tf - current_t, unit="t", smoothing=0.05)
         try:
             while current_t < tf:
@@ -685,6 +705,20 @@ class IVPSolver(EulerSolver):
                         on_topo_change(*topo_change_args)
                     self.eptm.topo_changed = False
 
+                # --- Removal stop (the ablation protocol) ---
+                # After the manager, so a removal made THIS step counts, and
+                # before the steady-state test, which it overrides.
+                if removal_ids is not None and not np.isin(
+                        removal_ids,
+                        self.eptm.face_df["id"].to_numpy(np.int64)).any():
+                    log.info("%s%g: none of the cells %s is left; stopping",
+                             REMOVAL_STOP_MARKER, current_t,
+                             removal_ids.tolist())
+                    removal_ids = None        # reported; the record follows
+                    _record(current_t, dt)
+                    stopped_on_removal = True
+                    break
+
                 # --- Steady-state stop ---
                 # Evaluated only when the caller opted in. Both
                 # criteria default to "satisfied" when their flag is
@@ -784,6 +818,12 @@ class IVPSolver(EulerSolver):
                 pbar.close()
             except Exception:
                 pass
+
+        if removal_ids is not None and not stopped_on_removal:
+            log.warning("reached tf=%g with cell(s) %s still present: the "
+                        "removal stop never fired", tf,
+                        removal_ids[np.isin(removal_ids, self.eptm.face_df[
+                            "id"].to_numpy(np.int64))].tolist())
 
         # Make sure the final state is always recorded, even if it
         # doesn't land on a save boundary.

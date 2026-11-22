@@ -59,6 +59,9 @@ def _evaluate_mechanics_for_sheet(args):
     Steady state. An optional 23rd field names the statistic both runs' stop
     reads: "max" (the default, historical) or "median" (median vertex speed,
     the strict criterion); the two quasi-static thresholds are cutoffs on it.
+    An optional 24th field says how the ablation run ends: "steady" (the
+    default) or "removed" -- once every ablated cell is gone, as in the
+    experiment; the ablation threshold is then unused.
     """
     args = tuple(args)
     (gammaSC, gammaHC_ratio, alphaHC_ratio, initial, experimental_stage,
@@ -84,6 +87,12 @@ def _evaluate_mechanics_for_sheet(args):
     # quasi-static thresholds are then cutoffs on THAT statistic.
     steady_state_statistic = (str(args[22]) if len(args) > 22 and args[22]
                               else "max")
+    # OPTIONAL 24th field: how the ABLATION run ends. "steady" (default,
+    # historical) uses the same steady-state stop as the base run, at
+    # ablation_quasi_static_threshold; "removed" stops once every ablated cell
+    # is gone, which is the experiment's protocol (run()'s ``ablation_stop``).
+    ablation_stop = (str(args[23]) if len(args) > 23 and args[23]
+                     else "steady")
     # Optional non-progress safety net: a crawling parameter region bails with a
     # RuntimeError (caught below) so it scores worst-case instead of stalling.
     stall_kwargs = dict(max_wall_seconds=max_wall_seconds,
@@ -157,6 +166,7 @@ def _evaluate_mechanics_for_sheet(args):
                         # prefered_area_initial.
                         **a0_kwargs,
                         steady_state_statistic=steady_state_statistic,
+                        ablation_stop=ablation_stop,
                         # Safe to coarsen ONLY when the analysis reads the LAST
                         # frame (-1), which is always recorded. A positive frame
                         # INDEX would point at a different simulation time under

@@ -6591,6 +6591,127 @@ class TestLateralInhibitionRatesFromTheSI:
                              beta=1) == "strict_arr0"
 
 
+class TestAblationStopsWhenTheCellsAreRemoved:
+    """``ablation_stop="removed"``: the ablation run ends once every ablated
+    cell has left the tissue -- the experiment measures the neighbours once
+    the hole has closed -- instead of on a whole-tissue steady state."""
+
+    @staticmethod
+    def _solver(monkeypatch, remove_at=None, targets=(0, 2)):
+        """Zero velocity (never steady-state relevant) and, from the step
+        whose start time passes ``remove_at``, the target cells' ids are
+        dropped -- what a delamination does to them."""
+        state = {"t": 0.0}
+
+        def velocity(t, pos):
+            if remove_at is not None and state["t"] >= remove_at:
+                ids = sheet.face_df["id"].to_numpy().copy()
+                ids[np.isin(ids, targets)] = -1
+                sheet.face_df["id"] = ids
+            state["t"] += 0.01
+            return np.zeros_like(pos)
+
+        sheet, solver = TestSteadyStateStop._build(monkeypatch,
+                                                   velocity_fn=velocity)
+        sheet.face_df["id"] = np.arange(sheet.Nf)
+        return sheet, solver
+
+    def test_stops_on_the_step_the_last_cell_goes(self, monkeypatch):
+        sheet, solver = self._solver(monkeypatch, remove_at=0.05)
+        solver.solve(tf=1.0, dt=0.01, max_displacement=1e9, save_interval=1.0,
+                     stop_when_removed=[0, 2])
+        assert 0.05 < solver.prev_t < 0.08
+        # ...and that state is the last recorded frame
+        assert max(solver.history.time_stamps) == pytest.approx(solver.prev_t)
+
+    def test_one_cell_left_keeps_it_running(self, monkeypatch):
+        sheet, solver = self._solver(monkeypatch, remove_at=0.05, targets=(0,))
+        solver.solve(tf=0.2, dt=0.01, max_displacement=1e9, save_interval=1.0,
+                     stop_when_removed=[0, 2])
+        assert solver.prev_t >= 0.2 - 1e-9
+
+    def test_it_overrides_a_steady_state_stop_only_when_asked(self, monkeypatch):
+        # without the rule, zero velocity is steady after 4 steps
+        sheet, solver = self._solver(monkeypatch)
+        solver.solve(tf=1.0, dt=0.01, max_displacement=1e9, save_interval=1.0,
+                     until_steady_state=True, quasi_static_threshold=1e-6,
+                     check_lateral_inhibition_steady=False)
+        assert solver.prev_t < 0.06
+
+    def test_needs_the_id_column(self, monkeypatch):
+        sheet, solver = self._solver(monkeypatch)
+        sheet.face_df.drop(columns="id", inplace=True)
+        with pytest.raises(ValueError, match="'id'"):
+            solver.solve(tf=0.1, dt=0.01, max_displacement=1e9,
+                         stop_when_removed=[0])
+
+    def test_ids_are_taken_from_the_first_frame_and_reread_on_resume(
+            self, tmp_path):
+        import pandas as pd
+        import run_model
+        sheet = type("S", (), {})()
+        sheet.face_df = pd.DataFrame({"id": [10, 11, 12, 13]})
+        assert run_model._ablated_cell_ids(sheet, [1, 3], str(tmp_path),
+                                           False) == [11, 13]
+        # a resume's frame has other labels; the record wins
+        sheet.face_df = pd.DataFrame({"id": [10, 12]})
+        assert run_model._ablated_cell_ids(sheet, [1, 3], str(tmp_path),
+                                           True) == [11, 13]
+        with pytest.raises(ValueError, match="cannot resume"):
+            run_model._ablated_cell_ids(sheet, [1], str(tmp_path / "nope"),
+                                        True)
+        with pytest.raises(ValueError, match="not faces"):
+            run_model._ablated_cell_ids(sheet, [7], str(tmp_path), False)
+
+    def test_folder_name(self):
+        import run_model
+        kw = dict(initial_sheet_name="base", gammaSC=0.0105,
+                  gammaHC_ratio=6.746, alphaHC_ratio=3.5, psigma=0,
+                  ablated_cells=[4, 9])
+        steady = run_model._short_run_folder_name(**kw)
+        removed = run_model._short_run_folder_name(ablation_stop="removed",
+                                                   **kw)
+        assert steady.endswith("_abl") and removed.endswith("_ablrm")
+        assert steady[:-4] != removed[:-6]        # the hash differs too
+        # the rule means nothing without an ablation, so it changes nothing
+        kw.pop("ablated_cells")
+        assert (run_model._short_run_folder_name(ablation_stop="removed", **kw)
+                == run_model._short_run_folder_name(**kw))
+
+    def test_unknown_rule_refused_before_making_a_folder(self, tmp_path,
+                                                         monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        with pytest.raises(ValueError, match="ablation_stop"):
+            run_model.run(0.0105, 6.746, 3.5, 0, "arr0", ablated_cells=[1],
+                          no_differentiation=True, ablation_stop="gone")
+        assert os.listdir(tmp_path) == []
+
+    def test_mechanics_task_passes_it_to_the_ablation_run(self, monkeypatch):
+        import mechanics_eval
+        seen = []
+
+        def fake_run(*a, **kw):
+            seen.append(kw)
+            if len(seen) % 2 == 1:
+                return "base_run"
+            raise FileNotFoundError("stop")
+
+        monkeypatch.setattr(mechanics_eval, "run", fake_run)
+        task = [0.0105, 6.746, 3.5, "arr0", "E17.5", [0, 1], -1, 0.3,
+                "delta_level", 100, None, 30.0, False, 0.0, 1e-3, 1e-3,
+                None, 0.0, 0.0, 0.0, None, True, "median"]
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(tuple(task))
+        assert seen[1]["ablation_stop"] == "steady"
+        assert "ablation_stop" not in seen[0]          # the base run has none
+        seen.clear()
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(
+                tuple(task + ["removed"]))
+        assert seen[1]["ablation_stop"] == "removed"
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 

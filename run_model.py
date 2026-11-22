@@ -244,6 +244,7 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
                            l0_ratio=1.0, preferred_area_per_cell=False,
                            steady_state_statistic="max",
                            hill_exponent=HILL_EXPONENT,
+                           ablation_stop="steady",
                            li_rates=(TAU_N, TAU_D, BETA)):
     """Build a SHORT, deterministic, collision-resistant results-folder name.
 
@@ -371,6 +372,13 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     # name, and spelling three rates out would lengthen every name.
     if any(abs(float(a) - b) > 1e-12 for a, b in zip(li_rates, HISTORICAL_LI_RATES)):
         canonical += "|tauN=%.6g|tauD=%.6g|beta=%.6g" % tuple(float(x) for x in li_rates)
+    # How the ablation run ends. "steady" is the historical rule (the same
+    # steady-state stop as any run); "removed" stops the moment the last
+    # ablated cell has been removed, which is the experiment's protocol (the
+    # area is measured once the hole has closed). A different end state, so a
+    # different folder.
+    if ablated_cells and ablation_stop != "steady":
+        canonical += "|ablstop=%s" % ablation_stop
     digest = hashlib.md5(canonical.encode("utf-8")).hexdigest()[:10]
     name = "fit_gSC%.4f_gHC%.2f_aHC%.2f_ps%.2f" % (
         gammaSC, gammaHC_ratio, alphaHC_ratio, psigma,
@@ -412,6 +420,8 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
         # Keep a readable marker that this is the ablation variant (the
         # actual cell ids live in the hash above).
         name += "_abl"
+        if ablation_stop == "removed":
+            name += "rm"          # "_ablrm": stopped when the cells were gone
     return name
 
 
@@ -566,6 +576,44 @@ def _write_L0(folder, value):
         pass                      # a missing record only costs a re-measure
 
 
+_ABLATED_IDS_FILE = "ablated_ids.txt"
+
+
+def _ablated_cell_ids(sheet, ablated_cells, folder, resuming):
+    """The persistent ``id`` of each ablated cell, for the removal stop.
+
+    ``ablated_cells`` are face LABELS of the frame the ablation run starts
+    from (the ablation handler writes ``face_df.loc[cell]``), and labels are
+    re-compacted every time a face is removed, so they cannot identify a cell
+    later in the run. ``id`` can. The translation is made once, on the frame
+    the labels refer to, and written beside the run: a RESUME starts from a
+    later frame, where the labels mean other cells (or nothing), so it reads
+    the record instead of translating again.
+    """
+    path = os.path.join(folder, _ABLATED_IDS_FILE)
+    if resuming:
+        try:
+            with open(path) as fh:
+                return [int(tok) for tok in fh.read().split()]
+        except (OSError, ValueError):
+            raise ValueError(
+                "cannot resume %s with ablation_stop='removed': it has no "
+                "readable %s, and the ablated cell labels %s refer to the "
+                "run's first frame, not to the one it resumes from"
+                % (folder, _ABLATED_IDS_FILE, list(ablated_cells)))
+    face_df = sheet.face_df
+    if "id" not in face_df.columns:
+        raise ValueError("ablation_stop='removed' needs the face 'id' column")
+    missing = [c for c in ablated_cells if c not in face_df.index]
+    if missing:
+        raise ValueError("ablated cell(s) %s are not faces of this sheet"
+                         % (missing,))
+    ids = [int(face_df.at[c, "id"]) for c in ablated_cells]
+    with open(path, "w") as fh:
+        fh.write(" ".join(str(i) for i in ids) + "\n")
+    return ids
+
+
 def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, ablated_cells=None,
         only_differentiation=False, no_differentiation=False, end_on_steady_state=True, t_end=25, dt=0.01,
         random_forces=False, name=None, continue_existing_run=False, divisions=False,
@@ -586,7 +634,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         division_interval=None, division_start=None, seed=None,
         restore_resume_state=True, preferred_area_per_cell=False,
         steady_state_statistic="max", hill_exponent=HILL_EXPONENT,
-        tau_n=TAU_N, tau_d=TAU_D, beta=BETA):
+        ablation_stop="steady", tau_n=TAU_N, tau_d=TAU_D, beta=BETA):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -695,6 +743,19 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         with all three at 1; pass those to name, reuse or resume one of its
         runs. Any other set is folded into the folder hash, and a folder
         recorded with different rates is refused, as for ``hill_exponent``.
+    ablation_stop : {"steady", "removed"}, default "steady"
+        How a run with ``ablated_cells`` ends. ``"steady"`` keeps the
+        historical rule: ``end_on_steady_state`` decides, exactly as for
+        any other run. ``"removed"`` stops the moment every ablated cell
+        has been removed from the tissue, and records that frame as the
+        last -- the experiment measures the neighbours once the hole has
+        closed, and a whole-tissue steady-state test stops the ablation
+        run whenever the BULK drift happens to fall below the cutoff,
+        unrelated to the ablation (median 1e-3 stopped it at t=10.5 with
+        the HC/SC area-change ratio 0.016 short of its long-time value).
+        ``end_on_steady_state`` is then ignored and ``t_end`` is only a
+        cap; a run that reaches it with an ablated cell still present
+        logs a warning. Tagged ``_ablrm`` in the folder name.
     reuse_existing_run : bool, default False
         Smart restart for re-launched parameter fits. When True and a
         results folder for ``name`` already exists, the previous run's
@@ -847,7 +908,7 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             # A different stopping rule relaxes to a different state, so it
             # must not share (or be reused as) a max-criterion run's folder.
             steady_state_statistic=steady_state_statistic,
-            hill_exponent=hill_exponent,
+            hill_exponent=hill_exponent, ablation_stop=ablation_stop,
             li_rates=(tau_n, tau_d, beta),
         )
     elif ablated_cells is not None and len(ablated_cells) > 0:
@@ -952,10 +1013,20 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # results folder is created under a name built from it.
         raise ValueError("steady_state_statistic must be 'max' or 'median', "
                          "not %r" % (steady_state_statistic,))
+    if ablation_stop not in ("steady", "removed"):
+        raise ValueError("ablation_stop must be 'steady' or 'removed', not %r"
+                         % (ablation_stop,))
     if int(hill_exponent) != hill_exponent or hill_exponent < 1:
         raise ValueError("hill_exponent must be a positive integer, not %r"
                          % (hill_exponent,))
     hill_exponent = int(hill_exponent)
+    # The removal stop REPLACES the steady-state stop for an ablation run:
+    # the two would otherwise race, and whichever fired first would decide
+    # what "after ablation" means. Turned off here, before parameters.txt is
+    # written, so the record says what the run actually did -- and so a
+    # completed run is reused as it stands (see the reuse branch below).
+    if ablated_cells and ablation_stop == "removed":
+        end_on_steady_state = False
     quasi_static = True
     # quasi_static_threshold is now a run() parameter (default
     # _DEFAULT_QUASI_STATIC_THRESHOLD) so the mechanics fit can relax base and
@@ -1561,7 +1632,14 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                  (", resuming from t=%g" % continue_from_time)
                  if continue_existing_run else ""),
               flush=True)
+        removal_stop_ids = None
+        if ablated_cells and ablation_stop == "removed":
+            removal_stop_ids = _ablated_cell_ids(
+                inner.sheet, ablated_cells, name, continue_existing_run)
+            run_log.info("ablation stop: ends once cells with id %s are removed",
+                         removal_stop_ids)
         history = inner.simulate(t_end=t_end, dt=dt, until_steady_state=end_on_steady_state,
+                                 stop_when_removed=removal_stop_ids,
                                  lateral_inhibition_threshold=li_steady_state_threshold,
                                  only_differentiation=only_differentiation,
                                  random_forces=random_forces, aging_sensitivity=aging_sensitivity,

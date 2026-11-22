@@ -1236,9 +1236,14 @@ class InnerEarModel:
                  until_steady_state=False, lateral_inhibition_threshold=1e-3, save_every=0.1,
                  continue_from_time=None, steady_state_min_steps=4,
                  max_wall_seconds=None, min_progress_rate=None, progress_window_seconds=30.0,
-                 restore_resume_state=True, steady_state_statistic="max"):
+                 restore_resume_state=True, steady_state_statistic="max",
+                 stop_when_removed=None):
         """Run the simulation until ``t_end`` (or, if
         ``until_steady_state`` is True, until the dynamics settle).
+
+        ``stop_when_removed`` (face ``id`` values) instead ends the run as
+        soon as none of those cells is left -- the ablation protocol; see
+        ``IVPSolver.solve``.
 
         Steady-state stopping (``until_steady_state=True``)
         ---------------------------------------------------
@@ -1554,6 +1559,7 @@ class InnerEarModel:
             max_wall_seconds=max_wall_seconds,
             min_progress_rate=min_progress_rate,
             progress_window_seconds=progress_window_seconds,
+            stop_when_removed=stop_when_removed,
         )
         # fig, ax = plot_forces(self.sheet, geom, model, ['x', 'y'], 1)
         # plt.show()
