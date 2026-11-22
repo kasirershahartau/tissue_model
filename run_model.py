@@ -634,7 +634,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         division_interval=None, division_start=None, seed=None,
         restore_resume_state=True, preferred_area_per_cell=False,
         steady_state_statistic="max", hill_exponent=HILL_EXPONENT,
-        ablation_stop="steady", tau_n=TAU_N, tau_d=TAU_D, beta=BETA):
+        ablation_stop="steady", tau_n=TAU_N, tau_d=TAU_D, beta=BETA,
+        fit_outputs_only=False):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -743,6 +744,13 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         with all three at 1; pass those to name, reuse or resume one of its
         runs. Any other set is folded into the folder hash, and a folder
         recorded with different rates is refused, as for ``hill_exponent``.
+    fit_outputs_only : bool, default False
+        Write only what the mechanical fit reads: the history, the log,
+        parameters.txt, l0.txt, the resume sidecar and cell_info.pkl. The
+        two still images, movie.gif, labels.npy and contact_matrix.npy are
+        skipped, and so is the drawing that produces the images, which saves
+        ~5 MB and a few seconds per run. Output-only, so it is not part of
+        the folder name; a run made this way simply lacks those files.
     ablation_stop : {"steady", "removed"}, default "steady"
         How a run with ``ablated_cells`` ends. ``"steady"`` keeps the
         historical rule: ``end_on_steady_state`` decides, exactly as for
@@ -1591,8 +1599,9 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
                 a0.size, a0.mean(), a0.min(), a0.max(), a0.std())
         draw_func = inner.get_draw_sheet_method(number_faces=True, number_edges=False, number_vertices=False,
                                                 color_by="atoh")
-        fig1, ax1 = draw_func(inner.sheet)
-        fig1.savefig(os.path.join(name, "initial.png"))
+        if not fit_outputs_only:
+            fig1, ax1 = draw_func(inner.sheet)
+            fig1.savefig(os.path.join(name, "initial.png"))
         # CLEAR IT, then close it. ``plt.close`` only unregisters a figure from
         # pyplot's global manager -- it does not dismantle it. Something else
         # keeps these figures reachable: after one array ``plt.get_fignums()``
@@ -1619,8 +1628,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # that is still referenced afterwards holds nothing of any size. The
         # same pairing is applied to the finale still below and to every gif
         # frame in history_io.create_gif_safe.
-        fig1.clf()
-        plt.close(fig1)
+            fig1.clf()
+            plt.close(fig1)
         # Pass the archive path so HistoryHdf5 writes each snapshot on the
         # fly; the partial file can be opened in another process while the
         # simulation is still running (useful for diagnosing hangs).
@@ -1668,17 +1677,19 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # method itself is kept on InnerEarModel as a stand-alone
         # utility for ad-hoc exports — nothing in the standard
         # run pipeline calls it any more.
-        fig2, ax2 = draw_func(inner.sheet)
-        fig2.savefig(os.path.join(name, "finale.png"))
-        fig2.clf()               # see the note on fig1 above
-        plt.close(fig2)
-        inner.save_sheet_labels_to_numpy(inner.sheet, path=os.path.join(name, "labels.npy"))
-        inner.save_contact_matrix_to_numpy(inner.sheet, path=os.path.join(name, "contact_matrix.npy"))
+        if not fit_outputs_only:
+            fig2, ax2 = draw_func(inner.sheet)
+            fig2.savefig(os.path.join(name, "finale.png"))
+            fig2.clf()               # see the note on fig1 above
+            plt.close(fig2)
+            inner.save_sheet_labels_to_numpy(inner.sheet, path=os.path.join(name, "labels.npy"))
+            inner.save_contact_matrix_to_numpy(inner.sheet, path=os.path.join(name, "contact_matrix.npy"))
         inner.save_face_data_to_df(inner.sheet, path=os.path.join(name, "cell_info.pkl"))
-        gif_func = inner.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
-                                               color_by="atoh",
-                                               arrange_sheet=True)
-        create_gif_safe(history, os.path.join(name, "movie.gif"), num_frames=movie_frames, draw_func=gif_func)
+        if not fit_outputs_only:
+            gif_func = inner.get_draw_sheet_method(number_faces=False, number_edges=False, number_vertices=False,
+                                                   color_by="atoh",
+                                                   arrange_sheet=True)
+            create_gif_safe(history, os.path.join(name, "movie.gif"), num_frames=movie_frames, draw_func=gif_func)
         run_log.info(_RUN_SUCCESS_MARKER)
         print("[run] FINISHED %s" % os.path.basename(name), flush=True)
         return name
@@ -2286,8 +2297,15 @@ _MECHANICS_ROUNDNESS_TERMS = ("roundness_ratio",)
 # which the solver records unconditionally (the first at entry, the last right
 # before the steady-state break), so a coarse interval cannot lose them. Dense
 # recording made a single base history ~700 MB and an ablation history ~1.6 GB,
-# which filled a 128 GB disk mid-fit; at this cadence a run is ~15-20 MB.
-_FIT_SAVE_INTERVAL = 10.0
+# which filled a 128 GB disk mid-fit; every 10 time units a run was ~15-20 MB.
+#
+# INFINITE now (2026-11-22): a fit run records its FIRST and LAST frame and
+# nothing in between -- exactly the two the solver writes unconditionally (at
+# entry, and at whatever ends the run: the steady-state stop, the removal
+# stop, t_end, or the frame a stall guard records before raising). Each frame
+# is ~5 MB, so this is the floor. The cost: an INTERRUPTED fit run has only
+# frame 0 to resume from, so reuse_existing_run effectively re-runs it.
+_FIT_SAVE_INTERVAL = float("inf")
 _MECHANICS_ABLATION_TERMS = ("ablation_ratio",)
 # A degenerate ACTIVE term (no usable model data at a bad parameter point) is
 # scored this many sigma so the point gets a large but FINITE penalty — the

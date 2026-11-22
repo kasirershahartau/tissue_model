@@ -17,6 +17,29 @@ from run_model import (run, MECHANICS_TERMS, _DEFAULT_ATOH_SENSITIVITY,
                        _short_run_folder_name, _strip_results_prefix)
 from post_processing import extract_model_mechanics
 
+def base_run_name(args):
+    """The results folder the task's BASE run is written to -- the one name
+    both the worker and a driver use, so a driver can find a run (and its
+    recorded seed) even when the task failed and returned nothing."""
+    args = tuple(args)
+    (gammaSC, gammaHC_ratio, alphaHC_ratio, initial, _stage, _abl, _frame,
+     fix_threshold, type_by, _w, _p, _pw, _rr, shape_index, base_qst, _aqst,
+     line_tension, hc_shape_index, sc_shape_index, bending,
+     preferred_area) = args[:21]
+    per_cell = bool(args[21]) if len(args) > 21 else False
+    statistic = str(args[22]) if len(args) > 22 and args[22] else "max"
+    atoh = (fix_threshold if type_by == "delta_level" and fix_threshold is not None
+            else _DEFAULT_ATOH_SENSITIVITY)
+    return _short_run_folder_name(
+        initial, gammaSC, gammaHC_ratio, alphaHC_ratio, 0,
+        atoh_sensitivity=atoh, shape_index=shape_index,
+        quasi_static_threshold=base_qst,
+        line_tension=line_tension, bending=bending,
+        hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
+        preferred_area=preferred_area, preferred_area_per_cell=per_cell,
+        steady_state_statistic=statistic)
+
+
 def _evaluate_mechanics_for_sheet(args):
     """Run one initial sheet to steady state (and, if cells are ablated, the
     ablation run too), then return its per-term model DISTRIBUTIONS (not p
@@ -128,16 +151,7 @@ def _evaluate_mechanics_for_sheet(args):
     # the exact folder on disk, INCLUDING a failure in the p-value comparison
     # that happens AFTER the runs finished (where the exception traceback alone
     # doesn't say which run it was for).
-    model_name = _short_run_folder_name(
-        initial, gammaSC, gammaHC_ratio, alphaHC_ratio, 0,
-        atoh_sensitivity=atoh_kwargs.get("atoh_sensitivity", _DEFAULT_ATOH_SENSITIVITY),
-        shape_index=shape_index,
-        quasi_static_threshold=base_quasi_static_threshold,
-        line_tension=line_tension, bending=bending,
-        hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
-        preferred_area=preferred_area,
-        preferred_area_per_cell=preferred_area_per_cell,
-        steady_state_statistic=steady_state_statistic)
+    model_name = base_run_name(args)
     print("[mechanics] START  %s  (initial=%s, gammaSC=%.4g, gammaHC_ratio=%.4g, "
           "alphaHC_ratio=%.4g, shape_index=%.4g)" % (model_name, initial, gammaSC,
                                    gammaHC_ratio, alphaHC_ratio, shape_index), flush=True)
@@ -155,6 +169,8 @@ def _evaluate_mechanics_for_sheet(args):
                 line_tension=line_tension, bending=bending,
                 hc_shape_index=hc_shape_index, sc_shape_index=sc_shape_index,
                 save_interval=_FIT_SAVE_INTERVAL,
+                # only what the score reads: no images, labels or contact matrix
+                fit_outputs_only=True,
                 steady_state_statistic=steady_state_statistic,
                 **a0_kwargs,
                 **li_kwargs, **stall_kwargs, **atoh_kwargs, **t_end_kwargs))
@@ -194,6 +210,7 @@ def _evaluate_mechanics_for_sheet(args):
                         **a0_kwargs,
                         steady_state_statistic=steady_state_statistic,
                         ablation_stop=ablation_stop,
+                        fit_outputs_only=True,
                         # Safe to coarsen ONLY when the analysis reads the LAST
                         # frame (-1), which is always recorded. A positive frame
                         # INDEX would point at a different simulation time under

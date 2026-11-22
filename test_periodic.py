@@ -6446,6 +6446,146 @@ class TestMedianSpeedSteadyState:
             ["median", "median"]
 
 
+class TestFitRunsKeepFirstAndLastFrame:
+    """Mechanical-fit runs record only their first and last frame
+    (``_FIT_SAVE_INTERVAL`` is infinite): the solver's two unconditional
+    records, whatever ends the run."""
+
+    def test_the_fit_interval_is_infinite(self):
+        import run_model
+        assert run_model._FIT_SAVE_INTERVAL == float("inf")
+
+    def test_steady_state_stop_keeps_two_frames(self, monkeypatch):
+        sheet, solver = TestSteadyStateStop._build(
+            monkeypatch, velocity_fn=lambda t, pos: np.full_like(pos, 1e-4))
+        solver.solve(tf=5.0, dt=0.01, max_displacement=1e9,
+                     save_interval=float("inf"), until_steady_state=True,
+                     quasi_static_threshold=1e-3,
+                     check_lateral_inhibition_steady=False)
+        ts = sorted(set(solver.history.time_stamps))
+        assert len(ts) == 2 and ts[0] == 0.0
+        assert ts[1] == pytest.approx(solver.prev_t) and ts[1] < 0.1
+
+    def test_removal_stop_keeps_two_frames(self, monkeypatch):
+        sheet, solver = TestAblationStopsWhenTheCellsAreRemoved._solver(
+            monkeypatch, remove_at=0.05)
+        solver.solve(tf=1.0, dt=0.01, max_displacement=1e9,
+                     save_interval=float("inf"), stop_when_removed=[0, 2])
+        ts = sorted(set(solver.history.time_stamps))
+        assert len(ts) == 2 and ts[0] == 0.0
+        assert ts[1] == pytest.approx(solver.prev_t)
+
+    def test_running_to_tf_keeps_two_frames(self, monkeypatch):
+        sheet, solver = TestSteadyStateStop._build(
+            monkeypatch, velocity_fn=lambda t, pos: np.zeros_like(pos))
+        solver.solve(tf=0.3, dt=0.01, max_displacement=1e9,
+                     save_interval=float("inf"))
+        ts = sorted(set(solver.history.time_stamps))
+        assert len(ts) == 2 and ts[1] == pytest.approx(0.3, abs=0.011)
+
+
+class TestFitOutputsSeedsAndScores:
+    """Fit runs write only what the score reads; the fit records every
+    simulation's seeds and its own score."""
+
+    def test_fit_outputs_only_skips_images_labels_and_contact_matrix(
+            self, tmp_path, monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        kw = dict(no_differentiation=True, t_end=0.03, seed=7,
+                  save_interval=run_model._FIT_SAVE_INTERVAL)
+        run_model.run(0.01, 2.0, 2.0, 0, name="lean", fit_outputs_only=True, **kw)
+        run_model.run(0.01, 2.0, 2.0, 0, name="full", **kw)
+        lean = set(os.listdir(tmp_path / "lean"))
+        full = set(os.listdir(tmp_path / "full"))
+        dropped = {"initial.png", "finale.png", "movie.gif", "labels.npy",
+                   "contact_matrix.npy"}
+        assert dropped <= full and not (dropped & lean)
+        assert {"history.hf5", "parameters.txt", "debug.log",
+                "cell_info.pkl"} <= lean
+        # same simulation either way: the switch is output-only
+        from tyssue import HistoryHdf5
+        from virtual_sheet import VirtualSheet
+        a = HistoryHdf5.from_archive(str(tmp_path / "lean" / "history.hf5"),
+                                     eptm_class=VirtualSheet)
+        b = HistoryHdf5.from_archive(str(tmp_path / "full" / "history.hf5"),
+                                     eptm_class=VirtualSheet)
+        ta, tb = max(a.time_stamps), max(b.time_stamps)
+        assert ta == tb
+        np.testing.assert_array_equal(a.retrieve(ta).vert_df[["x", "y"]].to_numpy(),
+                                      b.retrieve(tb).vert_df[["x", "y"]].to_numpy())
+
+    def test_records_carry_the_seeds_even_when_the_task_failed(
+            self, tmp_path, monkeypatch):
+        import grid_fit_mechanics_v3 as g
+        from mechanics_eval import base_run_name
+        monkeypatch.setattr(g, "RESULTS_DIR", str(tmp_path))
+        task = g.build_task("E17.5", "arr0", 3.5, 0.0105, 6.746, [1, 2], 0.4)
+        name = base_run_name(task)
+        assert "_medv0.001" in name and "_pacell" in name and "_h5" in name
+        for run, seed in ((name, 11), ("abl", 12)):
+            (tmp_path / run).mkdir()
+            (tmp_path / run / "parameters.txt").write_text("seed: %d\n" % seed)
+        failed = g.record_from_terms("E17.5", "k", {}, "arr0", 0.4, None,
+                                     task=task)
+        assert failed["failed"] and failed["base_seed"] == 11
+        ok = g.record_from_terms("E17.5", "k", {}, "arr0", 0.4,
+                                 {"base_run": name, "ablation_run": "abl"})
+        assert (ok["base_seed"], ok["ablation_seed"]) == (11, 12)
+
+    def test_the_raw_data_reproduces_every_observable(self, tmp_path,
+                                                       monkeypatch):
+        """Roundness ratio, ablation ratio, lambda^2 and sigma~ are all
+        recomputed from the saved raw data alone and match the record."""
+        import json
+        import grid_fit_mechanics_v3 as g
+        from mechanics_scoring import (energy_sums, shrinkage_lambda_squared,
+                                       isotropic_stress)
+        from post_processing import _hc_over_mean_sc
+        monkeypatch.setattr(g, "RESULTS_DIR", str(tmp_path))
+        fd = TestMechanicsScoring._face_df(seed=4)
+        rng = np.random.default_rng(5)
+        hc_r, sc_r = rng.uniform(.7, .9, 12), rng.uniform(.5, .8, 40)
+        hc_a, sc_a = rng.uniform(.9, 1.1, 2), rng.uniform(1., 1.3, 20)
+        terms = {"hc_roundness": hc_r, "sc_roundness": sc_r,
+                 "hc_ablation": hc_a, "sc_ablation": sc_a,
+                 "roundness_ratio": _hc_over_mean_sc(hc_r, sc_r),
+                 "ablation_ratio": _hc_over_mean_sc(hc_a, sc_a),
+                 "lambda_squared": shrinkage_lambda_squared(fd),
+                 "stress": isotropic_stress(fd), "energy_sums": energy_sums(fd)}
+        rec = g.record_from_terms("E17.5", "k", {}, "arr", 0.4, terms)
+        raw = json.loads(json.dumps(rec))["raw"]        # survives JSON
+        assert (raw["n_hc_roundness"], raw["n_sc_roundness"]) == (12, 40)
+        assert (raw["n_hc_area_change"], raw["n_sc_area_change"]) == (2, 20)
+        assert raw["mean_hc_roundness"] / raw["mean_sc_roundness"] == \
+            pytest.approx(rec["roundness_ratio"])
+        assert np.mean(raw["hc_area_change"]) / np.mean(raw["sc_area_change"]) \
+            == pytest.approx(rec["ablation_ratio"])
+        e = raw["energy_sums"]
+        assert (e["sum_2A0A_alpha"] - e["sum_gamma_L2"]) / (2 * e["sum_A2_alpha"]) \
+            == pytest.approx(rec["lambda_squared"], rel=1e-12)
+        assert (e["sum_2alphaA_A_minus_A0"] + e["sum_gamma_L2"]) / (2 * e["sum_A"]) \
+            == pytest.approx(rec["stress"], rel=1e-12)
+        assert e["n_cells"] == len(fd)
+
+    def test_a_simulations_own_score(self):
+        from mechanics_scoring import simulation_chi2, WORST_CHI2
+        targets = {"roundness_ratio": (1.2, 0.05, 3),
+                   "ablation_ratio": (0.85, 0.04, 3),
+                   "shrinkage": (0.925, 0.005, 14)}
+        rec = {"roundness_ratio": 1.25, "ablation_ratio": None,
+               "lambda_squared": 0.9025}
+        s = simulation_chi2(rec, targets)
+        assert s["terms"]["roundness_ratio"] == pytest.approx(1.0)
+        assert s["terms"]["shrinkage"] == pytest.approx(
+            (0.95 - 0.925) ** 2 / 0.005 ** 2)
+        assert s["terms"]["ablation_ratio"] is None
+        assert s["undefined"] == ["ablation_ratio"]
+        assert s["J"] == pytest.approx(1.0 + 25.0)
+        rec["lambda_squared"] = -0.1
+        assert simulation_chi2(rec, targets)["terms"]["shrinkage"] == WORST_CHI2
+
+
 class TestHillExponentFive:
     """Every Hill function runs at l = 5 (SI, Supplementary Table 1); phase 1
     ran at 3. The archived l=3 runs must stay nameable and must never be

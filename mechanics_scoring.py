@@ -82,6 +82,23 @@ def _mechanical_arrays(face_df):
     return cols
 
 
+def energy_sums(face_df):
+    """The sums Eqs. 40 and 42 are built from, over the cells the energy sums
+    over (see :func:`_mechanical_arrays`). Saved per simulation so both
+    observables -- or a variant of them -- can be recomputed without the run:
+
+        lambda^2 = (sum_2A0A_alpha - sum_gamma_L2) / (2 sum_A2_alpha)
+        sigma~   = (sum_2alphaA_A_minus_A0 + sum_gamma_L2) / (2 sum_A)
+    """
+    A, L, A0, alpha, gamma = _mechanical_arrays(face_df)
+    return {"n_cells": int(A.size),
+            "sum_2A0A_alpha": float(np.sum(2 * A0 * A * alpha)),
+            "sum_gamma_L2": float(np.sum(gamma * L ** 2)),
+            "sum_A2_alpha": float(np.sum(A ** 2 * alpha)),
+            "sum_2alphaA_A_minus_A0": float(np.sum(2 * alpha * A * (A - A0))),
+            "sum_A": float(np.sum(A))}
+
+
 def shrinkage_lambda_squared(face_df):
     """Eq. 31: the scale^2 minimising E(lambda) of a freely relaxing cut.
 
@@ -215,6 +232,35 @@ def stage_chi2(summary, targets):
     if summary["shrinkage_rejected"]:
         terms["shrinkage"] = WORST_CHI2
     return terms, float(sum(terms.values()))
+
+
+def simulation_chi2(record, targets):
+    """Score ONE simulation on its own: its value in place of the model mean
+    and no model SEM, as the SI does to rank single patterns (step 1 of 7.5).
+
+    Returns ``{"terms": {term: chi^2 or None}, "J": sum, "undefined": [...]}``.
+    A term is None when the simulation has no value for it -- an ablation
+    without any HC neighbour -- and is left out of J and listed, rather than
+    scored, since a single simulation's missing term says nothing about the
+    point. A non-positive lambda^2 scores WORST_CHI2, as for the stage.
+    """
+    lam_sq = record.get("lambda_squared")
+    values = {"roundness_ratio": record.get("roundness_ratio"),
+              "ablation_ratio": record.get("ablation_ratio"),
+              "shrinkage": (None if lam_sq is None or not np.isfinite(lam_sq)
+                            else (float(np.sqrt(lam_sq)) if lam_sq > 0 else "rejected"))}
+    terms = {}
+    for term, v in values.items():
+        e_m, e_s, _ = targets[term]
+        if v == "rejected":
+            terms[term] = WORST_CHI2
+        elif v is None or not np.isfinite(v):
+            terms[term] = None
+        else:
+            terms[term] = chi2(float(v), 0.0, e_m, e_s)
+    undefined = [t for t, v in terms.items() if v is None]
+    return {"terms": terms, "J": float(sum(v for v in terms.values() if v is not None)),
+            "undefined": undefined}
 
 
 def stress_chi2(summary_e17, summary_p0, targets_e17, targets_p0):

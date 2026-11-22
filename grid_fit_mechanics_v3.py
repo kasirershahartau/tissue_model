@@ -128,13 +128,29 @@ def _mean(a):
     return float(a.mean()) if a.size else None
 
 
-def record_from_terms(stage, key, params, initial, threshold, terms):
+def _recorded_seed(run_name):
+    """The seed run() drew and recorded for ``run_name`` (None if no record)."""
+    from run_model import _recorded_parameter
+    if not run_name:
+        return None
+    return _recorded_parameter(os.path.join(RESULTS_DIR, run_name), "seed")
+
+
+def record_from_terms(stage, key, params, initial, threshold, terms, task=None):
     """One JSON-able line per simulation. The per-cell arrays are reduced to
     the per-simulation value the objective uses: mean(HC / mean SC) is the
-    HC/SC ratio of the means."""
+    HC/SC ratio of the means.
+
+    Every record carries the SEEDS of its runs (read from their
+    parameters.txt), so any simulation of the fit can be replayed exactly --
+    including a failed one, whose base run is found by the task's own name
+    (mechanics_eval.base_run_name)."""
+    from mechanics_eval import base_run_name
     rec = {"stage": stage, "point": key, "initial": initial,
            "threshold": threshold, **params, "failed": terms is None}
     if terms is None:
+        name = base_run_name(task) if task is not None else None
+        rec.update({"base_run": name, "base_seed": _recorded_seed(name)})
         return rec
     rec.update({
         "roundness_ratio": _mean(terms.get("roundness_ratio")),
@@ -150,8 +166,36 @@ def record_from_terms(stage, key, params, initial, threshold, terms):
         "ablation_run": terms.get("ablation_run"),
         "ablated_ids": terms.get("ablated_ids"),
         "ablated_labels": terms.get("ablated_labels"),
+        "base_seed": _recorded_seed(terms.get("base_run")),
+        "ablation_seed": _recorded_seed(terms.get("ablation_run")),
+        # Everything the scores are computed FROM, so any score -- or a
+        # variant of one -- can be recomputed from the records alone:
+        # per-cell roundness and area change by type (with their means and
+        # counts) and the sums of Eqs. 40 and 42.
+        "raw": _raw_data(terms),
     })
     return rec
+
+
+def _finite_list(a):
+    if a is None:
+        return None
+    a = np.asarray(a, float)
+    return [float(x) for x in a[np.isfinite(a)]]
+
+
+def _raw_data(terms):
+    raw = {}
+    for kind, hc_key, sc_key in (("roundness", "hc_roundness", "sc_roundness"),
+                                 ("area_change", "hc_ablation", "sc_ablation")):
+        for cell, key in (("hc", hc_key), ("sc", sc_key)):
+            vals = _finite_list(terms.get(key))
+            raw["%s_%s" % (cell, kind)] = vals
+            raw["n_%s_%s" % (cell, kind)] = None if vals is None else len(vals)
+            raw["mean_%s_%s" % (cell, kind)] = (float(np.mean(vals))
+                                                if vals else None)
+    raw["energy_sums"] = terms.get("energy_sums")
+    return raw
 
 
 def load_records(stage):
@@ -181,7 +225,8 @@ def simulate(stage, initials, grid, workers, dry_run=False):
             meta[task_key] = (key, initial, t["threshold"],
                               {"alphaHC": alpha_hc, "gammaSC": gamma_sc,
                                "R_gamma": r_gamma,
-                               "gammaHC": gamma_sc * r_gamma})
+                               "gammaHC": gamma_sc * r_gamma},
+                              tasks[-1][1])
     print("%s: %d grid point(s) x %d pattern(s); %d simulation(s) to run, "
           "%d already recorded" % (stage, len(grid), len(initials), len(tasks),
                                    len(done)))
@@ -196,8 +241,9 @@ def simulate(stage, initials, grid, workers, dry_run=False):
     path = os.path.join(RESULTS_DIR, RECORDS % (stage, TAG))
 
     def handle(task_key, details, n, total):
-        key, initial, threshold, params = meta[task_key]
-        rec = record_from_terms(stage, key, params, initial, threshold, details)
+        key, initial, threshold, params, task = meta[task_key]
+        rec = record_from_terms(stage, key, params, initial, threshold, details,
+                                task=task)
         with open(path, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
         print("  [%4d/%4d] %s %s" % (n, total, task_key,
@@ -228,7 +274,32 @@ def score(top=10):
     per_stage = {s: {k: dict(zip(("terms", "J"),
                                  ms.stage_chi2(v, targets[s])))
                      for k, v in points[s].items()} for s in STAGES}
+    # Every simulation of every grid point, with its seeds, its observables
+    # and its OWN score (single value, no model SEM), so a point's J can be
+    # traced to the patterns that drive it.
+    simulations = {}
+    for s in STAGES:
+        for rec in load_records(s):
+            entry = {k: rec.get(k) for k in (
+                "initial", "failed", "base_run", "ablation_run", "base_seed",
+                "ablation_seed", "roundness_ratio", "ablation_ratio",
+                "n_hc_neighbours", "n_sc_neighbours", "lambda_squared",
+                "stress", "ablated_removed", "ablated_ids")}
+            # the means, counts and sums only; the per-cell lists stay in
+            # the JSONL records, which are the archive
+            raw = rec.get("raw") or {}
+            entry["raw"] = {k: v for k, v in raw.items()
+                            if not isinstance(v, list)}
+            # records written before seeds were recorded: read them now
+            for run_key, seed_key in (("base_run", "base_seed"),
+                                      ("ablation_run", "ablation_seed")):
+                if entry.get(seed_key) is None:
+                    entry[seed_key] = _recorded_seed(entry.get(run_key))
+            if not rec.get("failed"):
+                entry["score"] = ms.simulation_chi2(rec, targets[s])
+            simulations.setdefault(s, {}).setdefault(rec["point"], []).append(entry)
     out = {"targets": targets, "summaries": points, "per_stage": per_stage,
+           "simulations": simulations,
            "ranked_pairs": ranked[:200], "n_pairs": len(ranked)}
     path = os.path.join(RESULTS_DIR, SCORES % TAG)
     with open(path, "w") as fh:

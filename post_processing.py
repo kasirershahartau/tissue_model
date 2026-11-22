@@ -2307,7 +2307,8 @@ def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
     HC-over-SC ratio was split into separate HC and SC area-change terms.)
 
     Also returned, for the SI section 7 objective (:mod:`mechanics_scoring`):
-    ``lambda_squared`` (Eq. 31) and ``stress`` (Eq. 36) of the same frame,
+    ``lambda_squared`` (Eq. 40), ``stress`` (Eq. 42) and the ``energy_sums``
+    they are built from, all of the same frame,
     each None when the formula does not apply (a target perimeter), and
     ``ablated_removed`` -- whether every ablated cell is gone from the
     ablation run's last frame. With ``require_ablated_removed`` a run whose
@@ -2315,7 +2316,8 @@ def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
     not finished closing the hole, so the area change is not the one the
     experiment measures.
     """
-    from mechanics_scoring import shrinkage_lambda_squared, isotropic_stress
+    from mechanics_scoring import (shrinkage_lambda_squared, isotropic_stress,
+                                   energy_sums)
     history = load_history_file(model_name)
     if time_point == -1:
         time_point = np.max(history.time_stamps)
@@ -2361,14 +2363,16 @@ def extract_model_mechanics(model_name, type_by='atoh_level', threshold=None,
     try:
         lambda_squared = shrinkage_lambda_squared(sheet.face_df)
         stress = isotropic_stress(sheet.face_df)
+        sums = energy_sums(sheet.face_df)
     except ValueError:
-        lambda_squared = stress = None
+        lambda_squared = stress = sums = None
     return {"hc_roundness": hc_roundness, "sc_roundness": sc_roundness,
             "hc_ablation": hc_ablation, "sc_ablation": sc_ablation,
             "roundness_ratio": roundness_ratio,
             "ablation_ratio": ablation_ratio,
             "shrinkage": shrinkage,
             "lambda_squared": lambda_squared, "stress": stress,
+            "energy_sums": sums,
             "ablated_removed": ablated_removed}
 
 
