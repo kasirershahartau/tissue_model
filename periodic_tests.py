@@ -16,6 +16,7 @@ from tyssue import HistoryHdf5
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel
+from lateral_inhibition_model import HILL_EXPONENT, TAU_N, TAU_D, BETA
 from history_io import create_gif_safe, RESULTS_DIR
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 
@@ -220,17 +221,17 @@ def run():
 
     # Lateral Inhibition parameters
     differentiation_threshold = 0.5
-    l = 3  # decreasing Hill exponent
-    m = 3  # increasing Hill exponent
+    l = HILL_EXPONENT  # decreasing Hill exponent (SI: 5; phase 1 used 3)
+    m = HILL_EXPONENT  # increasing Hill exponent
     betaN = 1  # maximum production rate Notch for classical model
     betaD = 1  # maximum production rate Delta for classical model
-    notch_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
+    notch_repressor_degradation_ratio = TAU_N  # notch / repressor degradation rate (SI)
     repressor_sensitivity = 0.35  # PR - how much Delta production is sensitive to repressor level (sensitivity^l / (sensitivity^l + repressor^l)
     atoh_sensitivity = 0.377  # how much Atoh1 production is sensitive to delta level (delta^l / (sensitivity^l + delta^l)
     atoh_by_repressor = False  # if True, Atoh1 production will be set by repressor level instead of delta (sensitivity^l / (sensitivity^l + repressor^l)
     notch_sensitivity = 0.2  # PS - how much Repressor production is sensitive to signaling level (signaling^m / (sensitivity^m + signaling^m))
-    delta_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
-    notch_delta_production_ratio = 1 # beta
+    delta_repressor_degradation_ratio = TAU_D  # delta / repressor degradation rate (SI)
+    notch_delta_production_ratio = BETA  # beta~ (SI)
     sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
     mechanosensitivity = 0 # Sensitivity to mechanical stress (for stress dependent version)
     stress_effectors = [FaceContractility]  # effectors to calculate stress (for stress dependent version)

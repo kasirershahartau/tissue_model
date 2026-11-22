@@ -244,7 +244,8 @@ class BoundaryBending(AbstractEffector):
         return grad_srce, grad_trgt
 
 
-from lateral_inhibition_model import LateralInhibitionModel
+from lateral_inhibition_model import (LateralInhibitionModel, HILL_EXPONENT,
+                                      TAU_N, TAU_D, BETA)
 
 # Experimental cell-area distribution in units of the MEAN PERIMETER SQUARED,
 # i.e. A/<P>^2, so it is scale-free and can be converted into any length unit.
@@ -447,9 +448,9 @@ class InnerEarModel:
                  contractility=None, elasticity=None, shape_index=0.0,
                  hc_shape_index=None, sc_shape_index=None, bending=0.0,
                  differentiation_threshold=0.5, random_sensitivity=False,
-                 l=3, m=3, betaN=1, betaD=1, inhibition=False,
-                 notch_repressor_degradation_ratio=1, repressor_sensitivity=1, atoh_sensitivity=1,
-                 delta_repressor_degradation_ratio=1, notch_delta_production_ratio=1,
+                 l=HILL_EXPONENT, m=HILL_EXPONENT, betaN=1, betaD=1, inhibition=False,
+                 notch_repressor_degradation_ratio=TAU_N, repressor_sensitivity=1, atoh_sensitivity=1,
+                 delta_repressor_degradation_ratio=TAU_D, notch_delta_production_ratio=BETA,
                  stress_effectors=None, mechanosensitivity=0, stress_shift=0.0,
                  stress_hill_exponent=None,
                  notch_sensitivity=1, atoh_by_repressor=False,

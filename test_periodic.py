@@ -5433,8 +5433,10 @@ class TestMechanicalParamsFromAtoh:
         fd = m.sheet.face_df
         delta = fd["delta_level"].values
         atoh = fd["atoh_level"].values
-        # atoh is the increasing Hill of delta with half-max AT the threshold.
-        np.testing.assert_allclose(atoh, delta ** 3 / (A ** 3 + delta ** 3), atol=1e-9)
+        # atoh is the increasing Hill of delta with half-max AT the threshold,
+        # exponent l = 5 (SI Eqs. 16-17 and Supplementary Table 1). Spelled out
+        # rather than imported, so the test pins the value, not the constant.
+        np.testing.assert_allclose(atoh, delta ** 5 / (A ** 5 + delta ** 5), atol=1e-9)
         live = fd["type"].values >= 0
         # contractility / area_elasticity are the atoh interpolation of HC<->SC.
         np.testing.assert_allclose(fd["contractility"].values[live],
@@ -6442,6 +6444,151 @@ class TestMedianSpeedSteadyState:
                 tuple(task + ["median"]))
         assert [kw["steady_state_statistic"] for kw in seen] == \
             ["median", "median"]
+
+
+class TestHillExponentFive:
+    """Every Hill function runs at l = 5 (SI, Supplementary Table 1); phase 1
+    ran at 3. The archived l=3 runs must stay nameable and must never be
+    reused, resumed or returned in place of an l=5 run."""
+
+    def test_the_model_defaults_are_five(self):
+        from lateral_inhibition_model import (LateralInhibitionModel,
+                                              HILL_EXPONENT,
+                                              HISTORICAL_HILL_EXPONENT)
+        assert (HILL_EXPONENT, HISTORICAL_HILL_EXPONENT) == (5, 3)
+        li = LateralInhibitionModel(None)
+        assert (li.l, li.m) == (5, 5)
+        # the gate exponent follows m unless overridden
+        x = np.array([0.2, 0.5, 0.9])
+        np.testing.assert_allclose(li.increasing_hill(x, 0.5),
+                                   x ** 5 / (0.5 ** 5 + x ** 5))
+        np.testing.assert_allclose(li.decreasing_hill(x, 0.5),
+                                   0.5 ** 5 / (0.5 ** 5 + x ** 5))
+
+    def test_folder_name_carries_the_exponent_and_keeps_the_old_names(self):
+        import run_model
+        kw = dict(initial_sheet_name="arr0", gammaSC=0.0105,
+                  gammaHC_ratio=6.746, alphaHC_ratio=3.5, psigma=0)
+        new = run_model._short_run_folder_name(**kw)
+        old = run_model._short_run_folder_name(hill_exponent=3,
+                                               li_rates=(1, 1, 1), **kw)
+        assert "_h5_" in new
+        assert "_h" not in old.replace("_gHC", "")
+        assert new != old
+        # The l=3 spelling is the pre-change name, byte for byte: these
+        # parameters made this folder before the exponent existed.
+        canonical = "from=arr0|gSC=0.0105|gHC=6.75|aHC=3.50|ps=0.00|abl="
+        import hashlib
+        assert old.endswith(hashlib.md5(canonical.encode()).hexdigest()[:10])
+
+    @staticmethod
+    def _old_run(tmp_path, name, l):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "parameters.txt").write_text("l: %d\nm: %d\n" % (l, l))
+        return folder
+
+    def test_run_refuses_a_folder_made_at_another_exponent(
+            self, tmp_path, monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        self._old_run(tmp_path, "strict_arr0", 3)
+        for kw in (dict(), dict(reuse_existing_run=True),
+                   dict(continue_existing_run=True)):
+            with pytest.raises(ValueError, match="Hill exponent 3"):
+                run_model.run(0.0105, 6.746, 3.5, 0, "arr0", name="strict_arr0",
+                              no_differentiation=True, **kw)
+
+    def test_the_same_exponent_gets_the_old_behaviour(self, tmp_path,
+                                                      monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        self._old_run(tmp_path, "strict_arr0", 3)
+        # exists, not reused -> returned untouched, as always
+        assert run_model.run(0.0105, 6.746, 3.5, 0, "arr0", name="strict_arr0",
+                             no_differentiation=True,
+                             hill_exponent=3) == "strict_arr0"
+
+    def test_a_bad_exponent_is_refused_before_making_a_folder(
+            self, tmp_path, monkeypatch):
+        import run_model
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        with pytest.raises(ValueError, match="hill_exponent"):
+            run_model.run(0.0105, 6.746, 3.5, 0, "arr0",
+                          no_differentiation=True, hill_exponent=4.5)
+        assert os.listdir(tmp_path) == []
+
+
+class TestLateralInhibitionRatesFromTheSI:
+    """tau_N = 0.15, tau_D = 0.30, beta~ = 0.5 (SI 2.4); phase 1 ran at 1."""
+
+    def test_defaults_and_natural_bounds(self):
+        from lateral_inhibition_model import LateralInhibitionModel
+        li = LateralInhibitionModel(None)
+        assert (li.notch_repressor_degradation_ratio,
+                li.delta_repressor_degradation_ratio,
+                li.notch_delta_production_ratio) == (0.15, 0.30, 0.5)
+        assert li.get_maximal_notch_level() == pytest.approx(1 / 0.15)
+        assert li.get_maximal_delta_level() == pytest.approx(1 / 0.30)
+        assert li.get_maximal_repressor_level() == 1.0
+        # the phase-1 rates give back the old bounds exactly
+        old = LateralInhibitionModel(None, notch_repressor_degradation_ratio=1,
+                                     delta_repressor_degradation_ratio=1,
+                                     notch_delta_production_ratio=1)
+        assert (old.get_maximal_notch_level(), old.get_maximal_delta_level(),
+                old.get_maximal_repressor_level()) == (1, 1, 1)
+
+    def test_an_unsignalled_cell_is_not_capped_at_one(self):
+        """One isolated cell: no contacts, so N -> 1/tau_N = 6.67 and D ->
+        1/tau_D = 3.33; nothing after the integration may hold them at 1."""
+        from lateral_inhibition_model import LateralInhibitionModel
+
+        class _Model:
+            def get_contact_matrix(self):
+                return np.zeros((1, 1))
+
+            def update_cell_type_parameters(self, atoh):
+                pass
+
+        sheet = type("S", (), {})()
+        sheet.face_df = pd.DataFrame({
+            "unique_id": [0], "repressor_level": [0.0], "notch_level": [0.0],
+            "delta_level": [0.0], "perimeter": [3.0], "notch_sensitivity": [0.2],
+            "type": [0], "atoh_level": [0.0]})
+        li = LateralInhibitionModel(_Model(), atoh_sensitivity=0.5)
+        li.get_length_dependent_differentiation_function(
+            dt=60.0, quasi_static=True)(sheet, None)
+        assert sheet.face_df.notch_level[0] == pytest.approx(1 / 0.15, rel=1e-3)
+        assert sheet.face_df.delta_level[0] == pytest.approx(1 / 0.30, rel=1e-3)
+        # Not capped at their natural maxima either: a cell started ABOVE
+        # 1/tau decays towards it, and a short step must leave it above.
+        sheet.face_df.loc[0, ["notch_level", "delta_level", "repressor_level"]]             = [20.0, 20.0, 5.0]
+        li.get_length_dependent_differentiation_function(
+            dt=0.1, quasi_static=True)(sheet, None)
+        assert sheet.face_df.notch_level[0] > 19
+        assert sheet.face_df.delta_level[0] > 19
+        assert sheet.face_df.repressor_level[0] > 4      # R > 1 is not capped
+
+    def test_folder_names_and_the_guard(self, tmp_path, monkeypatch):
+        import run_model
+        kw = dict(initial_sheet_name="arr0", gammaSC=0.0105,
+                  gammaHC_ratio=6.746, alphaHC_ratio=3.5, psigma=0)
+        si = run_model._short_run_folder_name(**kw)
+        ones = run_model._short_run_folder_name(li_rates=(1, 1, 1), **kw)
+        assert si != ones
+        monkeypatch.setattr(run_model, "RESULTS_DIR", str(tmp_path))
+        folder = tmp_path / "strict_arr0"
+        folder.mkdir()
+        (folder / "parameters.txt").write_text(
+            "l: 5\nnotch_repressor_degradation_ratio: 1\n"
+            "delta_repressor_degradation_ratio: 1\n"
+            "notch_delta_production_ratio: 1\n")
+        with pytest.raises(ValueError, match="lateral-inhibition rates"):
+            run_model.run(0.0105, 6.746, 3.5, 0, "arr0", name="strict_arr0",
+                          no_differentiation=True, reuse_existing_run=True)
+        assert run_model.run(0.0105, 6.746, 3.5, 0, "arr0", name="strict_arr0",
+                             no_differentiation=True, tau_n=1, tau_d=1,
+                             beta=1) == "strict_arr0"
 
 
 class TestFindNonBoundaryCells:

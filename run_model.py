@@ -54,6 +54,8 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from virtual_sheet import VirtualSheet
 from inner_ear_model import InnerEarModel, ContractilityPerimeterElasticity, BoundaryBending
+from lateral_inhibition_model import (HILL_EXPONENT, HISTORICAL_HILL_EXPONENT,
+                                      TAU_N, TAU_D, BETA, HISTORICAL_LI_RATES)
 from tyssue.dynamics.effectors import LineTension, FaceAreaElasticity, FaceContractility
 from history_io import create_gif_safe, random_array_name, RESULTS_DIR
 
@@ -240,7 +242,9 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
                            hc_shape_index=None, sc_shape_index=None,
                            bending=None, preferred_area=None, stress_shift=0.0,
                            l0_ratio=1.0, preferred_area_per_cell=False,
-                           steady_state_statistic="max"):
+                           steady_state_statistic="max",
+                           hill_exponent=HILL_EXPONENT,
+                           li_rates=(TAU_N, TAU_D, BETA)):
     """Build a SHORT, deterministic, collision-resistant results-folder name.
 
     The previous scheme embedded the full ``initial_sheet_name`` verbatim::
@@ -354,6 +358,19 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     # assumption (L0 == average perimeter) and keeps the existing folder names.
     if abs(l0_ratio - 1.0) > 1e-9:
         canonical += "|l0r=%.4g" % l0_ratio
+    # The Hill exponent changes every Hill function of the model -- the LI
+    # dynamics AND the delta-to-mechanics interpolation of Eqs. 16-17 -- so
+    # runs at two exponents must never share a folder. Only an exponent other
+    # than the phase-1 one is folded in, so the archived l=3 runs keep their
+    # names; since the DEFAULT is now 5, every new run carries the tag.
+    if int(hill_exponent) != HISTORICAL_HILL_EXPONENT:
+        canonical += "|hill=%d" % int(hill_exponent)
+    # (tau_N, tau_D, beta~) of Eqs. 7-9 -- the LI dynamics. Folded in only
+    # when they differ from phase 1's (1, 1, 1), so archived names survive.
+    # Hash only: the new default set rides with the "_h5" tag in the readable
+    # name, and spelling three rates out would lengthen every name.
+    if any(abs(float(a) - b) > 1e-12 for a, b in zip(li_rates, HISTORICAL_LI_RATES)):
+        canonical += "|tauN=%.6g|tauD=%.6g|beta=%.6g" % tuple(float(x) for x in li_rates)
     digest = hashlib.md5(canonical.encode("utf-8")).hexdigest()[:10]
     name = "fit_gSC%.4f_gHC%.2f_aHC%.2f_ps%.2f" % (
         gammaSC, gammaHC_ratio, alphaHC_ratio, psigma,
@@ -383,6 +400,8 @@ def _short_run_folder_name(initial_sheet_name, gammaSC, gammaHC_ratio,
     # an l0_ratio sweep is self-describing on disk. %g keeps 1e5 short.
     if abs(l0_ratio - 1.0) > 1e-9:
         name += "_l0r%.4g" % l0_ratio
+    if int(hill_exponent) != HISTORICAL_HILL_EXPONENT:
+        name += "_h%d" % int(hill_exponent)
     # Self-describing tag for the type-dependent shape index (HC/SC split).
     if hc_shape_index is not None or sc_shape_index is not None:
         name += "_p0hc%.2f_p0sc%.2f" % (
@@ -566,7 +585,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         uniform_delta_level=None, division_area=1.2, division_rule="area",
         division_interval=None, division_start=None, seed=None,
         restore_resume_state=True, preferred_area_per_cell=False,
-        steady_state_statistic="max"):
+        steady_state_statistic="max", hill_exponent=HILL_EXPONENT,
+        tau_n=TAU_N, tau_d=TAU_D, beta=BETA):
     """Run a simulation; optionally resume an interrupted one OR
     fork a fresh one from a chosen snapshot of an existing archive.
 
@@ -657,6 +677,24 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         at t=27.5, bit-identical to a no-stop run up to there, with the
         HC/SC roundness ratio 1.4% of its total change short of its
         t=50 value. A median run gets its own folder (``_medv<thr>``).
+    hill_exponent : int, default HILL_EXPONENT (5)
+        The exponent of every Hill function in the model: ``l`` (the
+        repressor's inhibition of Delta) and ``m`` (the signal's
+        activation of the repressor, and Delta's activation of Atoh1,
+        which is the Hill of Eqs. 16-17 that sets each cell's
+        mechanics), and the mechanosensitivity gate unless
+        ``stress_hill_exponent`` overrides it. Phase 1 ran at 3
+        (``HISTORICAL_HILL_EXPONENT``); pass 3 to name, reuse or
+        resume one of those runs. Any other value is in the folder
+        name (``_h<value>``), and a folder recorded at a different
+        exponent is refused rather than reused or resumed.
+    tau_n, tau_d, beta : float, default TAU_N, TAU_D, BETA (0.15, 0.30, 0.5)
+        The dimensionless rates of SI Eqs. 7-9: Notch and Delta degradation
+        over repressor degradation, and Notch over Delta production (the
+        literature estimates of SI 2.4; beta~ = 0.5 confirmed). Phase 1 ran
+        with all three at 1; pass those to name, reuse or resume one of its
+        runs. Any other set is folded into the folder hash, and a folder
+        recorded with different rates is refused, as for ``hill_exponent``.
     reuse_existing_run : bool, default False
         Smart restart for re-launched parameter fits. When True and a
         results folder for ``name`` already exists, the previous run's
@@ -809,6 +847,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
             # A different stopping rule relaxes to a different state, so it
             # must not share (or be reused as) a max-criterion run's folder.
             steady_state_statistic=steady_state_statistic,
+            hill_exponent=hill_exponent,
+            li_rates=(tau_n, tau_d, beta),
         )
     elif ablated_cells is not None and len(ablated_cells) > 0:
         # Caller supplied an explicit ``name`` AND an ablation list: keep the
@@ -912,6 +952,10 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         # results folder is created under a name built from it.
         raise ValueError("steady_state_statistic must be 'max' or 'median', "
                          "not %r" % (steady_state_statistic,))
+    if int(hill_exponent) != hill_exponent or hill_exponent < 1:
+        raise ValueError("hill_exponent must be a positive integer, not %r"
+                         % (hill_exponent,))
+    hill_exponent = int(hill_exponent)
     quasi_static = True
     # quasi_static_threshold is now a run() parameter (default
     # _DEFAULT_QUASI_STATIC_THRESHOLD) so the mechanics fit can relax base and
@@ -983,11 +1027,14 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
 
     # Lateral Inhibition parameters
     differentiation_threshold = 0.5
-    l = 3  # decreasing Hill exponent
-    m = 3  # increasing Hill exponent
+    # ONE exponent for every Hill function (SI: l = 5); phase 1 used 3. Kept as
+    # the two locals the model takes, which parameters.txt records -- and the
+    # folder guard below reads ``l`` back from an old run's record.
+    l = hill_exponent  # decreasing Hill exponent
+    m = hill_exponent  # increasing Hill exponent
     betaN = 1  # maximum production rate Notch for classical model
     betaD = 1  # maximum production rate Delta for classical model
-    notch_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
+    notch_repressor_degradation_ratio = float(tau_n)  # tau_N: notch / repressor degradation rate
     # repressor_sensitivity (PR) is a run() arg now (default 0.45): how much Delta
     # production is sensitive to repressor level (sens^l / (sens^l + repressor^l)).
     # atoh_sensitivity (patoh) is the DELTA half-max of the Atoh1 Hill function
@@ -999,8 +1046,8 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
     atoh_by_repressor = False  # if True, Atoh1 production will be set by repressor level instead of delta (sensitivity^l / (sensitivity^l + repressor^l)
     # notch_sensitivity (PS) is a run() arg now (default 0.2): how much Repressor
     # production is sensitive to signaling level (sig^m / (sens^m + sig^m)).
-    delta_repressor_degradation_ratio = 1  # notch degradation rate / repressor degradation rate
-    notch_delta_production_ratio = 1  # beta
+    delta_repressor_degradation_ratio = float(tau_d)  # tau_D: delta / repressor degradation rate
+    notch_delta_production_ratio = float(beta)  # beta~: notch / delta production rate
     sensitivity_aging_rate = 10  # Notch sensitivity change rate (for aging sensitivity version)
     mechanosensitivity = psigma  # Sensitivity to mechanical stress (for stress dependent version)
     stress_effectors = [ContractilityPerimeterElasticity]  # effectors to calculate stress (for stress dependent version)
@@ -1010,6 +1057,40 @@ def run(gammaSC, gammaHC_ratio, alphaHC_ratio, psigma, initial_sheet_name=None, 
         mechanosensitivity = 0
 
     results_dir = os.path.join(RESULTS_DIR, name)
+    # A folder made at a DIFFERENT Hill exponent is a different model. Most
+    # names now carry the exponent, but several drivers build names by hand
+    # (strict_steady_state, ablate_single_hc, the psigma repeats ...), and for
+    # those an l=3 archive and an l=5 request share a name. Reusing, resuming
+    # or merely returning that folder would hand back the wrong model without
+    # a word, so refuse here, where every path through run() passes. The
+    # record is the ``l`` local every run since parameters.txt existed has
+    # dumped; no record (or no folder) means nothing to compare.
+    if os.path.isdir(results_dir):
+        # The LI rates get the same treatment: every run records the three
+        # locals, so an archive at the phase-1 rates is told apart from one at
+        # the SI rates however its folder was named.
+        for _local, _wanted in (
+                ("notch_repressor_degradation_ratio", notch_repressor_degradation_ratio),
+                ("delta_repressor_degradation_ratio", delta_repressor_degradation_ratio),
+                ("notch_delta_production_ratio", notch_delta_production_ratio)):
+            _rec = _recorded_parameter(results_dir, _local)
+            if _rec is not None and abs(float(_rec) - _wanted) > 1e-12:
+                raise ValueError(
+                    "%s was made with %s=%r, but this run asks for %r; runs at "
+                    "different lateral-inhibition rates are different models "
+                    "and must not be reused, resumed or returned in each "
+                    "other's place. Pass tau_n/tau_d/beta matching that run, "
+                    "or give this one another name."
+                    % (results_dir, _local, _rec, _wanted))
+        _recorded_l = _recorded_parameter(results_dir, "l")
+        if _recorded_l is not None and int(_recorded_l) != hill_exponent:
+            raise ValueError(
+                "%s was made with Hill exponent %d, but this run asks for %d; "
+                "a run at a different exponent is a different model and must "
+                "not be reused, resumed or returned in its place. Pass "
+                "hill_exponent=%d to work with that run, or give this one "
+                "another name." % (results_dir, int(_recorded_l), hill_exponent,
+                                   int(_recorded_l)))
     if continue_existing_run:
         if not os.path.exists(results_dir):
             print("Directory %s doesn't exist. Unable to continue from existing run." % results_dir)
@@ -1804,6 +1885,11 @@ def _run_full_model_one(args):
     # different l0_ratio would collide and reuse_existing_run would hand back a
     # run made at the wrong coupling. 1.0 keeps the historical names.
     _l0tag = "" if abs(float(l0_ratio) - 1.0) < 1e-9 else "_l0r%.4g" % l0_ratio
+    # NOT tagged with the Hill exponent: ~45 readers rebuild these names by
+    # hand, and a tag here alone would silently point them at the wrong runs.
+    # The archived fullmodel_* runs are l=3, so an l=5 run under the same
+    # prefix is REFUSED by run()'s exponent guard -- give new runs a new
+    # name_prefix (the readers take it as run_prefix).
     name = ("%s_ps%s_ks%.3f%s%s_%s"
             % (name_prefix, _psigma_tag(psigma), stress_shift, _mtag, _l0tag, initial)
             if stress_dependent else "%s%s_%s" % (name_prefix, _l0tag, initial))

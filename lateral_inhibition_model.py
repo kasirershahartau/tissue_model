@@ -46,10 +46,40 @@ and read as signal / primary / secondary in general use.
 import numpy as np
 from scipy.integrate import solve_ivp
 
+# The Hill exponent of EVERY Hill function in the model: the repressor's
+# inhibition of Delta production (``l``), the signal's activation of the
+# repressor and Delta's activation of Atoh1 (``m``) -- the last of which is
+# also the l of Eqs. 16-17 that interpolates each cell's mechanics between HC
+# and SC -- and, unless overridden, the mechanosensitivity gate. The SI sets it
+# to 5 ("a sharp switching response", Supplementary Table 1).
+HILL_EXPONENT = 5
+# What every PHASE-1 run used. Kept so a run made at it can still be named,
+# recognised and reproduced: folder names fold in only an exponent OTHER than
+# this one, so the archived l=3 folders keep their names, and run() refuses to
+# reuse or resume a folder recorded at a different exponent.
+HISTORICAL_HILL_EXPONENT = 3
+
+# The dimensionless rates of Eqs. 7-9, from the literature estimates of SI 2.4:
+#   tau_N = gamma_N / gamma_R  (Notch half-life 5.7 h, repressor 0.85 h) = 0.15
+#   tau_D = gamma_D / gamma_R  (Dll1 half-life 2.85 h)                   = 0.30
+#   beta~ = beta_N / beta_D ~= N_ss tau_N / (D_ss tau_D), with N_ss:D_ss
+#           = 1:1                                                        = 0.5
+# (beta~ = 0.5 confirmed 2026-11-22; an earlier Supplementary Table 1 printed 2.)
+TAU_N = 0.15
+TAU_D = 0.30
+BETA = 0.5
+# Phase 1 ran with all three at 1. As for the Hill exponent, only the SI set is
+# folded into folder names, and run() refuses a folder recorded with others.
+HISTORICAL_LI_RATES = (1.0, 1.0, 1.0)            # (tau_N, tau_D, beta~)
+
+
 class LateralInhibitionModel:
-    def __init__(self, model, l=3, m=3, betaN=1, betaD=1, inhibition=False,
-                 notch_repressor_degradation_ratio=1, length_normalization_factor=1, repressor_sensitivity=1,
-                 atoh_sensitivity=1, delta_repressor_degradation_ratio=1, notch_delta_production_ratio=1,
+    def __init__(self, model, l=HILL_EXPONENT, m=HILL_EXPONENT, betaN=1, betaD=1,
+                 inhibition=False,
+                 notch_repressor_degradation_ratio=TAU_N, length_normalization_factor=1,
+                 repressor_sensitivity=1, atoh_sensitivity=1,
+                 delta_repressor_degradation_ratio=TAU_D,
+                 notch_delta_production_ratio=BETA,
                  stress_effectors=None, mechanosensitivity=0, stress_shift=0.0,
                  stress_hill_exponent=None, l0_ratio=1.0):
         self.model = model
@@ -64,7 +94,7 @@ class LateralInhibitionModel:
 
         # Contact dependent model parameters
         self.notch_repressor_degradation_ratio = notch_repressor_degradation_ratio  # tauN
-        self.delta_repressor_degradation_ratio = delta_repressor_degradation_ratio  # tauR
+        self.delta_repressor_degradation_ratio = delta_repressor_degradation_ratio  # tauD
         # L0: mean perimeter of the initial array. It normalises the contact
         # coupling and the face stress, and nothing else (module docstring).
         self.length_normalization_factor = length_normalization_factor
@@ -74,7 +104,7 @@ class LateralInhibitionModel:
         self.l0_ratio = float(l0_ratio)
         self.repressor_sensitivity = repressor_sensitivity  # pR
         self.atoh_sensitivity = atoh_sensitivity  # patoh
-        self.notch_delta_production_ratio = notch_delta_production_ratio  # alpha
+        self.notch_delta_production_ratio = notch_delta_production_ratio  # beta~
 
         self.stress_effectors = stress_effectors
         self.mechanosensitivity = mechanosensitivity  # psigma - the Hill constant
@@ -86,25 +116,34 @@ class LateralInhibitionModel:
         # destroying the discrimination. K = 0 reproduces the historical gate
         # exactly. NOTE K is not a redundant offset: the Hill depends on the RATIO
         # psigma/(s-K), so K also sets the gate's STEEPNESS (slope at half-max =
-        # 3/(4*psigma)). Set K just below the stress you intend to block; putting
+        # m/(4*psigma)). Set K just below the stress you intend to block; putting
         # it far below flattens the gate and washes out the selectivity.
         self.stress_shift = stress_shift
-        # Hill exponent for the MECHANOSENSITIVITY gate only. None -> self.m (3),
-        # an exact no-op. It is separate from self.m because that exponent is also
+        # Hill exponent for the MECHANOSENSITIVITY gate only. None -> self.m
+        # (HILL_EXPONENT), an exact no-op. It is separate from self.m because that exponent is also
         # used by the repressor and signal Hills, so raising it globally would
         # change the whole lateral-inhibition model. A larger value sharpens the
         # stress switch, which is what allows one threshold to separate two
         # populations whose stresses differ only slightly.
         self.stress_hill_exponent = stress_hill_exponent
 
+    # The largest level each channel can reach in the contact-dependent model
+    # (Eqs. 7-9): with no signalling, dN/dt = 1 - tau_N N settles at 1/tau_N;
+    # Delta's production is a Hill function <= 1, so D <= 1/tau_D; the
+    # repressor's production is a Hill function <= 1 against unit
+    # degradation, so R <= 1. They bound the random seeding only: no level is
+    # capped after an integration step. At the phase-1 rates (all 1) every
+    # bound is 1, exactly
+    # the values these returned before -- the repressor's used to be written
+    # betaN / tau_N, which is 1 only when tau_N is.
     def get_maximal_delta_level(self):
-        return self.betaD
+        return self.betaD / self.delta_repressor_degradation_ratio
 
     def get_maximal_notch_level(self):
-        return self.betaN
+        return self.betaN / self.notch_repressor_degradation_ratio
 
     def get_maximal_repressor_level(self):
-        return self.betaN / self.notch_repressor_degradation_ratio
+        return 1.0
 
     def get_differentiation_function(self, dt=1.):
         def differentiation(sheet, manager):
@@ -208,12 +247,17 @@ class LateralInhibitionModel:
                 return np.hstack((notch_change, delta_change, repressor_change))
 
             final_y = solve_ivp(lateral_inhibition_ode, (0, dt), initial_y, t_eval=[dt]).y[:,0]
-            final_notch_level = final_y[:n_faces]
-            final_notch_level = np.clip(final_notch_level, a_min=0, a_max=1)
-            final_delta_level = final_y[n_faces:2 * n_faces]
-            final_delta_level = np.clip(final_delta_level, a_min=0, a_max=1)
-            final_repressor_level = final_y[2 * n_faces:]
-            final_repressor_level = np.clip(final_repressor_level, a_min=0, a_max=1)
+            # No level is CAPPED (decided 2026-11-22). Phase 1 clipped all three
+            # to [0, 1], which only ever bit at the phase-1 rates if the
+            # integrator overshot; at the SI rates the natural maxima of Notch
+            # and Delta are 1/tau_N ~ 6.7 and 1/tau_D ~ 3.3, and any cap
+            # rewrites the dynamics. Only the floor at 0 stays: the levels are
+            # amounts, and an RK45 undershoot below 0 is integration error, not
+            # a state. (So a phase-1 run is reproduced exactly only if it never
+            # overshot 1.)
+            final_notch_level = np.maximum(final_y[:n_faces], 0)
+            final_delta_level = np.maximum(final_y[n_faces:2 * n_faces], 0)
+            final_repressor_level = np.maximum(final_y[2 * n_faces:], 0)
             sheet.face_df.loc[:, "notch_level"] = final_notch_level
             sheet.face_df.loc[:, "delta_level"] = final_delta_level
             sheet.face_df.loc[:, "repressor_level"] = final_repressor_level
