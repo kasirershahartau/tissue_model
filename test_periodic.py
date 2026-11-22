@@ -6568,6 +6568,95 @@ class TestFitOutputsSeedsAndScores:
             == pytest.approx(rec["stress"], rel=1e-12)
         assert e["n_cells"] == len(fd)
 
+    def test_the_grid_gamma_sc_reproduces_the_measured_shrinkage(self):
+        """gammaSC_bar plugged back into Eq. 40 (A0 = A) gives lambda_exp,
+        and the five grid values sit evenly inside (0, 2 gammaSC_bar)."""
+        import grid_fit_mechanics_v3 as g
+        from mechanics_scoring import shrinkage_lambda_squared
+        rng = np.random.default_rng(8)
+        A = rng.uniform(.6, .9, 300)
+        L = np.sqrt(A) * rng.uniform(3.6, 3.9, 300)
+        w = (rng.random(300) < .25).astype(float)
+        for a_hc, r in ((2.0, 10.0), (10.0, 2.0), (6.0, 6.0)):
+            gsc = g.gamma_sc_for_shrinkage(A, L, w, a_hc, r, 0.9249)
+            fd = pd.DataFrame({"area": A, "perimeter": L, "prefered_area": A,
+                               "area_elasticity": 1 + (a_hc - 1) * w,
+                               "contractility": gsc * (1 + (r - 1) * w)})
+            assert shrinkage_lambda_squared(fd) == pytest.approx(0.9249 ** 2,
+                                                                 rel=1e-12)
+        vals = [f * 2 for f in g.GAMMA_SC_FRACTIONS]
+        assert np.allclose(np.diff([0] + vals + [2 * 2]), 2 * 2 / 6)
+
+    @staticmethod
+    def _coarse_record(tmp_path, monkeypatch, bar=0.0152):
+        import json
+        import grid_fit_mechanics_v3 as g
+        monkeypatch.setattr(g, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(g, "TAG", "")
+        rows = [{"alphaHC": a, "R_gamma": r, "gammaSC_bar": bar * a / r,
+                 "gammaSC_bar_per_pattern": [bar * a / r]}
+                for a in g.GRID_ALPHA_HC for r in g.GRID_R_GAMMA]
+        (tmp_path / (g.GRID % ("E17.5", ""))).write_text(json.dumps(
+            {"per_point": True, "pooled_gammaSC_bar": bar,
+             "fractions": g.GAMMA_SC_FRACTIONS, "bars": rows}))
+        return g
+
+    def test_the_fine_grid_is_a_quarter_of_the_coarse_spacing(self, tmp_path,
+                                                               monkeypatch):
+        g = self._coarse_record(tmp_path, monkeypatch)
+        bar = 0.0152 * 6 / 4                     # the (6, 4) pair's own bar
+        centre = (6.0, round(bar, 5), 4.0)
+        grid, info = g.build_fine_grid("E17.5", centre)
+        assert len(grid) == 125 and len(set(grid)) == 125 and centre in grid
+        a = sorted({p[0] for p in grid}); r = sorted({p[2] for p in grid})
+        gs = sorted({p[1] for p in grid})
+        assert np.allclose(a, [5.0, 5.5, 6.0, 6.5, 7.0])
+        assert np.allclose(r, [3.0, 3.5, 4.0, 4.5, 5.0])
+        assert np.allclose(np.diff(gs), bar / 3 / 4, atol=2e-5)
+        assert info["coarse_steps"]["gammaSC"] == pytest.approx(bar / 3)
+
+    def test_the_fine_grid_shifts_inward_at_a_lower_bound(self, tmp_path,
+                                                          monkeypatch):
+        """At alpha_HC = R_gamma = 2 the centred window would reach 1.0; it is
+        shifted up one step instead. gammaSC at its lowest coarse value
+        (bar/3) needs no shift: bar/3 - 2 bar/12 = bar/6 > 0."""
+        g = self._coarse_record(tmp_path, monkeypatch)
+        bar = 0.0152                                  # the (2, 2) pair's bar
+        grid, info = g.build_fine_grid("E17.5", (2.0, round(bar / 3, 5), 2.0))
+        a = sorted({p[0] for p in grid}); r = sorted({p[2] for p in grid})
+        gs = sorted({p[1] for p in grid})
+        assert np.allclose(a, [1.5, 2.0, 2.5, 3.0, 3.5])
+        assert np.allclose(r, [1.5, 2.0, 2.5, 3.0, 3.5])
+        assert gs[0] == pytest.approx(bar / 6, abs=2e-5) and len(gs) == 5
+        assert info["offsets"]["alphaHC"] == [-1, 0, 1, 2, 3]
+        assert info["offsets"]["gammaSC"] == [-2, -1, 0, 1, 2]
+        assert len(grid) == 125 and all(p[0] > 1 and p[2] > 1 and p[1] > 0
+                                        for p in grid)
+
+    def test_best_coarse_point_reads_the_top_pair(self, tmp_path, monkeypatch):
+        import json
+        g = self._coarse_record(tmp_path, monkeypatch)
+        (tmp_path / (g.SCORES % "")).write_text(json.dumps({"ranked_pairs": [
+            {"E17.5": g.point_key(6.0, 0.0228, 4.0),
+             "P0": g.point_key(2.0, 0.01, 8.0), "J_mech": 3.1}]}))
+        assert g.best_coarse_point("E17.5")[0] == (6.0, 0.0228, 4.0)
+        assert g.best_coarse_point("P0")[0] == (2.0, 0.01, 8.0)
+
+    def test_two_points_sharing_a_run_folder_are_refused(self, tmp_path,
+                                                         monkeypatch):
+        g = self._coarse_record(tmp_path, monkeypatch)
+        monkeypatch.setattr(g, "ablation_targets", lambda stage, initials: {
+            "arr": {"ids": [1], "threshold": 0.4, "min_separation_hops": 5,
+                    "neighbours_hc_sc": [(0, 6)]}})
+        # 0.01231 and 0.01234 are both "0.0123" in the folder name
+        with pytest.raises(SystemExit, match="share run folders"):
+            g.simulate("E17.5", ["arr"], [(6.0, 0.01231, 4.0),
+                                          (6.0, 0.01234, 4.0)], 1, dry_run=True)
+
+    def test_the_run_cap_is_1500_s(self):
+        import grid_fit_mechanics_v3 as g
+        assert g.MAX_WALL_SECONDS == 1500
+
     def test_a_simulations_own_score(self):
         from mechanics_scoring import simulation_chi2, WORST_CHI2
         targets = {"roundness_ratio": (1.2, 0.05, 3),

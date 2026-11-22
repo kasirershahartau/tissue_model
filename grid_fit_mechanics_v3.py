@@ -4,6 +4,17 @@
     python grid_fit_mechanics_v3.py --stage E17.5 --workers 6
     python grid_fit_mechanics_v3.py --stage P0 --workers 6
     python grid_fit_mechanics_v3.py --score-only
+    python grid_fit_mechanics_v3.py --fine --workers 6   # after --score-only
+    python grid_fit_mechanics_v3.py --score-only         # ranks coarse + fine
+
+THE FINE GRID (decided 2026-11-22): 5 x 5 x 5 centred on each stage's point
+in the best-ranked (E17.5, P0) coarse pair, at a quarter of the coarse
+spacing in every parameter (alpha_HC and R_gamma steps 0.5; gammaSC step
+gammaSC_bar/12 of the centre's own pair). A centre at the lowest coarse value
+gets its window shifted inward (e.g. alpha_HC 1.5-3.5 around 2), never past
+a lower bound. Its derivation goes to
+grid_fit_mechanics_v3_finegrid_<stage>.json; its records join the coarse ones,
+so the final ranking covers both.
 
 THE MODEL (SI 3.4). E = sum alpha_n/2 (A_n - A0_n)^2 + Gamma_n/2 L_n^2, with
 alpha_SC = 1, A0_n each cell's area in the initial array, and alpha_n, Gamma_n
@@ -11,8 +22,12 @@ interpolated between the HC and SC values by a Hill function of the cell's
 delta at threshold p_D (Eqs. 16-17, exponent 5). Three free parameters per
 stage: alpha~_HC, Gamma~_SC, Gamma~_HC. The grid runs on Gamma~_SC and the
 ratio R_gamma = Gamma~_HC / Gamma~_SC (Gamma~_HC is reported): R_gamma < 1
-would make HCs LESS round than SCs, against both stages' data, and roundness
-is ~linear in ln R_gamma, so a geometric R_gamma grid covers it evenly.
+would make HCs LESS round than SCs, against both stages' data.
+
+THE COARSE GRID (decided 2026-11-22): alpha_HC and R_gamma in {2, 4, 6, 8,
+10}; gammaSC at five values evenly spaced between 0 and twice gammaSC_bar,
+the value Eq. 40 gives when the experimental mean shrinkage is plugged in with
+the initial patterns' data (see :func:`gamma_sc_estimate`).
 
 PER SIMULATION (one pattern x one grid point):
   1. the pattern's mechanics-only run to steady state (median vertex speed
@@ -47,12 +62,24 @@ import mechanics_scoring as ms
 
 STAGES = ("E17.5", "P0")
 
-# Coarse grid, 5 x 5 x 5 (the deferred plan's values). gammaSC stops at 0.0175:
-# above ~0.018 the earlier self-consistent A0 exceeded pi/4; with per-cell A0
-# the bound that matters is lambda^2 > 0, which Eq. 31 checks per run.
-GRID_ALPHA_HC = [1.25, 1.75, 2.5, 3.5, 5.0]
-GRID_GAMMA_SC = [0.005, 0.0075, 0.0105, 0.0145, 0.0175]
-GRID_R_GAMMA = [1.5, 2.5, 4.0, 6.5, 10.0]
+# Coarse grid, 5 x 5 x 5. gammaSC is not listed: it is k/6 * 2 * gammaSC_bar
+# for k = 1..5 -- five values evenly spaced strictly inside (0, 2 gammaSC_bar),
+# centred on gammaSC_bar -- with gammaSC_bar from Eq. 40 (gamma_sc_estimate).
+GRID_ALPHA_HC = [2.0, 4.0, 6.0, 8.0, 10.0]
+GRID_R_GAMMA = [2.0, 4.0, 6.0, 8.0, 10.0]
+GAMMA_SC_FRACTIONS = [1 / 3, 2 / 3, 1.0, 4 / 3, 5 / 3]
+# gammaSC values are rounded to this many decimals before use, so the value
+# simulated, the one in the record and the one in the folder name (%.4f, and
+# %.4f in its hash) can never disagree about which point a run belongs to.
+GAMMA_SC_DECIMALS = 5
+GRID = "grid_fit_mechanics_v3_grid_%s%s.json"
+FINE_GRID = "grid_fit_mechanics_v3_finegrid_%s%s.json"
+# The FINE grid: 5 x 5 x 5 centred on the best coarse point (the top-ranked
+# (E17.5, P0) pair, each stage's own point), at a QUARTER of the coarse
+# spacing in every parameter: centre + {-2, -1, 0, 1, 2} fine steps, so it
+# spans the coarse cell on either side of the centre.
+FINE_OFFSETS = [-2, -1, 0, 1, 2]
+FINE_REFINEMENT = 4
 
 N_ABLATED = 4
 MIN_SEPARATION_HOPS = 5
@@ -61,7 +88,10 @@ BASE_THRESHOLD = 1e-3            # median vertex speed, both stages
 ABLATION_STOP = "removed"
 T_END_CAP = 100.0                # cap only; each run stops on its own rule
 MIN_PROGRESS_RATE = 1e-4
-MAX_WALL_SECONDS = 10000
+# Per-run wall-clock cap. A stalling parameter corner once used 37% of a whole
+# fit (6.8 h per run); a run at the phase-1 point takes ~6-7 min here, so a
+# run still going after 25 min is scored as failed rather than waited for.
+MAX_WALL_SECONDS = 1500
 PROGRESS_WINDOW_SECONDS = 30.0
 RERUN_STALLED = False
 
@@ -71,6 +101,144 @@ SCORES = "grid_fit_mechanics_v3_scores%s.json"
 # Suffix of every output file (--tag), so a verification run on a few arrays
 # keeps its records apart from the production fit's.
 TAG = ""
+
+
+def gamma_sc_estimate(stage, initials, alpha_hc, r_gamma, lam=None):
+    """gammaSC from Eq. 40 at the experimental mean shrinkage, on the
+    initial patterns.
+
+    On an initial pattern every cell is at its own preferred area (A0_n is
+    the cell's initial area), so Eq. 40 with lambda = lambda_exp solves to
+
+        gammaSC = 2 (1 - lambda_exp^2) sum(alpha_n A_n^2) / sum(g_n L_n^2),
+
+    alpha_n = 1 + (alpha_HC - 1) w_n,  g_n = 1 + (R_gamma - 1) w_n,  with w_n
+    the Hill weight of Eqs. 24-25 (delta at the pattern's p_D, exponent
+    HILL_EXPONENT). Returns ``(mean over patterns, per-pattern values)``.
+    """
+    from lateral_inhibition_model import HILL_EXPONENT
+    from post_processing import load_history_file
+    if lam is None:
+        lam = ms.experimental_targets(stage)["shrinkage"][0]
+    out = []
+    for initial in initials:
+        h = load_history_file(initial)
+        sheet = h.retrieve(float(np.min(h.time_stamps)))
+        sheet.arrange_sheet_from_history()
+        sheet.geom.update_all(sheet)
+        fd = sheet.face_df
+        delta = np.load(os.path.join(RESULTS_DIR, initial, "delta_levels.npy"))
+        d = delta[fd["unique_id"].to_numpy(int)]
+        p_d = _load_saved_threshold(initial)
+        w = d ** HILL_EXPONENT / (p_d ** HILL_EXPONENT + d ** HILL_EXPONENT)
+        out.append(gamma_sc_for_shrinkage(
+            fd["area"].to_numpy(float), fd["perimeter"].to_numpy(float), w,
+            alpha_hc, r_gamma, lam))
+    return float(np.mean(out)), out
+
+
+def gamma_sc_for_shrinkage(A, L, w, alpha_hc, r_gamma, lam):
+    """The gammaSC at which Eq. 40 gives ``lam`` on cells at their preferred
+    areas (A0 = A), HC weights ``w``."""
+    alpha = 1 + (alpha_hc - 1) * np.asarray(w, float)
+    g = 1 + (r_gamma - 1) * np.asarray(w, float)
+    A, L = np.asarray(A, float), np.asarray(L, float)
+    return float(2 * (1 - lam ** 2) * np.sum(alpha * A ** 2) / np.sum(g * L ** 2))
+
+
+def build_grid(stage, initials, alpha_values=None, r_values=None,
+               per_point=True):
+    """The coarse grid for ``stage`` and its provenance.
+
+    ``per_point`` (default) centres the five gammaSC values on the
+    gammaSC_bar of each (alpha_HC, R_gamma); otherwise on ONE gammaSC_bar,
+    the mean over all 25 of them, giving a rectangular box.
+    """
+    alpha_values = alpha_values or GRID_ALPHA_HC
+    r_values = r_values or GRID_R_GAMMA
+    lam = ms.experimental_targets(stage)["shrinkage"][0]
+    bars = {(a, r): gamma_sc_estimate(stage, initials, a, r, lam)
+            for a in alpha_values for r in r_values}
+    pooled = float(np.mean([m for m, _ in bars.values()]))
+    grid, rows = [], []
+    for (a, r), (bar, per) in sorted(bars.items()):
+        centre = bar if per_point else pooled
+        for f in GAMMA_SC_FRACTIONS:
+            grid.append((a, round(f * centre, GAMMA_SC_DECIMALS), r))
+        rows.append({"alphaHC": a, "R_gamma": r, "gammaSC_bar": bar,
+                     "gammaSC_bar_per_pattern": per})
+    info = {"stage": stage, "lambda_exp": lam, "per_point": per_point,
+            "pooled_gammaSC_bar": pooled, "fractions": GAMMA_SC_FRACTIONS,
+            "initials": list(initials), "bars": rows,
+            "points": [{"alphaHC": a, "gammaSC": g, "R_gamma": r}
+                       for a, g, r in grid]}
+    return grid, info
+
+
+def coarse_spacing(stage, centre):
+    """The coarse grid's step in each parameter at ``centre``:
+    (alpha_HC step, gammaSC step, R_gamma step). The gammaSC step is the one
+    of the centre's own (alpha_HC, R_gamma) pair -- gammaSC_bar / 3 -- read
+    from the coarse grid's record, since it differs from pair to pair."""
+    a, g, r = centre
+    with open(os.path.join(RESULTS_DIR, GRID % (stage, TAG))) as fh:
+        info = json.load(fh)
+    alphas = sorted({row["alphaHC"] for row in info["bars"]})
+    rs = sorted({row["R_gamma"] for row in info["bars"]})
+    bar = next(row["gammaSC_bar"] for row in info["bars"]
+               if abs(row["alphaHC"] - a) < 1e-9 and abs(row["R_gamma"] - r) < 1e-9)
+    centre_bar = info["pooled_gammaSC_bar"] if not info["per_point"] else bar
+    f = info["fractions"]
+    return (float(np.diff(alphas).min()), float((f[1] - f[0]) * centre_bar),
+            float(np.diff(rs).min()))
+
+
+def _fine_offsets(centre, step, lower):
+    """FINE_OFFSETS, shifted up by the fewest whole steps that keep every
+    value strictly above ``lower`` -- for a centre at the lowest coarse value
+    (alpha_HC or R_gamma = 2, whose -2 step would land on 1). Same spacing,
+    still 5 points, just off-centre."""
+    shift = 0
+    while centre + (FINE_OFFSETS[0] + shift) * step <= lower + 1e-12:
+        shift += 1
+        if shift > len(FINE_OFFSETS):
+            raise SystemExit("cannot place a fine grid above %g around %g"
+                             % (lower, centre))
+    return [o + shift for o in FINE_OFFSETS]
+
+
+def build_fine_grid(stage, centre):
+    """5 x 5 x 5 around ``centre`` = (alpha_HC, gammaSC, R_gamma) at a
+    quarter of the coarse spacing. Where the centred window would cross a
+    lower bound (alpha_HC, R_gamma > 1; gammaSC > 0) it is shifted inward
+    (_fine_offsets), parameter by parameter."""
+    steps = coarse_spacing(stage, centre)
+    fine = [s / FINE_REFINEMENT for s in steps]
+    lowers = (1.0, 0.0, 1.0)
+    offsets = [_fine_offsets(c, st, lo) for c, st, lo in zip(centre, fine, lowers)]
+    grid = []
+    for i in offsets[0]:
+        for j in offsets[1]:
+            for k in offsets[2]:
+                grid.append((round(centre[0] + i * fine[0], 6),
+                             round(centre[1] + j * fine[1], GAMMA_SC_DECIMALS),
+                             round(centre[2] + k * fine[2], 6)))
+    names = ("alphaHC", "gammaSC", "R_gamma")
+    info = {"stage": stage, "centre": dict(zip(names, centre)),
+            "coarse_steps": dict(zip(names, steps)),
+            "fine_steps": dict(zip(names, fine)),
+            "offsets": dict(zip(names, offsets)),
+            "points": [{"alphaHC": a, "gammaSC": g_, "R_gamma": r}
+                       for a, g_, r in grid]}
+    return grid, info
+
+
+def best_coarse_point(stage):
+    """This stage's point in the top-ranked (E17.5, P0) pair of the scores."""
+    with open(os.path.join(RESULTS_DIR, SCORES % TAG)) as fh:
+        best = json.load(fh)["ranked_pairs"][0]
+    a, g, r = (float(x.split("=")[1]) for x in best[stage].split("|"))
+    return (a, g, r), best
 
 
 def point_key(alpha_hc, gamma_sc, r_gamma):
@@ -227,6 +395,17 @@ def simulate(stage, initials, grid, workers, dry_run=False):
                                "R_gamma": r_gamma,
                                "gammaHC": gamma_sc * r_gamma},
                               tasks[-1][1])
+    # Two grid points must never share a run folder: the folder name holds
+    # gammaSC at 4 decimals and alpha/R at 2, so a too-fine grid would make
+    # reuse_existing_run hand one point's runs to another. Refuse it.
+    from mechanics_eval import base_run_name
+    names = {}
+    for task_key, task in tasks:
+        names.setdefault(base_run_name(task), []).append(task_key)
+    clashes = {n: k for n, k in names.items() if len(k) > 1}
+    if clashes:
+        raise SystemExit("grid points share run folders: %s"
+                         % list(clashes.values())[:3])
     print("%s: %d grid point(s) x %d pattern(s); %d simulation(s) to run, "
           "%d already recorded" % (stage, len(grid), len(initials), len(tasks),
                                    len(done)))
@@ -326,9 +505,17 @@ def main():
     ap.add_argument("--alpha-hc", dest="alpha_hc", type=float, nargs="+",
                     default=GRID_ALPHA_HC)
     ap.add_argument("--gamma-sc", dest="gamma_sc", type=float, nargs="+",
-                    default=GRID_GAMMA_SC)
+                    default=None,
+                    help="explicit gammaSC values (e.g. a verification point); "
+                         "by default they come from Eq. 40 (build_grid)")
+    ap.add_argument("--pooled-gamma-sc", dest="pooled", action="store_true",
+                    help="one gammaSC_bar for all (alphaHC, R_gamma) -- a "
+                         "rectangular box -- instead of one per pair")
     ap.add_argument("--r-gamma", dest="r_gamma", type=float, nargs="+",
                     default=GRID_R_GAMMA)
+    ap.add_argument("--fine", action="store_true",
+                    help="run the FINE grid around the best coarse point "
+                         "(needs the coarse scores: run --score-only first)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--score-only", action="store_true")
     ap.add_argument("--tag", default="",
@@ -340,12 +527,12 @@ def main():
     if a.score_only:
         score()
         return
-    if any(r <= 1 for r in a.r_gamma) or any(x <= 0 for x in a.alpha_hc + a.gamma_sc):
-        raise SystemExit("need R_gamma > 1 and positive alphaHC, gammaSC")
+    if (any(r <= 1 for r in a.r_gamma) or any(x <= 1 for x in a.alpha_hc)
+            or any(x <= 0 for x in (a.gamma_sc or []))):
+        raise SystemExit("need R_gamma > 1, alphaHC > 1 and gammaSC > 0")
     stages = STAGES if a.stage == "both" else (a.stage,)
     if a.initials and len(stages) != 1:
         raise SystemExit("--initials needs a single --stage")
-    grid = [(x, g, r) for x in a.alpha_hc for g in a.gamma_sc for r in a.r_gamma]
     for stage in stages:
         initials = a.initials or [initial_morphology_name(i, stage)
                                   for i in range(a.n_sheets)]
@@ -356,6 +543,33 @@ def main():
                 raise SystemExit("%s has no lateral-inhibition sidecars "
                                  "(notch/delta/repressor_levels.npy)" % initial)
             _load_saved_threshold(initial)
+        if a.fine:
+            centre, best = best_coarse_point(stage)
+            grid, info = build_fine_grid(stage, centre)
+            info["from_pair"] = {k: best[k] for k in ("E17.5", "P0", "J_mech")}
+            with open(os.path.join(RESULTS_DIR, FINE_GRID % (stage, TAG)), "w") as fh:
+                json.dump(info, fh, indent=1)
+            print("%s: fine grid around %s (best pair J_mech %.4g), steps %s"
+                  % (stage, info["centre"], best["J_mech"], info["fine_steps"]))
+        elif a.gamma_sc:
+            grid = [(x, g, r) for x in a.alpha_hc for g in a.gamma_sc
+                    for r in a.r_gamma]
+        else:
+            grid, info = build_grid(stage, initials, a.alpha_hc, a.r_gamma,
+                                    per_point=not a.pooled)
+            # The grid's derivation travels with the fit's records.
+            with open(os.path.join(RESULTS_DIR, GRID % (stage, TAG)), "w") as fh:
+                json.dump(info, fh, indent=1)
+            print("%s: lambda_exp %.4f; gammaSC_bar %s (pooled %.5f)"
+                  % (stage, info["lambda_exp"],
+                     "per (alphaHC, R_gamma)" if not a.pooled else "pooled",
+                     info["pooled_gammaSC_bar"]))
+            for row in info["bars"]:
+                print("   alphaHC %4.1f  R_gamma %4.1f  gammaSC_bar %.5f  "
+                      "(patterns %.5f-%.5f)"
+                      % (row["alphaHC"], row["R_gamma"], row["gammaSC_bar"],
+                         min(row["gammaSC_bar_per_pattern"]),
+                         max(row["gammaSC_bar_per_pattern"])))
         simulate(stage, initials, grid, a.workers, dry_run=a.dry_run)
 
 
