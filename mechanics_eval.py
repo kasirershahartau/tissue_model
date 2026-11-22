@@ -62,6 +62,10 @@ def _evaluate_mechanics_for_sheet(args):
     An optional 24th field says how the ablation run ends: "steady" (the
     default) or "removed" -- once every ablated cell is gone, as in the
     experiment; the ablation threshold is then unused.
+
+    ``ablated_cells`` may also be ``{"ids": [...]}``: cells named by their
+    persistent ``id`` (see :mod:`ablation_targets`), translated to the
+    labels of the base run's last frame, which the ablation run forks from.
     """
     args = tuple(args)
     (gammaSC, gammaHC_ratio, alphaHC_ratio, initial, experimental_stage,
@@ -150,6 +154,23 @@ def _evaluate_mechanics_for_sheet(args):
                 **li_kwargs, **stall_kwargs, **atoh_kwargs))
 
         ablation_kwargs = {}
+        ablation_ids = None
+        if isinstance(ablated_cells, dict):
+            # Cells given by their persistent ``id`` (ablation_targets chooses
+            # them once per pattern). The ablation run takes LABELS of the
+            # frame it forks from -- the base run's last -- so translate there;
+            # a cell that delaminated during the base run is simply not there.
+            from ablation_targets import labels_for_ids
+            from post_processing import load_history_file
+            ablation_ids = [int(i) for i in ablated_cells["ids"]]
+            _h = load_history_file(base_name)
+            _last = _h.retrieve(float(max(_h.time_stamps)))
+            _last.arrange_sheet_from_history()
+            ablated_cells, _gone = labels_for_ids(_last.face_df, ablation_ids)
+            if _gone:
+                print("[mechanics] %s: ablation target id(s) %s left during the "
+                      "base run; ablating the other %d"
+                      % (model_name, _gone, len(ablated_cells)), flush=True)
         if ablated_cells:
             try:
                 with_ablation_name = _strip_results_prefix(

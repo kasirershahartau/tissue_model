@@ -6712,6 +6712,123 @@ class TestAblationStopsWhenTheCellsAreRemoved:
         assert seen[1]["ablation_stop"] == "removed"
 
 
+class TestAblationTargets:
+    """Four well-separated HCs per pattern, chosen by contact hops."""
+
+    @staticmethod
+    def _sheet():
+        sheet = _build_sheet(10, 10)
+        sheet.get_opposite()
+        # distinct ids, offset from the labels so the two cannot be confused
+        # (the lattice builder leaves the column all zeros)
+        sheet.face_df["id"] = np.arange(sheet.Nf) + 1000
+        return sheet
+
+    def test_adjacency_is_the_hex_lattice(self):
+        from ablation_targets import cell_adjacency
+        sheet = self._sheet()
+        adj = cell_adjacency(sheet)
+        assert {len(v) for v in adj.values()} == {6}      # periodic hexagons
+        assert all(a in adj[b] for a in adj for b in adj[a])
+
+    def test_chooses_separated_hcs_reproducibly(self):
+        from ablation_targets import (choose_ablation_hcs, cell_adjacency,
+                                      _hops_from, pattern_seed)
+        sheet = self._sheet()
+        rng = np.random.default_rng(3)
+        delta = rng.uniform(0, 1, sheet.Nf)
+        seed = pattern_seed("initial_array_0_for_E17")
+        assert seed == pattern_seed("initial_array_0_for_E17")
+        ids, info = choose_ablation_hcs(sheet, delta, 0.6, min_separation=4,
+                                        seed=seed)
+        ids2, _ = choose_ablation_hcs(sheet, delta, 0.6, min_separation=4,
+                                      seed=seed)
+        assert ids == ids2 and len(ids) == 4 and info["seed"] == seed
+        labels = info["labels"]
+        assert all(delta[sheet.face_df.index.get_loc(c)] > 0.6 for c in labels)
+        adj = cell_adjacency(sheet)
+        hops = [_hops_from(adj, a)[b] for i, a in enumerate(labels)
+                for b in labels[i + 1:]]
+        assert min(hops) == info["min_separation_hops"] >= 4
+        assert ids == [int(sheet.face_df.at[c, "id"]) for c in labels]
+        # a different seed is a different (equally valid) sample
+        others = {tuple(choose_ablation_hcs(sheet, delta, 0.6,
+                                            min_separation=4, seed=s)[0])
+                  for s in range(5)}
+        assert len(others) > 1
+
+    def test_refuses_when_it_cannot_separate_them(self):
+        from ablation_targets import choose_ablation_hcs
+        sheet = self._sheet()
+        delta = np.zeros(sheet.Nf)
+        delta[:3] = 1.0                       # only three HCs at all
+        with pytest.raises(ValueError, match="candidate"):
+            choose_ablation_hcs(sheet, delta, 0.5)
+        delta[:] = 0.0
+        hc = list(cell_adjacency_ring(sheet))
+        delta[[sheet.face_df.index.get_loc(c) for c in hc]] = 1.0
+        with pytest.raises(ValueError, match="hop"):
+            choose_ablation_hcs(sheet, delta, 0.5)
+
+    def test_counts_hc_and_sc_neighbours(self):
+        from ablation_targets import choose_ablation_hcs, cell_adjacency
+        sheet = self._sheet()
+        delta = np.zeros(sheet.Nf)
+        hcs = [0, 45, 50, 95]
+        delta[hcs] = 1.0
+        f0 = int(sheet.face_df.index[0])
+        nb = sorted(cell_adjacency(sheet)[f0])[0]       # one HC beside cell 0
+        delta[sheet.face_df.index.get_loc(nb)] = 1.0
+        ids, info = choose_ablation_hcs(sheet, delta, 0.5, min_separation=1)
+        counts = dict(zip(info["labels"], info["neighbours_hc_sc"]))
+        assert all(h + s == 6 for h, s in counts.values())
+        assert sum(h for h, _ in counts.values()) >= 1
+
+    def test_initial_array_cells_are_named_as_the_runs_name_them(
+            self, tmp_path, monkeypatch):
+        """InnerEarModel re-bases ``id`` to the row label, and many initial
+        arrays store a PERMUTED id column: the chosen cells must come back as
+        row labels, not as that column."""
+        import ablation_targets, history_io, post_processing
+        sheet = self._sheet()
+        sheet.face_df["id"] = np.random.default_rng(0).permutation(sheet.Nf)
+        sheet.face_df["unique_id"] = np.arange(sheet.Nf)
+        sheet.face_df["type"] = 0
+        delta = np.random.default_rng(1).uniform(0, 1, sheet.Nf)
+        (tmp_path / "arr").mkdir()
+        np.save(tmp_path / "arr" / "delta_levels.npy", delta)
+
+        class _H:
+            time_stamps = [0.0]
+
+            def retrieve(self, t):
+                s = sheet.copy() if hasattr(sheet, "copy") else sheet
+                s.arrange_sheet_from_history = lambda *a, **k: None
+                return s
+
+        monkeypatch.setattr(history_io, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(post_processing, "load_history_file", lambda n: _H())
+        ids, info = ablation_targets.ablation_hcs_for_initial(
+            "arr", 0.6, min_separation=4)
+        assert ids == info["labels"] == info["ids"]
+        assert info["extract_id_column"] == [
+            int(sheet.face_df.at[c, "id"]) for c in ids]
+        assert ids != info["extract_id_column"]
+
+    def test_labels_for_ids_after_a_removal(self):
+        from ablation_targets import labels_for_ids
+        fd = pd.DataFrame({"id": [10, 12, 13]}, index=[0, 1, 2])
+        assert labels_for_ids(fd, [12, 11, 13]) == ([1, 2], [11])
+
+
+def cell_adjacency_ring(sheet):
+    """A cell and its six neighbours: seven cells, none 3 hops apart."""
+    from ablation_targets import cell_adjacency
+    adj = cell_adjacency(sheet)
+    f0 = int(sheet.face_df.index[0])
+    return [f0] + sorted(adj[f0])
+
+
 class TestFindNonBoundaryCells:
     """The boundary filter, on the sheets where it is not a no-op.
 
