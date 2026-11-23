@@ -2,12 +2,18 @@
 
 A practical, step-by-step guide for running `create_random_arrays`,
 `initialize_differentiated_arrays`, `find_mechanical_parameters` and
-`find_psigma` on Azure, driven by [`azure_run.py`](azure_run.py).
+`find_psigma` on Azure, driven by [`azure_run.py`](azure_run.py) — and the
+**phase-2 mechanical grid fit**, [`grid_fit_mechanics_v3.py`](grid_fit_mechanics_v3.py),
+which has its own recipe in [§13](#13-the-v3-mechanical-grid-fit-phase-2--step-by-step).
 
 ---
 
 ## 0. Which setup? (decision in one line)
 
+- **The v3 mechanical grid fit** → one **48-vCPU** PAYG VM with a data disk,
+  **§13**. Unlike `find-mech` it is not a sequential optimiser: every
+  (grid point, pattern) simulation is independent, so it uses every core you
+  rent, and the "do not over-size" warning below does not apply to it.
 - **Single pay-as-you-go VM** — recommended for everything. Simplest, works for
   all four methods, uses the existing `ProcessPoolExecutor` parallelism.
   **Start here.**
@@ -361,6 +367,9 @@ python azure_run.py init-diff --stage E17.5 --gammaSC 0.01 --gammaHC-ratio 10 --
 python azure_run.py init-diff --stage P0    --indices 0 1 2
 
 # Mechanical-parameter fit (Bayesian optimization), per stage ------------------
+# HISTORICAL (phase 1). The phase-2 fit is grid_fit_mechanics_v3.py -- see §13;
+# find-mech does not know its model (Hill 5, SI rates, contractility only) or
+# its SI-section-7 score.
 # ALL defaults mirror run_model.__main__, so this reproduces the local fit:
 #   fitted:  gammaSC, alphaHC_ratio, hc_shape_index, sc_shape_index
 #   fixed:   gammaHC_ratio=1.0, bending=0.02 (replaces line tension),
@@ -427,8 +436,10 @@ can coexist without either reading the other's frames.
 2. find_best_timepoint_for_random_arrays + store_best_time_point_for_random_arrays
                                        # score every array, keep the best ten
                                        # per stage -> initial_array_<rank>_for_*
-3. find-mech  --stage E17.5            # fit MECHANICS per stage
-   find-mech  --stage P0
+3. grid_fit_mechanics_v3.py           # fit MECHANICS, both stages, coarse then
+                                       # fine grid (§13). Needs the LI patterns +
+                                       # threshold.npy beside every initial array.
+                                       # (phase 1 used find-mech per stage)
 4. find-psigma --mechanical-params ... # fit the single SHARED psigma
    (optional) init-diff                # produce final differentiated arrays at the fitted params
 ```
@@ -928,3 +939,541 @@ az group delete -n %RG% --yes
 A 2 TiB disk left behind is ~$6.5/day whether or not the VM runs — more than
 the sweep itself if forgotten for a week. Snapshot first if you want the
 histories kept.
+
+---
+
+## 13. The v3 mechanical grid fit (phase 2) — step by step
+
+[`grid_fit_mechanics_v3.py`](grid_fit_mechanics_v3.py) fits α̃_HC, Γ̃_SC and
+R_γ = Γ̃_HC / Γ̃_SC per stage on a grid, scored as in SI section 7. Each
+simulation is one pattern at one grid point:
+
+1. a mechanics-only base run to steady state (median vertex speed < 1e-3 for
+   4 steps, capped at t = 100);
+2. a fork of that steady state that ablates 4 well-separated HCs and stops
+   once all 4 have been removed.
+
+The 4 HCs are chosen once per pattern and reused at every grid point.
+
+The fit has two phases. Each **grid** is 125 points per stage (5 × 5 × 5) ×
+10 patterns × 2 stages = **2,500 simulations**:
+
+- **Coarse grid.** α̃_HC and R_γ each take the values {2, 4, 6, 8, 10}. Γ̃_SC
+  takes the values Γ̄_SC × {1/3, 2/3, 1, 4/3, 5/3}, where Γ̄_SC is the
+  value Eq. 40 gives for each (α̃_HC, R_γ) pair on the initial patterns.
+- **Fine grid.** It is centred on the best-ranked (E17.5, P0) pair, at a
+  quarter of the coarse spacing.
+
+**J_mech** is formed only once both stages are simulated, because the stress
+term couples the two stages. Every simulation is independent of every other,
+so unlike `find-mech` this fit **uses every core you rent**.
+
+| | one grid | coarse + fine |
+|---|---|---|
+| simulations | 2,500 | 5,000 |
+| wall-clock, F48s_v2, 46 workers | ~13 h (9–18) | **~27 h (18–37)** |
+| disk (~20 MB per simulation, two frames per run) | ~50 GB | **~100 GB** |
+| RAM (≤ 370 MB per worker) | ~17 GB of 96 | |
+| compute, F48s_v2 PAYG (~$2.03/h) | | **~$55** (~$100 at the 48 h limit) |
+
+**How the wall-clock was estimated:**
+- One simulation took about 520 s on the workstation: the base run 350–440 s,
+  the ablation run about 120 s.
+- The earlier Azure VM was 1.2–1.6× slower per run, so the estimate assumes
+  700 s per simulation at 80 % pool efficiency.
+- These times were measured at the phase-1 parameters. The corners of the
+  coarse grid may be slower; the pilot in §13.6 measures that before you
+  commit to the full run.
+
+### 13.0 Prerequisite — the LI patterns (the fit refuses to start without them)
+
+Each of the 20 `initial_array_<rank>_for_{E17,P0}` folders needs four more
+files: the steady-state lateral-inhibition pattern and threshold p_D chosen by
+the LI-only fit.
+
+- `notch_levels.npy`
+- `delta_levels.npy`
+- `repressor_levels.npy`
+- `threshold.npy`
+
+On 2026-11-23 **all 20 folders lack all four files**; they are waiting on
+Michal. The driver checks for them and exits rather than fall back to a random
+delta. Check locally before renting anything — this prints nothing when all
+80 files are present:
+
+```bat
+for /d %d in (D:\Kasirer\model_results\initial_array_*_for_*) do @for %f in (notch_levels.npy delta_levels.npy repressor_levels.npy threshold.npy) do @if not exist "%d\%f" echo MISSING %d\%f
+```
+
+**Commit before uploading.** The run must come from a committed tree, so
+that one hash identifies the code that produced the fit. `git status --short`
+must print nothing. The upload in §13.2 writes that hash into a
+`CODE_COMMIT` file, which travels with the records (§13.7). Re-scoring and
+replaying (§13.8–13.9) are only exact at that commit.
+
+### 13.1 Provision — F48s_v2, PAYG, a 512 GiB data disk
+
+Follow **§9.1** with two changes:
+
+- set `VM` **before** anything else, so the identity and role commands act on
+  this VM;
+- create the VM with a 512 GiB data disk instead of 2 TiB.
+
+```bat
+set RG=Simulations
+set LOC=israelcentral
+set VM=MechFitVM
+az group create -n %RG% -l %LOC%
+az vm create -g %RG% -n %VM% --image Ubuntu2204 --size Standard_F48s_v2 --os-disk-size-gb 128 --data-disk-sizes-gb 512 --admin-username azureuser --generate-ssh-keys
+```
+
+Then run §9.1's identity block (the two `for /f` lines, the `echo`s and the
+role assignment) unchanged. Keep the `publicIpAddress` as `%IP%`.
+
+512 GiB leaves about 5× headroom over the expected 100 GB. That margin
+covers the older 37 MB-per-simulation layout in case the two-frame trim did
+not apply. 128 GB on the OS disk alone would not be enough.
+
+Then **§9.2**: format, mount and check `/data`.
+
+### 13.2 Base setup
+
+Follow **§4**: apt packages, Miniconda and the `tyssue` env. The local env is
+Python 3.10.16; match it.
+
+Upload the code with the **filtered copy**, never `scp -r .`, which would
+carry `SimulationsVM_key.pem` up. This version adds the commit hash:
+
+```bat
+rem from your LOCAL machine, in the tissue_model folder, with a clean tree
+git status --short
+robocopy . %TEMP%\tm_upload /E /XD .git __pycache__ .idea .pytest_cache /XF *.pem /NFL /NDL /NJH /NJS
+git rev-parse HEAD > %TEMP%\tm_upload\CODE_COMMIT
+scp -r %TEMP%\tm_upload azureuser@%IP%:~/tissue_model
+rd /s /q %TEMP%\tm_upload
+```
+
+Then set the variables as in **§9.3**, with one addition:
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+source ~/miniconda/etc/profile.d/conda.sh
+export PYTHONPATH="$HOME/tissue_model:$HOME/tissue_model/tyssue/src"
+export TISSUE_RESULTS_DIR=/data/results
+export EXPERIMENTAL_DATA_DIR=$HOME/experimental
+export MPLBACKEND=Agg
+EOF
+source ~/.bashrc
+grep -c TISSUE_RESULTS_DIR ~/.bashrc     # must print 1
+```
+
+The v3 fit does **not** need `TISSUE_ANALYZER_PATH` or `statistical_analysis`.
+
+**For the self-deallocation in §13.7**, the VM needs the Azure CLI, logged in
+as its own identity:
+
+```bash
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+az login --identity
+az vm show -g Simulations -n MechFitVM --query provisioningState -o tsv   # Succeeded
+```
+
+If the last command is refused, the role assignment from §9.1 is missing.
+
+### 13.3 Upload the inputs (~1.1 GB)
+
+From your local machine:
+
+```bat
+rem The 20 initial arrays WITH their LI sidecars (~0.2 GB). Upload them only
+rem after 13.0 prints nothing.
+for /d %d in (D:\Kasirer\model_results\initial_array_*_for_E17) do scp -r "%d" azureuser@%IP%:/data/results/
+for /d %d in (D:\Kasirer\model_results\initial_array_*_for_P0) do scp -r "%d" azureuser@%IP%:/data/results/
+
+rem The experimental data (0.9 GB): roundness and ablation ratios.
+scp -r "C:\Users\Kasirer\Phd\mouse_ear_project\papers\Dynamic lateral inhibition in the utricle\Experimental Data" azureuser@%IP%:~/experimental
+
+rem The circular-ablation workbook: the shrinkage and stress targets. It
+rem lives in the sibling "Raw Data" folder locally, and the copy above does
+rem not include it. Put it INSIDE ~/experimental, where
+rem resolve_circular_ablation_file looks for it on the VM.
+scp "C:\Users\Kasirer\Phd\mouse_ear_project\papers\Dynamic lateral inhibition in the utricle\Raw Data\circular_ablation_raw_data(figure 3 +E4).xlsx" azureuser@%IP%:~/experimental/
+```
+
+Nothing else is needed. The fit reads no phase-1 result, and every run
+starts from the 20 arrays.
+
+### 13.4 Verify before spending anything
+
+```bash
+conda activate tyssue && cd ~/tissue_model
+
+# (a) the vendored tyssue
+python -c "import tyssue; print(tyssue.__file__)"        # under ~/tissue_model/tyssue/src
+
+# (b) the experimental targets -- the numbers the whole score is measured against
+python -c "import mechanics_scoring as ms
+for s in ('E17.5','P0'):
+    print(s, {k: tuple(round(x, 4) for x in v[:2]) + (v[2],) for k, v in ms.experimental_targets(s).items()})"
+```
+
+(b) must print exactly:
+
+```
+E17.5 {'roundness_ratio': (1.2453, 0.0541, 3), 'ablation_ratio': (0.8142, 0.1494, 2), 'shrinkage': (0.9249, 0.005, 14), 'stress': (0.309, 0.0457, 14)}
+P0 {'roundness_ratio': (1.1955, 0.0059, 3), 'ablation_ratio': (0.8659, 0.0358, 3), 'shrinkage': (0.9219, 0.0114, 14), 'stress': (0.2004, 0.0191, 14)}
+```
+
+A `FileNotFoundError` naming `circular_ablation_raw_data` means the workbook
+upload in §13.3 was missed.
+
+```bash
+# (c) the v3 machinery. 49 tests, ~3.5 min here; they need no results data.
+python -m pytest test_periodic.py -q -k "MechanicsScoring or AblationTargets or FitOutputsSeedsAndScores or HillExponentFive or LateralInhibitionRatesFromTheSI or AblationStopsWhenTheCellsAreRemoved or MedianSpeedSteadyState or FitRunsKeepFirstAndLastFrame"
+
+# (d) the resolved fit, without running anything
+python grid_fit_mechanics_v3.py --dry-run
+```
+
+(d) checks every pattern's sidecars and threshold, then prints, per stage:
+
+- λ_exp: 0.9249 for E17.5, 0.9219 for P0;
+- the 25 per-pair Γ̄_SC values and their spread over the patterns;
+- `125 grid point(s) x 10 pattern(s); 1250 simulation(s) to run, 0 already recorded`;
+- for each pattern, its p_D, the 4 ablated ids, their separation in hops (≥ 5)
+  and their HC/SC neighbour counts.
+
+Read the neighbour counts: if a stage's ablated HCs have almost no HC
+neighbours, the ablation ratio rests on very few cells.
+
+(d) also writes the grid derivation (`grid_fit_mechanics_v3_grid_<stage>.json`)
+and the ablation targets. The real run rewrites both with the same content.
+
+```bash
+# (e) ONE real simulation, end to end (~10-15 min). --tag keeps its records
+#     apart from the fit's. The run itself is a full-length, genuine run, so
+#     there is no need for a throwaway results dir.
+python -u grid_fit_mechanics_v3.py --stage E17.5 --initials initial_array_0_for_E17 \
+    --alpha-hc 4 --r-gamma 4 --gamma-sc 0.01 --tag _smoke --workers 1
+python -c "import json; r=json.loads(open('/data/results/grid_fit_mechanics_v3_E17.5_smoke.jsonl').readline()); print({k: r.get(k) for k in ('failed','ablated_removed','roundness_ratio','ablation_ratio','lambda_squared','stress','base_seed','ablation_seed')})"
+du -sh /data/results/fit_*                       # 2 folders, ~10 MB each
+rm /data/results/grid_fit_mechanics_v3_*_smoke*
+```
+
+(e) must show:
+
+- `failed: False` and `ablated_removed: True`;
+- finite values for the four observables;
+- both seeds recorded.
+
+### 13.5 Never edit the tree while the fit runs
+
+Edit a **copy** of the tree instead. Worker pools are rebuilt every 138
+tasks, so a change on disk reaches the new workers but not the parent; see
+the `find-mech` row of §11. Finished simulations are kept, so a restart only
+loses the work in flight.
+
+### 13.6 Pilot — the four corners first (~2 h, recommended)
+
+Run the four corner (α̃_HC, R_γ) pairs at all five Γ̃_SC values, on both
+stages: 20 points × 10 patterns × 2 stages = 400 simulations. This includes
+the stiffest and softest corners, which are the most likely to stall.
+
+```bash
+tmux new -s pilot
+time python -u grid_fit_mechanics_v3.py --alpha-hc 2 10 --r-gamma 2 10 --tag _pilot --workers 46 2>&1 | tee /data/pilot.log
+grep -c 'FAILED$' /data/pilot.log
+```
+
+Use `'FAILED$'`: one line per failed simulation. A crash also prints a
+`sheet FAILED <error>` line, which a bare `FAILED` would count twice.
+
+**The pilot costs nothing extra.** Its runs have the same folder names as
+the coarse grid's corner points, and the fit reuses finished runs, so those
+400 simulations take seconds each in §13.7.
+
+**What its wall-clock means.** The full fit is ~12.5 pilots (5,000 / 400).
+The pilot is the slowest part, so this is a conservative estimate.
+
+- A pilot **under ~3.5 h** fits both grids in 48 h.
+- A pilot **over ~3.5 h** does not. Run the coarse grid alone, look at the
+  scores, and decide on the fine grid then.
+
+**Failures.** A run that hits the 1,500 s cap is recorded as `FAILED`, and
+that pattern drops out of its point's mean. The cap is about 3× the base run's
+expected time on this VM.
+
+- A failure here and there is expected.
+- One point failing on most patterns is a parameter corner that cannot reach
+  steady state in time; it is not a setup problem.
+
+### 13.7 The real fit — coarse, score, fine, score, then deallocate
+
+```bash
+tmux new -s mechfit
+source ~/miniconda/etc/profile.d/conda.sh
+conda activate tyssue && cd ~/tissue_model
+echo "$PYTHONPATH" && echo "$TISSUE_RESULTS_DIR" && echo "$EXPERIMENTAL_DATA_DIR"
+cp ~/tissue_model/CODE_COMMIT /data/results/            # travels with the records (13.2)
+
+{ python -u grid_fit_mechanics_v3.py --workers 46 \
+  && python -u grid_fit_mechanics_v3.py --score-only \
+  && python -u grid_fit_mechanics_v3.py --fine --workers 46 \
+  && python -u grid_fit_mechanics_v3.py --score-only ; } 2>&1 | tee -a /data/mech_fit_v3.log ; \
+  az vm deallocate -g Simulations -n MechFitVM --no-wait
+```
+
+**What the chain does:**
+- `--stage both` is the default, so each grid runs E17.5 and then P0.
+- The `&&`s stop the chain at the first step that fails.
+- The trailing `;` deallocates the VM however the chain ends, exactly as in
+  §9.6.
+- `-u` keeps the log live through `tee`.
+
+**Where the fine grid is centred.** `--fine` ranks the **coarse points
+only**, straight from the records; it never reads the scores file. It
+refuses to start until **both** stages' coarse grids are complete: every
+point × pattern recorded, failures included.
+
+The fine records go into the same JSONL files as the coarse ones, so a
+`--score-only` run during the fine phase cannot move the centre. If a resumed
+`--fine` would build a different grid from the one already on disk
+(`grid_fit_mechanics_v3_finegrid_<stage>.json`), it stops instead of starting
+a second fine grid.
+
+**Watch it, from a second shell:**
+
+```bash
+wc -l /data/results/grid_fit_mechanics_v3_E17.5.jsonl /data/results/grid_fit_mechanics_v3_P0.jsonl
+grep -c 'FAILED$' /data/mech_fit_v3.log
+df -h /data ; free -g
+```
+
+**Line counts per stage file:**
+- 1,250 when that stage's coarse grid is finished;
+- 2,500 when its fine grid is finished.
+
+Records are appended as each simulation finishes, so a crash loses only the
+runs in flight.
+
+**Resuming after an interruption**, in either phase: run `az vm start` (the
+data disk remounts from fstab), then rerun the whole command above in a new
+`tmux`.
+
+- Recorded (point, pattern) pairs are skipped. So are failed ones: a failure
+  is a result, not a retry.
+- An interrupted run is resumed from its folder, or re-run if it has no
+  snapshot.
+- `--fine` re-derives the same centre and checks it against the fine grid on
+  disk.
+
+### 13.8 Retrieve everything needed to re-score without re-simulating
+
+There are two levels. Download both before tearing down.
+
+| | size | enough to |
+|---|---|---|
+| **(a) the records**: `grid_fit_mechanics_v3_*` (records, grid derivations, ablation targets, scores), the log, `CODE_COMMIT` | ~50 MB | recompute J_mech, or any change to the score's formula, weighting or terms |
+| **(b) the run folders**: base and ablation run of every simulation, two frames each | ~100 GB | re-measure every observable from the simulated tissues, including ones the records do not hold |
+
+Each simulation's record holds:
+
+- its parameters;
+- the seeds of both runs;
+- the observables;
+- the raw data the score is computed from: per-cell roundness and area change
+  by type, the counts, and the Eq. 40/42 sums.
+
+That is why (a) is enough for the score as defined. (b) is the simulations
+themselves.
+
+**Package both on the VM**, in one archive with a checksum:
+
+```bash
+cd /data/results
+python - <<'EOF'
+import glob, json, os
+runs = set()
+for path in glob.glob("grid_fit_mechanics_v3_*.jsonl"):
+    for line in open(path):
+        if line.strip():
+            r = json.loads(line)
+            runs.update(x for x in (r.get("base_run"), r.get("ablation_run")) if x)
+runs = sorted(r for r in runs if os.path.isdir(r))   # a crashed run may have no folder
+open("/data/runs.txt", "w").write("\n".join(runs) + "\n")
+print(len(runs), "run folders")                       # up to 10,000
+EOF
+cp /data/mech_fit_v3.log .
+ls grid_fit_mechanics_v3_* mech_fit_v3.log CODE_COMMIT > /data/records.txt
+tar -cf /data/mech_fit_v3_records.tar -T /data/records.txt
+tar -cf /data/mech_fit_v3_runs.tar -T /data/runs.txt            # ~100 GB, ~15-30 min
+cd /data && sha256sum mech_fit_v3_records.tar mech_fit_v3_runs.tar > mech_fit_v3.sha256
+```
+
+**Download** from your local machine. D: has ~1.1 TB free.
+
+The records archive takes a minute. The runs archive is ~100 GB of egress:
+Azure bills about $0.08/GB beyond its free monthly allowance (check for your
+region), and the transfer takes hours on a typical link, so run it from a
+window you can leave open.
+
+```bat
+set L=D:\kasirer\model_results\mech_fit_v3_vm
+mkdir "%L%"
+scp azureuser@%IP%:/data/mech_fit_v3.sha256 "%L%"
+scp azureuser@%IP%:/data/mech_fit_v3_records.tar "%L%"
+scp azureuser@%IP%:/data/mech_fit_v3_runs.tar "%L%"
+certutil -hashfile "%L%\mech_fit_v3_records.tar" SHA256
+certutil -hashfile "%L%\mech_fit_v3_runs.tar" SHA256
+type "%L%\mech_fit_v3.sha256"
+```
+
+The two `certutil` hashes must match the file's lines; compare them by eye,
+since `certutil` prints them without the names. Then unpack and delete the
+archives:
+
+```bat
+tar -xf "%L%\mech_fit_v3_records.tar" -C "%L%"
+tar -xf "%L%\mech_fit_v3_runs.tar" -C "%L%"
+del "%L%\mech_fit_v3_records.tar" "%L%\mech_fit_v3_runs.tar"
+```
+
+Use a sub-folder, so that nothing local is overwritten. Do not end a local
+path with a backslash: Windows reads `\"` as an escaped quote, so
+`"...\mech_fit_v3_vm\"` reaches scp with a stray `"` on the end.
+
+#### 13.8.1 Re-score from the records (a)
+
+From the `tissue_model` folder, checked out at the commit in `CODE_COMMIT`:
+
+```bat
+set L=D:\kasirer\model_results\mech_fit_v3_vm
+set TISSUE_RESULTS_DIR=%L%
+set PYTHONPATH=%CD%;%CD%\tyssue\src
+set MPLBACKEND=Agg
+copy "%L%\grid_fit_mechanics_v3_scores.json" "%L%\scores_from_vm.json"
+conda run -n tyssue python grid_fit_mechanics_v3.py --score-only
+conda run -n tyssue python -c "import json; a=json.load(open(r'%L%\scores_from_vm.json')); b=json.load(open(r'%L%\grid_fit_mechanics_v3_scores.json')); print('ranking identical' if a['ranked_pairs']==b['ranked_pairs'] else 'RANKING DIFFERS')"
+```
+
+Compare `ranked_pairs`, not the whole file. Where an old record lacks a
+seed, `--score-only` fills it in from the run folder when that folder is
+present, so the per-simulation section can differ from the VM's copy while
+the ranking cannot.
+
+`--score-only` reads only the records and the experimental data
+(`EXPERIMENTAL_DATA_DIR`, which defaults to the local copy). A changed score
+is a change to `mechanics_scoring.py`, followed by the same command.
+
+#### 13.8.2 Re-measure from the run folders (b) — nothing is simulated
+
+```bat
+conda run -n tyssue python grid_fit_mechanics_v3.py --re-extract
+conda run -n tyssue python grid_fit_mechanics_v3.py --score-only --tag _reextract
+conda run -n tyssue python -c "import json; a=json.load(open(r'%L%\scores_from_vm.json')); b=json.load(open(r'%L%\grid_fit_mechanics_v3_scores_reextract.json')); print('ranking identical' if a['ranked_pairs']==b['ranked_pairs'] else 'RANKING DIFFERS')"
+```
+
+**What `--re-extract` does:**
+- It reads every record and re-measures its simulation from the two run
+  folders, through the same function the fit scored it with
+  (`mechanics_eval.terms_from_runs`).
+- It never calls `run()`.
+- It writes the `_reextract` records and prints, per simulation, `identical`
+  or the fields that differ: observables, cells, seeds and raw data, compared
+  exactly.
+- It exits 1 if anything differs, and refuses up front if a run folder is
+  missing.
+- Failed records are carried over unchanged, since nothing was measured for
+  them.
+
+**What it needs:** only the run folders and the records. It needs neither the
+initial arrays nor the experimental data; scoring the result needs the
+experimental data.
+
+**Checked on 2026-11-23** on the seven verification simulations:
+
+- re-extracted in place: all identical;
+- re-extracted from a folder holding only their 14 run folders and the
+  records: all identical, the same ranking.
+
+A new observable is a change to `extract_model_mechanics` / `terms_from_runs`
+and a re-extraction.
+
+### 13.9 Re-run any grid point with its recorded seeds
+
+Every record carries `base_seed` and `ablation_seed`. `--replay` re-runs one
+recorded simulation with exactly those seeds and compares the result with the
+record, field by field. The output is either `REPLAY IDENTICAL on ...` with
+exit code 0, or `REPLAY DIFFERS in [...]` with the values and exit code 1.
+
+**A replay must run into a results dir that does not hold the original
+runs.** The seed is not part of the folder name, so in the fit's own
+`/data/results` the existing runs would be reused, not re-simulated. The
+driver refuses that case.
+
+The replay dir needs:
+
+- the initial arrays, with their LI files;
+- the same code commit (`CODE_COMMIT`).
+
+`--from` points at the folder holding the fit's records.
+
+**On the VM** (same image, same hardware as the fit):
+
+```bash
+mkdir -p /data/replay
+for d in /data/results/initial_array_*_for_*; do ln -s "$d" /data/replay/; done
+
+# a point key, e.g. each stage's point of the best pair
+python -c "import json; p=json.load(open('/data/results/grid_fit_mechanics_v3_scores.json'))['ranked_pairs'][0]; print(p['E17.5']); print(p['P0'])"
+
+# one simulation (~10 min)
+TISSUE_RESULTS_DIR=/data/replay python -u grid_fit_mechanics_v3.py \
+    --replay "aHC=4.0000|gSC=0.01234|Rg=6.0000" --stage E17.5 \
+    --initial initial_array_3_for_E17 --from /data/results
+
+# a whole grid point: its 10 patterns at once
+P="aHC=4.0000|gSC=0.01234|Rg=6.0000"; S=E17.5; X=E17      # X: E17 or P0
+for i in $(seq 0 9); do
+  TISSUE_RESULTS_DIR=/data/replay python -u grid_fit_mechanics_v3.py --replay "$P" \
+      --stage $S --initial initial_array_${i}_for_${X} --from /data/results \
+      > /data/replay/replay_${S}_${i}.log 2>&1 &
+done; wait
+grep -h "^REPLAY" /data/replay/replay_${S}_*.log            # 10 lines
+```
+
+Copy the key exactly: `--replay` matches it as a string. Each replay appends
+its record to `/data/replay/grid_fit_mechanics_v3_<stage>_replay.jsonl`.
+
+To replay the same simulation again, first remove that run's two folders from
+`/data/replay`; the record names them (`base_run`, `ablation_run`).
+
+**Locally**, after the download (§13.8), the initial arrays are already on
+D:. From the `tissue_model` folder at `CODE_COMMIT`:
+
+```bat
+set RP=D:\kasirer\model_results\mech_fit_v3_replay
+mkdir "%RP%"
+xcopy /e /i "D:\kasirer\model_results\initial_array_3_for_E17" "%RP%\initial_array_3_for_E17"
+set TISSUE_RESULTS_DIR=%RP%
+conda run -n tyssue python -u grid_fit_mechanics_v3.py --replay "aHC=4.0000|gSC=0.01234|Rg=6.0000" --stage E17.5 --initial initial_array_3_for_E17 --from D:\kasirer\model_results\mech_fit_v3_vm
+```
+
+**What reproduces:**
+- **Same platform, same commit: bit-identical.** Checked on 2026-11-23 on the
+  workstation: a recorded verification simulation, replayed with its two
+  seeds, matched its record exactly on every field (`REPLAY IDENTICAL`).
+- **Linux VM → Windows workstation: not tested.** The seeds fix every random
+  choice, but floating-point results can differ between platforms' maths
+  libraries, and an event-driven tissue can amplify the last bit. Replay on
+  the VM, or on a fresh VM of the same size and image, when exact identity
+  matters. A local replay reports any difference rather than hiding it.
+- **A failed record that hit the 1,500 s cap** replays only as fast as the
+  machine running it. A faster machine can finish what the VM could not, so
+  the comparison then reports `failed` as differing.
+
+### 13.10 Tear down
+
+Do this only once §13.8 has been downloaded and checked. As in **§9.9**,
+`az vm deallocate` stops compute only, and the 512 GiB disk keeps billing
+until `az group delete`.
