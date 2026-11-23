@@ -6633,14 +6633,201 @@ class TestFitOutputsSeedsAndScores:
         assert len(grid) == 125 and all(p[0] > 1 and p[2] > 1 and p[1] > 0
                                         for p in grid)
 
-    def test_best_coarse_point_reads_the_top_pair(self, tmp_path, monkeypatch):
+    _TARGETS = {
+        "E17.5": {"roundness_ratio": (1.2, 0.05, 3), "ablation_ratio": (0.85, 0.1, 2),
+                  "shrinkage": (0.925, 0.005, 14), "stress": (0.3, 0.04, 14)},
+        "P0": {"roundness_ratio": (1.2, 0.05, 3), "ablation_ratio": (0.85, 0.1, 3),
+               "shrinkage": (0.92, 0.01, 14), "stress": (0.2, 0.02, 14)}}
+
+    @classmethod
+    def _graded_records(cls, tmp_path, monkeypatch, drop=None):
+        """Two coarse points per stage on two patterns, plus a FINE point that
+        fits better than either. Roundness alone separates them."""
+        import json
+        import grid_fit_mechanics_v3 as g
+        monkeypatch.setattr(g, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(g, "TAG", "")
+        monkeypatch.setattr(g.ms, "experimental_targets",
+                            lambda s: cls._TARGETS[s])
+        coarse = {"E17.5": [(2.0, 0.01, 2.0), (4.0, 0.02, 4.0)],
+                  "P0": [(2.0, 0.01, 8.0), (4.0, 0.03, 2.0)]}
+        best = {"E17.5": (4.0, 0.02, 4.0), "P0": (2.0, 0.01, 8.0)}
+        fine = {"E17.5": (4.5, 0.02, 4.0), "P0": (2.5, 0.01, 8.0)}
+        for s in g.STAGES:
+            t = cls._TARGETS[s]
+            (tmp_path / (g.GRID % (s, ""))).write_text(json.dumps({
+                "initials": ["a", "b"],
+                "points": [{"alphaHC": a, "gammaSC": gs, "R_gamma": r}
+                           for a, gs, r in coarse[s]]}))
+            lines = []
+            for p in coarse[s] + [fine[s]]:
+                rr = 1.2 if p == fine[s] else (1.21 if p == best[s] else 1.5)
+                for i in ("a", "b"):
+                    if drop == (s, p, i):
+                        continue
+                    lines.append(json.dumps({
+                        "point": g.point_key(*p), "initial": i, "failed": False,
+                        "roundness_ratio": rr, "ablation_ratio": t["ablation_ratio"][0],
+                        "lambda_squared": t["shrinkage"][0] ** 2,
+                        "stress": t["stress"][0]}))
+            (tmp_path / (g.RECORDS % (s, ""))).write_text("\n".join(lines) + "\n")
+        return g, coarse, best
+
+    def test_the_fine_centre_is_ranked_over_the_coarse_points_only(
+            self, tmp_path, monkeypatch):
+        """A fine point that fits better (its records sit in the same JSONL)
+        must not move the centre, and no scores file is read at all."""
+        g, _, best = self._graded_records(tmp_path, monkeypatch)
+        assert not (tmp_path / (g.SCORES % "")).exists()
+        for s in g.STAGES:
+            centre, pair = g.best_coarse_point(s)
+            assert centre == best[s]
+            assert set(pair) == {"E17.5", "P0", "J_mech"}
+
+    def test_the_fine_centre_waits_for_a_complete_coarse_grid(
+            self, tmp_path, monkeypatch):
+        g, coarse, _ = self._graded_records(
+            tmp_path, monkeypatch, drop=("P0", (4.0, 0.03, 2.0), "b"))
+        with pytest.raises(SystemExit, match="P0 coarse grid incomplete: 3 of 4"):
+            g.best_coarse_point("E17.5")
+
+    def test_a_resumed_fine_grid_must_be_the_one_already_started(
+            self, tmp_path, monkeypatch):
         import json
         g = self._coarse_record(tmp_path, monkeypatch)
-        (tmp_path / (g.SCORES % "")).write_text(json.dumps({"ranked_pairs": [
-            {"E17.5": g.point_key(6.0, 0.0228, 4.0),
-             "P0": g.point_key(2.0, 0.01, 8.0), "J_mech": 3.1}]}))
-        assert g.best_coarse_point("E17.5")[0] == (6.0, 0.0228, 4.0)
-        assert g.best_coarse_point("P0")[0] == (2.0, 0.01, 8.0)
+        bar = 0.0152 * 6 / 4
+        _, info = g.build_fine_grid("E17.5", (6.0, round(bar, 5), 4.0))
+        g.check_fine_grid_unchanged("E17.5", info)          # nothing on disk yet
+        (tmp_path / (g.FINE_GRID % ("E17.5", ""))).write_text(json.dumps(info))
+        g.check_fine_grid_unchanged("E17.5", info)          # the same grid: fine
+        _, moved = g.build_fine_grid("E17.5", (4.0, round(0.0152 * 4 / 4, 5), 4.0))
+        with pytest.raises(SystemExit, match="coarse records have changed"):
+            g.check_fine_grid_unchanged("E17.5", moved)
+
+    @staticmethod
+    def _terms(base, abl, roundness=(0.8, 0.9)):
+        hc_r, sc_r = np.array(roundness), np.array([0.7, 0.72])
+        return {"hc_roundness": hc_r, "sc_roundness": sc_r,
+                "hc_ablation": np.array([0.9]), "sc_ablation": np.array([1.1, 1.2]),
+                "roundness_ratio": hc_r / sc_r.mean(),
+                "ablation_ratio": np.array([0.9 / 1.15]),
+                "lambda_squared": 0.85, "stress": 0.3, "ablated_removed": True,
+                "energy_sums": {"n_cells": 3}, "base_run": base,
+                "ablation_run": abl, "ablated_labels": [5], "ablated_ids": [7]}
+
+    def test_re_extract_rereads_every_record_and_runs_nothing(
+            self, tmp_path, monkeypatch):
+        import json
+        import grid_fit_mechanics_v3 as g
+        import mechanics_eval
+        monkeypatch.setattr(g, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(g, "TAG", "")
+        monkeypatch.setattr(mechanics_eval, "run", lambda *a, **k: 1 / 0)
+        for run, seed in (("base", 11), ("abl", 12)):
+            (tmp_path / run).mkdir()
+            (tmp_path / run / "parameters.txt").write_text("seed: %d\n" % seed)
+            (tmp_path / run / "history.hf5").write_text("")
+        params = {"alphaHC": 4.0, "gammaSC": 0.02, "R_gamma": 4.0, "gammaHC": 0.08}
+        ok = g.record_from_terms("E17.5", "k", params, "arr", 0.4,
+                                 self._terms("base", "abl"))
+        failed = g.record_from_terms("E17.5", "k2", params, "arr", 0.4, None)
+        (tmp_path / (g.RECORDS % ("E17.5", ""))).write_text(
+            json.dumps(ok) + "\n" + json.dumps(failed) + "\n")
+        seen = []
+
+        def fake_terms(base, abl, labels, ids, **kw):
+            seen.append((base, abl, labels, ids, kw))
+            return self._terms(base, abl)
+        monkeypatch.setattr(mechanics_eval, "terms_from_runs", fake_terms)
+        assert g.re_extract("E17.5") == 0
+        assert seen == [("base", "abl", [5], [7], dict(
+            type_by="delta_level", threshold=0.4, post_ablation_frame=-1,
+            require_ablated_removed=True))]                 # the failed one: not read
+        out = [json.loads(l) for l in open(
+            tmp_path / (g.RECORDS % ("E17.5", "_reextract")))]
+        assert g.differing_fields(ok, out[0]) == [] and out[1] == failed
+        with pytest.raises(SystemExit, match="delete it"):
+            g.re_extract("E17.5")
+        # a different measurement is reported, field by field
+        (tmp_path / (g.RECORDS % ("E17.5", "_reextract"))).unlink()
+        monkeypatch.setattr(mechanics_eval, "terms_from_runs",
+                            lambda b, a, l, i, **kw: self._terms(b, a, (0.8, 0.95)))
+        assert g.re_extract("E17.5") == 1
+
+    def test_re_extract_refuses_when_a_run_folder_is_missing(
+            self, tmp_path, monkeypatch):
+        import json
+        import grid_fit_mechanics_v3 as g
+        monkeypatch.setattr(g, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(g, "TAG", "")
+        rec = g.record_from_terms("E17.5", "k", {}, "arr", 0.4,
+                                  self._terms("base", "abl"))
+        (tmp_path / (g.RECORDS % ("E17.5", ""))).write_text(json.dumps(rec) + "\n")
+        with pytest.raises(SystemExit, match="run base"):
+            g.re_extract("E17.5")
+
+    def test_replay_runs_the_record_with_its_own_seeds(self, tmp_path,
+                                                        monkeypatch):
+        import json
+        import grid_fit_mechanics_v3 as g
+        import mechanics_eval
+        from mechanics_eval import base_run_name
+        src, dst = tmp_path / "fit", tmp_path / "replay"
+        src.mkdir(), dst.mkdir()
+        (dst / "arr").mkdir()
+        monkeypatch.setattr(g, "TAG", "")
+        params = {"alphaHC": 4.0, "gammaSC": 0.02, "R_gamma": 4.0, "gammaHC": 0.08}
+        name = base_run_name(g.build_task("E17.5", "arr", 4.0, 0.02, 4.0, [7], 0.4))
+        for run, seed in ((name, 11), ("abl", 12)):
+            (src / run).mkdir()
+            (src / run / "parameters.txt").write_text("seed: %d\n" % seed)
+        monkeypatch.setattr(g, "RESULTS_DIR", str(src))
+        rec = g.record_from_terms("E17.5", "k", params, "arr", 0.4,
+                                  self._terms(name, "abl"))
+        assert (rec["base_seed"], rec["ablation_seed"]) == (11, 12)
+        (src / (g.RECORDS % ("E17.5", ""))).write_text(json.dumps(rec) + "\n")
+        monkeypatch.setattr(g, "RESULTS_DIR", str(dst))
+        tasks = []
+
+        def fake_evaluate(task):
+            tasks.append(task)
+            for run, key in ((name, "base"), ("abl", "ablation")):
+                (dst / run).mkdir()
+                (dst / run / "parameters.txt").write_text(
+                    "seed: %d\n" % task[25][key])
+            return self._terms(name, "abl")
+        monkeypatch.setattr(mechanics_eval, "_evaluate_mechanics_for_sheet",
+                            fake_evaluate)
+        assert g.replay("E17.5", "k", "arr", str(src)) == []
+        assert len(tasks[0]) == 26 and tasks[0][25] == {"base": 11, "ablation": 12}
+        assert tasks[0][:25] == g.build_task("E17.5", "arr", 4.0, 0.02, 4.0,
+                                             [7], 0.4)
+        assert (dst / (g.RECORDS % ("E17.5", "_replay"))).is_file()
+        # the runs are there now: a second replay would only reuse them
+        with pytest.raises(SystemExit, match="without the original runs"):
+            g.replay("E17.5", "k", "arr", str(src))
+
+    def test_replay_seeds_reach_both_runs(self, monkeypatch):
+        import mechanics_eval
+        seen = []
+
+        def fake_run(*a, **kw):
+            seen.append(kw)
+            if len(seen) % 2 == 1:
+                return "base_run"
+            raise FileNotFoundError("stop")
+        monkeypatch.setattr(mechanics_eval, "run", fake_run)
+        task = [0.0105, 6.746, 3.5, "arr0", "E17.5", [0, 1], -1, 0.3,
+                "delta_level", 100, None, 30.0, False, 0.0, 1e-3, 1e-3,
+                None, 0.0, 0.0, 0.0, None, True, "median", "removed", 100.0]
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(tuple(task))
+        assert ["seed" in kw for kw in seen] == [False, False]
+        seen.clear()
+        with pytest.raises(FileNotFoundError):
+            mechanics_eval._evaluate_mechanics_for_sheet(
+                tuple(task + [{"base": 11, "ablation": 12}]))
+        assert [kw["seed"] for kw in seen] == [11, 12]
 
     def test_two_points_sharing_a_run_folder_are_refused(self, tmp_path,
                                                          monkeypatch):

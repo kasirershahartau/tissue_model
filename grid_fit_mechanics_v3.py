@@ -4,11 +4,22 @@
     python grid_fit_mechanics_v3.py --stage E17.5 --workers 6
     python grid_fit_mechanics_v3.py --stage P0 --workers 6
     python grid_fit_mechanics_v3.py --score-only
-    python grid_fit_mechanics_v3.py --fine --workers 6   # after --score-only
+    python grid_fit_mechanics_v3.py --fine --workers 6   # needs BOTH coarse grids complete
     python grid_fit_mechanics_v3.py --score-only         # ranks coarse + fine
 
+    # re-score from the run folders, running nothing; then score that set
+    python grid_fit_mechanics_v3.py --re-extract
+    python grid_fit_mechanics_v3.py --score-only --tag _reextract
+    # re-run one recorded simulation with its own seeds, into a results dir
+    # (TISSUE_RESULTS_DIR) that holds the initial array but not the runs
+    python grid_fit_mechanics_v3.py --replay "aHC=...|gSC=...|Rg=..." \
+        --stage E17.5 --initial initial_array_0_for_E17 --from <fit results dir>
+
 THE FINE GRID (decided 2026-11-22): 5 x 5 x 5 centred on each stage's point
-in the best-ranked (E17.5, P0) coarse pair, at a quarter of the coarse
+in the best-ranked (E17.5, P0) pair OF THE COARSE POINTS -- ranked from the
+records, never read from the scores file, which after a --score-only also
+ranks fine points; a resume that finds a different centre than the fine grid
+it started refuses (check_fine_grid_unchanged). At a quarter of the coarse
 spacing in every parameter (alpha_HC and R_gamma steps 0.5; gammaSC step
 gammaSC_bar/12 of the centre's own pair). A centre at the lowest coarse value
 gets its window shifted inward (e.g. alpha_HC 1.5-3.5 around 2), never past
@@ -233,12 +244,63 @@ def build_fine_grid(stage, centre):
     return grid, info
 
 
+def coarse_point_keys(stage):
+    """The coarse grid's point keys and patterns, from its own record."""
+    with open(os.path.join(RESULTS_DIR, GRID % (stage, TAG))) as fh:
+        info = json.load(fh)
+    keys = [point_key(p["alphaHC"], p["gammaSC"], p["R_gamma"])
+            for p in info["points"]]
+    return keys, list(info["initials"])
+
+
 def best_coarse_point(stage):
-    """This stage's point in the top-ranked (E17.5, P0) pair of the scores."""
-    with open(os.path.join(RESULTS_DIR, SCORES % TAG)) as fh:
-        best = json.load(fh)["ranked_pairs"][0]
+    """This stage's point in the best (E17.5, P0) pair of the COARSE grid.
+
+    Ranked here, from the records, over the coarse points only -- never read
+    from the scores file. The fine records go into the same JSONL as the
+    coarse ones, so a ranking that included them (a --score-only run during
+    the fine phase, say) would move the centre and give a different fine
+    grid on resume. And it refuses until BOTH stages' coarse grids are
+    complete (every point x pattern recorded, failures included), since a
+    centre chosen from a partial grid could change once the rest arrived.
+    """
+    targets = {s: ms.experimental_targets(s) for s in STAGES}
+    points = {}
+    for s in STAGES:
+        keys, initials = coarse_point_keys(s)
+        records = load_records(s)
+        have = {(r["point"], r["initial"]) for r in records}
+        missing = sum((k, i) not in have for k in keys for i in initials)
+        if missing:
+            raise SystemExit(
+                "%s coarse grid incomplete: %d of %d simulations recorded; the "
+                "fine grid is centred only on a complete coarse grid"
+                % (s, len(keys) * len(initials) - missing,
+                   len(keys) * len(initials)))
+        points[s] = summaries(s, keys=set(keys))
+    best = ms.rank_pairs(points["E17.5"], points["P0"],
+                         targets["E17.5"], targets["P0"])[0]
+    best = {k: best[k] for k in ("E17.5", "P0", "J_mech")}
     a, g, r = (float(x.split("=")[1]) for x in best[stage].split("|"))
     return (a, g, r), best
+
+
+def check_fine_grid_unchanged(stage, info):
+    """On a resume the fine grid must be the one already started. The coarse
+    grid is complete and unchanged by then, so its centre cannot have moved;
+    if it has, something rewrote the coarse records, and the fit stops rather
+    than start a second fine grid beside the first."""
+    path = os.path.join(RESULTS_DIR, FINE_GRID % (stage, TAG))
+    if not os.path.isfile(path):
+        return
+    with open(path) as fh:
+        old = json.load(fh)
+    if old["points"] != json.loads(json.dumps(info["points"])):
+        raise SystemExit(
+            "%s: the fine grid would now centre on %s, but %s was built around "
+            "%s; the coarse records have changed. Move that file aside to "
+            "build a new fine grid." % (stage, info["centre"], path,
+                                        old["centre"]))
 
 
 def point_key(alpha_hc, gamma_sc, r_gamma):
@@ -275,8 +337,17 @@ def ablation_targets(stage, initials, refresh=False):
     return known
 
 
-def build_task(stage, initial, alpha_hc, gamma_sc, r_gamma, ids, threshold):
-    """The 25-field task _evaluate_mechanics_for_sheet expects."""
+def build_task(stage, initial, alpha_hc, gamma_sc, r_gamma, ids, threshold,
+               seeds=None):
+    """The 25-field task _evaluate_mechanics_for_sheet expects; with
+    ``seeds`` ({"base": int, "ablation": int}) a 26th field that replays a
+    recorded simulation with its own seeds."""
+    task = _task_fields(stage, initial, alpha_hc, gamma_sc, r_gamma, ids,
+                        threshold)
+    return task if seeds is None else task + (dict(seeds),)
+
+
+def _task_fields(stage, initial, alpha_hc, gamma_sc, r_gamma, ids, threshold):
     return (float(gamma_sc), float(r_gamma), float(alpha_hc), initial, stage,
             {"ids": list(ids)}, -1, float(threshold), "delta_level",
             MAX_WALL_SECONDS, MIN_PROGRESS_RATE, PROGRESS_WINDOW_SECONDS,
@@ -432,9 +503,132 @@ def simulate(stage, initials, grid, workers, dry_run=False):
     run_task_pool(tasks, workers, handle)
 
 
-def summaries(stage):
+# What a re-extraction or a replay must reproduce: the observables, the cells,
+# the seeds and the raw data the score is computed from.
+COMPARED_FIELDS = ("failed", "roundness_ratio", "ablation_ratio",
+                   "lambda_squared", "stress", "n_hc_neighbours",
+                   "n_sc_neighbours", "ablated_removed", "ablated_ids",
+                   "ablated_labels", "base_seed", "ablation_seed", "raw")
+REEXTRACT_TAG = "_reextract"
+REPLAY_TAG = "_replay"
+
+
+def differing_fields(original, new):
+    """The COMPARED_FIELDS on which two records of one simulation disagree,
+    compared exactly (as JSON). A field the original does not carry (a
+    record written before it existed) is not compared."""
+    return [k for k in COMPARED_FIELDS if k in original
+            and json.dumps(original.get(k), sort_keys=True)
+            != json.dumps(new.get(k), sort_keys=True)]
+
+
+def re_extract(stage):
+    """Re-measure every recorded simulation of ``stage`` from its run
+    folders, through the extraction code that scored it, WITHOUT running
+    anything; write the records to the ``_reextract`` file and report any
+    that differ from the originals. Failed records carry over unchanged:
+    nothing was measured for them. Score the result with
+    ``--score-only --tag <tag>_reextract``."""
+    from mechanics_eval import terms_from_runs
+    out = os.path.join(RESULTS_DIR, RECORDS % (stage, TAG + REEXTRACT_TAG))
+    if os.path.isfile(out):
+        raise SystemExit("%s exists; delete it to re-extract" % out)
+    records = load_records(stage)
+    for rec in records:
+        for run in (rec.get("base_run"), rec.get("ablation_run")):
+            if (not rec.get("failed") and run and not os.path.isfile(
+                    os.path.join(RESULTS_DIR, run, "history.hf5"))):
+                raise SystemExit("run %s (%s @ %s) is not in %s"
+                                 % (run, rec["point"], rec["initial"],
+                                    RESULTS_DIR))
+    n_diff = 0
+    with open(out, "w") as fh:
+        for n, rec in enumerate(records, 1):
+            if rec.get("failed"):
+                new = dict(rec)
+            else:
+                terms = terms_from_runs(
+                    rec["base_run"], rec.get("ablation_run"),
+                    rec.get("ablated_labels"), rec.get("ablated_ids"),
+                    type_by="delta_level", threshold=rec["threshold"],
+                    post_ablation_frame=-1,
+                    require_ablated_removed=ABLATION_STOP == "removed")
+                params = {k: rec[k] for k in ("alphaHC", "gammaSC", "R_gamma",
+                                              "gammaHC")}
+                new = record_from_terms(stage, rec["point"], params,
+                                        rec["initial"], rec["threshold"], terms)
+            fh.write(json.dumps(new) + "\n")
+            diff = differing_fields(rec, new)
+            n_diff += bool(diff)
+            print("  [%4d/%4d] %s @ %s %s" % (n, len(records), rec["point"],
+                                             rec["initial"],
+                                             "DIFFERS in %s" % diff if diff
+                                             else "identical"), flush=True)
+    print("%s: %d record(s) re-extracted, %d differ; wrote %s"
+          % (stage, len(records), n_diff, out))
+    return n_diff
+
+
+def replay(stage, key, initial, source_dir):
+    """Re-run ONE recorded simulation with its recorded seeds and compare.
+
+    ``source_dir`` holds the fit's records (and its ablation targets); the
+    replay runs into RESULTS_DIR, which must hold the initial array but NOT
+    the original runs: the seed is not part of the folder name, so an
+    existing folder would be reused rather than re-simulated."""
+    from mechanics_eval import _evaluate_mechanics_for_sheet, base_run_name
+    path = os.path.join(source_dir, RECORDS % (stage, TAG))
+    with open(path) as fh:
+        found = [r for r in (json.loads(l) for l in fh if l.strip())
+                 if r["point"] == key and r["initial"] == initial]
+    if len(found) != 1:
+        raise SystemExit("%d record(s) of %s @ %s in %s"
+                         % (len(found), key, initial, path))
+    rec = found[0]
+    seeds = {"base": rec.get("base_seed"), "ablation": rec.get("ablation_seed")}
+    if seeds["base"] is None:
+        raise SystemExit("the record has no base seed; it cannot be replayed")
+    ids = rec.get("ablated_ids")
+    if ids is None:
+        # a failed record names no cells: they are the pattern's targets
+        with open(os.path.join(source_dir, TARGETS % (stage, TAG))) as fh:
+            ids = json.load(fh)[initial]["ids"]
+    if not os.path.isdir(os.path.join(RESULTS_DIR, initial)):
+        raise SystemExit("copy or link the initial array %s into %s first"
+                         % (initial, RESULTS_DIR))
+    task = build_task(stage, initial, rec["alphaHC"], rec["gammaSC"],
+                      rec["R_gamma"], ids, rec["threshold"], seeds=seeds)
+    name = base_run_name(task)
+    if os.path.exists(os.path.join(RESULTS_DIR, name)):
+        raise SystemExit("%s already holds %s: a replay needs a results dir "
+                         "without the original runs" % (RESULTS_DIR, name))
+    print("replaying %s @ %s (%s) with seeds %s" % (key, initial, stage, seeds),
+          flush=True)
+    terms = _evaluate_mechanics_for_sheet(task)
+    params = {k: rec[k] for k in ("alphaHC", "gammaSC", "R_gamma", "gammaHC")}
+    new = record_from_terms(stage, key, params, initial, rec["threshold"],
+                            terms, task=task)
+    with open(os.path.join(RESULTS_DIR, RECORDS % (stage, TAG + REPLAY_TAG)),
+              "a") as fh:
+        fh.write(json.dumps(new) + "\n")
+    diff = differing_fields(rec, new)
+    if diff:
+        print("REPLAY DIFFERS in %s" % diff)
+        for k in diff:
+            if k != "raw":
+                print("   %-18s recorded %r, replay %r" % (k, rec.get(k), new.get(k)))
+    else:
+        print("REPLAY IDENTICAL on %s" % ", ".join(
+            k for k in COMPARED_FIELDS if k in rec))
+    return diff
+
+
+def summaries(stage, keys=None):
+    """Model mean/SEM per grid point; ``keys`` limits it to those points."""
     by_point = {}
     for rec in load_records(stage):
+        if keys is not None and rec["point"] not in keys:
+            continue
         by_point.setdefault(rec["point"], []).append(
             None if rec.get("failed") else rec)
     return {k: ms.stage_summary(v) for k, v in by_point.items()}
@@ -520,6 +714,20 @@ def main():
     ap.add_argument("--score-only", action="store_true")
     ap.add_argument("--tag", default="",
                     help="suffix for every output file, e.g. _verify")
+    ap.add_argument("--re-extract", dest="re_extract", action="store_true",
+                    help="re-measure every record from its run folders in "
+                         "RESULTS_DIR, running nothing; writes the "
+                         "<tag>_reextract records (score them with "
+                         "--score-only --tag <tag>_reextract)")
+    ap.add_argument("--replay", default=None, metavar="POINT_KEY",
+                    help="re-run ONE recorded simulation with its recorded "
+                         "seeds (needs --stage, --initial, --from) into "
+                         "RESULTS_DIR, and compare it with the record")
+    ap.add_argument("--initial", default=None,
+                    help="--replay: the pattern of the simulation")
+    ap.add_argument("--from", dest="source_dir", default=None,
+                    help="--replay: the folder holding the fit's records "
+                         "(not RESULTS_DIR)")
     a = ap.parse_args()
     global TAG
     TAG = a.tag
@@ -527,6 +735,15 @@ def main():
     if a.score_only:
         score()
         return
+    if a.re_extract:
+        stages = STAGES if a.stage == "both" else (a.stage,)
+        n_diff = sum(re_extract(s) for s in stages)
+        raise SystemExit(1 if n_diff else 0)
+    if a.replay:
+        if a.stage == "both" or not a.initial or not a.source_dir:
+            raise SystemExit("--replay needs --stage, --initial and --from")
+        raise SystemExit(1 if replay(a.stage, a.replay, a.initial,
+                                     a.source_dir) else 0)
     if (any(r <= 1 for r in a.r_gamma) or any(x <= 1 for x in a.alpha_hc)
             or any(x <= 0 for x in (a.gamma_sc or []))):
         raise SystemExit("need R_gamma > 1, alphaHC > 1 and gammaSC > 0")
@@ -546,8 +763,10 @@ def main():
         if a.fine:
             centre, best = best_coarse_point(stage)
             grid, info = build_fine_grid(stage, centre)
-            info["from_pair"] = {k: best[k] for k in ("E17.5", "P0", "J_mech")}
-            with open(os.path.join(RESULTS_DIR, FINE_GRID % (stage, TAG)), "w") as fh:
+            info["from_pair"] = best
+            check_fine_grid_unchanged(stage, info)
+            with open(os.path.join(RESULTS_DIR, FINE_GRID % (stage, TAG)),
+                      "w") as fh:
                 json.dump(info, fh, indent=1)
             print("%s: fine grid around %s (best pair J_mech %.4g), steps %s"
                   % (stage, info["centre"], best["J_mech"], info["fine_steps"]))

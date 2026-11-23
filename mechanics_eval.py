@@ -40,6 +40,33 @@ def base_run_name(args):
         steady_state_statistic=statistic)
 
 
+def terms_from_runs(base_name, ablation_name=None, ablated_labels=None,
+                    ablation_ids=None, type_by="delta_level", threshold=None,
+                    post_ablation_frame=-1, require_ablated_removed=False):
+    """The observables of one simulation, read from its FINISHED runs.
+
+    The single extraction step of :func:`_evaluate_mechanics_for_sheet`, kept
+    separate so a fit can be re-scored from its run folders alone (the grid
+    driver's ``--re-extract``) through exactly the code that scored it, and
+    without running anything. ``ablation_name=None`` is a simulation whose
+    ablation run failed: only the base-run terms are measured.
+    """
+    ablation_kwargs = {}
+    if ablation_name:
+        ablation_kwargs = dict(ablation_model_name=ablation_name,
+                               ablated_cells=list(ablated_labels or []),
+                               post_ablation_frame=post_ablation_frame,
+                               require_ablated_removed=require_ablated_removed)
+    terms = extract_model_mechanics(
+        base_name, type_by=type_by, threshold=threshold, **ablation_kwargs)
+    # Provenance for the per-simulation record: which runs, which cells.
+    terms["base_run"] = base_name
+    terms["ablation_run"] = ablation_name or None
+    terms["ablated_labels"] = [int(c) for c in (ablated_labels or [])]
+    terms["ablated_ids"] = ablation_ids
+    return terms
+
+
 def _evaluate_mechanics_for_sheet(args):
     """Run one initial sheet to steady state (and, if cells are ablated, the
     ablation run too), then return its per-term model DISTRIBUTIONS (not p
@@ -126,6 +153,16 @@ def _evaluate_mechanics_for_sheet(args):
     # the median-1e-3 base run needs (it settled at t=27.5 on E17.5 array 4).
     t_end_kwargs = ({} if len(args) <= 24 or args[24] is None
                     else dict(t_end=float(args[24])))
+    # OPTIONAL 26th field: {"base": seed, "ablation": seed} -- REPLAY a
+    # recorded simulation exactly. Without it each run draws (and records) its
+    # own seed. The seed is not in the folder name, so a replay must write to
+    # a results dir that does not already hold the runs, or the existing
+    # folder is reused instead of re-simulated.
+    seeds = (dict(args[25]) if len(args) > 25 and args[25] else {})
+    base_seed_kwargs = ({} if seeds.get("base") is None
+                        else dict(seed=int(seeds["base"])))
+    ablation_seed_kwargs = ({} if seeds.get("ablation") is None
+                            else dict(seed=int(seeds["ablation"])))
     # Optional non-progress safety net: a crawling parameter region bails with a
     # RuntimeError (caught below) so it scores worst-case instead of stalling.
     stall_kwargs = dict(max_wall_seconds=max_wall_seconds,
@@ -172,7 +209,7 @@ def _evaluate_mechanics_for_sheet(args):
                 # only what the score reads: no images, labels or contact matrix
                 fit_outputs_only=True,
                 steady_state_statistic=steady_state_statistic,
-                **a0_kwargs,
+                **a0_kwargs, **base_seed_kwargs,
                 **li_kwargs, **stall_kwargs, **atoh_kwargs, **t_end_kwargs))
 
         ablation_kwargs = {}
@@ -217,9 +254,10 @@ def _evaluate_mechanics_for_sheet(args):
                         # a coarse cadence, so keep those dense.
                         save_interval=(_FIT_SAVE_INTERVAL
                                        if post_ablation_frame == -1 else None),
+                        **ablation_seed_kwargs,
                         **stall_kwargs, **atoh_kwargs, **t_end_kwargs))
-                ablation_kwargs = dict(ablation_model_name=with_ablation_name,
-                                       ablated_cells=ablated_cells,
+                ablation_kwargs = dict(ablation_name=with_ablation_name,
+                                       ablated_labels=ablated_cells,
                                        post_ablation_frame=post_ablation_frame,
                                        require_ablated_removed=(
                                            ablation_stop == "removed"))
@@ -239,13 +277,12 @@ def _evaluate_mechanics_for_sheet(args):
                       % (model_name, type(exc).__name__, exc), flush=True)
                 ablation_kwargs = {}
 
-        terms = extract_model_mechanics(
-            base_name, type_by=type_by, threshold=fix_threshold, **ablation_kwargs)
-        # Provenance for the per-simulation record: which runs, which cells.
-        terms["base_run"] = base_name
-        terms["ablation_run"] = ablation_kwargs.get("ablation_model_name")
+        terms = terms_from_runs(base_name, type_by=type_by,
+                                threshold=fix_threshold,
+                                ablation_ids=ablation_ids, **ablation_kwargs)
+        # The labels the ablation was ASKED for, even when its run failed and
+        # nothing was extracted from it (as before this was factored out).
         terms["ablated_labels"] = [int(c) for c in (ablated_cells or [])]
-        terms["ablated_ids"] = ablation_ids
         print("[mechanics] DONE   %s  %s"
               % (model_name, "  ".join(
                   "%s n=%d" % (t, 0 if terms.get(t) is None else len(terms[t]))
